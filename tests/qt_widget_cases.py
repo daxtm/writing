@@ -3614,6 +3614,17 @@ def main(argv):
     if unknown:
         print(f"unknown Qt widget case(s): {', '.join(unknown)}", file=sys.stderr)
         return 2
+    # coverage guard: every case_* function in this module must be
+    # registered, or it would silently never run from check.sh
+    defined = sorted(
+        name for name, obj in vars(sys.modules["__main__"]).items()
+        if name.startswith("case_") and callable(obj))
+    unregistered = [n for n in defined
+                    if n not in CASES and n.removeprefix("case_") not in CASES]
+    if unregistered:
+        print(f"unregistered Qt widget case(s): {', '.join(unregistered)}",
+              file=sys.stderr)
+        return 2
     failures = []
     for name in names:
         try:
@@ -3634,3 +3645,7 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+
+
+def case_zz_unregistered(root):
+    pass
