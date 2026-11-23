@@ -33,7 +33,7 @@ PRE_START_GUIDANCE = (
 REFRESH_MS = 2000
 
 # Tabs
-MANUSCRIPT, BRANCHES, DRAFT, NOTES = 0, 1, 2, 3
+MANUSCRIPT, BRANCHES, DRAFT, SCENE, CONTEXT, NOTES = 0, 1, 2, 3, 4, 5
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -118,6 +118,7 @@ class MainWindow(QMainWindow):
         self._op_kind = "generate"
         self._op_rows = None
         self._view_override = None    # (label, text) shown until cleared
+        self._scene_edit_dirty = {}   # scene -> user edited pov/cast fields
         try:
             self._session = dop.session_info(self._root)
         except dop.OpError as e:
@@ -178,6 +179,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.reading, "Manuscript")
         self.tabs.addTab(self.metadata, "Branches")
         self.tabs.addTab(self._build_draft_tab(), "Draft")
+        self.tabs.addTab(self._build_scene_tab(), "Scene")
+        self.tabs.addTab(self._build_context_tab(), "Context")
         self.tabs.addTab(self._build_notes_tab(), "Notes")
         right_l.addWidget(self.tabs, 1)
 
@@ -225,6 +228,105 @@ class MainWindow(QMainWindow):
 
         self.status = QLabel("")
         self.statusBar().addWidget(self.status, 1)
+
+    def _build_scene_tab(self):
+        """Scene controls: card, POV/cast, session length, status/warnings,
+        Mark done, Next unfinished. Full card editing belongs to planning."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.addWidget(QLabel("Scene card (read-only here; editing belongs to setup/planning)"))
+        self.scene_card = QPlainTextEdit()
+        self.scene_card.setReadOnly(True)
+        l.addWidget(self.scene_card, 2)
+        form = QHBoxLayout()
+        form.addWidget(QLabel("POV"))
+        self.pov_edit = self._line()
+        self.pov_edit.textEdited.connect(
+            lambda: self._scene_edit_dirty.__setitem__(self._scene_sel, True))
+        form.addWidget(self.pov_edit)
+        self.save_pov_btn = QPushButton("Save POV")
+        self.save_pov_btn.clicked.connect(self.save_pov)
+        form.addWidget(self.save_pov_btn)
+        form.addWidget(QLabel("Cast"))
+        self.cast_edit = self._line()
+        self.cast_edit.textEdited.connect(
+            lambda: self._scene_edit_dirty.__setitem__(self._scene_sel, True))
+        form.addWidget(self.cast_edit)
+        self.save_cast_btn = QPushButton("Save cast")
+        self.save_cast_btn.clicked.connect(self.save_cast)
+        form.addWidget(self.save_cast_btn)
+        l.addLayout(form)
+        lenform = QHBoxLayout()
+        lenform.addWidget(QLabel("Passage length (words, this session; also caps max_tokens)"))
+        self.length_spin = QSpinBox()
+        self.length_spin.setRange(1, 4000)
+        self.length_spin.setValue(int(self._session.get("passage_words", 220)))
+        self.length_spin.setToolTip(
+            "Session-only: the CLI `l` semantics; the stored writer default "
+            "is not changed")
+        lenform.addWidget(self.length_spin)
+        lenform.addStretch(1)
+        l.addLayout(lenform)
+        self.scene_status = QLabel("")
+        l.addWidget(self.scene_status)
+        self.scene_warnings = QLabel("")
+        self.scene_warnings.setWordWrap(True)
+        l.addWidget(self.scene_warnings)
+        btns = QHBoxLayout()
+        self.mark_done_btn = QPushButton("Mark done")
+        self.mark_done_btn.setToolTip("Mark the scene done and exit active "
+                                      "drafting controls; continuity update "
+                                      "remains an explicit later step")
+        self.mark_done_btn.clicked.connect(self.mark_done)
+        btns.addWidget(self.mark_done_btn)
+        self.next_unfinished_btn = QPushButton("Next unfinished")
+        self.next_unfinished_btn.setToolTip(
+            "Select the first scene that is not done; done scenes can still "
+            "be reopened by selecting them, like CLI --scene")
+        self.next_unfinished_btn.clicked.connect(self.next_unfinished)
+        btns.addWidget(self.next_unfinished_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        l.addStretch(1)
+        return box
+
+    def _build_context_tab(self):
+        """Budget/sampler/injected-lore inspection and exact prompt dump; no
+        provider calls ever."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        btns = QHBoxLayout()
+        self.inspect_btn = QPushButton("Inspect next call")
+        self.inspect_btn.setToolTip("Budget parts, ceiling, samplers and "
+                                    "injected lore for the current captured "
+                                    "inputs — no provider call")
+        self.inspect_btn.clicked.connect(self.inspect_context)
+        btns.addWidget(self.inspect_btn)
+        self.exact_prompt_btn = QPushButton("Exact prompt")
+        self.exact_btn = self.exact_prompt_btn
+        self.exact_prompt_btn.setToolTip("Show the exact prompt bytes for the "
+                                         "next call — no provider call")
+        self.exact_prompt_btn.clicked.connect(self.show_exact_prompt)
+        btns.addWidget(self.exact_prompt_btn)
+        self.save_prompt_btn = QPushButton("Save last_prompt.txt")
+        self.save_prompt_btn.setToolTip("Write the exact prompt bytes to "
+                                        "last_prompt.txt (CLI cp's dump)")
+        self.save_prompt_btn.clicked.connect(self.save_last_prompt)
+        btns.addWidget(self.save_prompt_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        self.context_view = QPlainTextEdit()
+        self.context_view.setReadOnly(True)
+        l.addWidget(self.context_view, 1)
+        return box
+
+    def _line(self):
+        from PySide6.QtWidgets import QLineEdit
+        edit = QLineEdit()
+        edit.setPlaceholderText("(unset)")
+        return edit
 
     def _build_draft_tab(self):
         """Provisional preview and completed candidate tray (never accepts)."""
@@ -511,8 +613,15 @@ class MainWindow(QMainWindow):
             self._steer = ss.SteeringState(
                 scene_id=None, text="", baseline=None, editable=False,
                 reason="no current scene selected; steering is per scene")
+            self._scene_warn = []
         else:
             self._steer = self._steering_state(scene_id)
+            try:
+                self._scene_warn = list(dop.session_info(
+                    self._root, scene_id)["warnings"])
+                self._scene_info_scene = scene_id
+            except dop.OpError as e:
+                self._scene_warn = [str(e)]
         self._set_editor_text(self._steer.text or "")
 
     def _steering_state(self, scene_id):
@@ -722,8 +831,18 @@ class MainWindow(QMainWindow):
             self.refresh(force=True)
             msg = f"accepted {value['head']}; head moved, other candidates stay saved branches"
             if value.get("ended"):
-                msg += (" — the model signalled scene end; Mark done is "
-                        "available in the Scene tab")
+                self._status(msg)
+                pick = self._choice(
+                    "Scene end",
+                    "The model signalled scene end. Mark the scene done?\n"
+                    "(Declining leaves the post-accept status unchanged.)",
+                    ["Mark scene done", "Keep status"])
+                if pick == "Mark scene done":
+                    self.mark_done()
+                else:
+                    self._status(msg + " — end suggestion declined; the "
+                                 "post-accept status is unchanged")
+                return
             self._status(msg)
         elif isinstance(value, dict) and "deleted" in value:
             nid = value["deleted"]
@@ -735,6 +854,18 @@ class MainWindow(QMainWindow):
             self.refresh(force=True)
             self._status(f"deleted {nid}" +
                          (f"; head moved to {value['head']}" if value.get("head") is not None else ""))
+        elif isinstance(value, dict) and "status" in value and value.get("scene"):
+            # scene field writes (pov/cast/mark done)
+            self._scene_edit_dirty[value["scene"]] = False
+            self.refresh(force=True)
+            if "hint" in value:
+                self._status(value["hint"] + " (continuity update is a later "
+                             "separate step, not run here)")
+            else:
+                self._status("Scene fields saved")
+        elif isinstance(value, dict) and "path" in value:
+            self._status(f"wrote {value['path']} (exact prompt bytes; "
+                         "no provider call)")
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
@@ -846,6 +977,157 @@ class MainWindow(QMainWindow):
         self._status(f"{label}: tray closed; saved candidates remain in the "
                      "branch tree and the head is unchanged")
 
+    # -------------------------------------------------------- scene/context
+
+    def _update_scene_tab(self):
+        """Refresh the read-only card/status; warnings come from the
+        session's captured CLI-prologue notes."""
+        scene = self._scene_sel
+        if scene is None or self.snap is None:
+            self.scene_card.setPlainText("")
+            self.scene_status.setText("")
+            self.scene_warnings.setText("")
+            self.pov_edit.setText("")
+            self.cast_edit.setText("")
+            return
+        try:
+            card = dop.scene_card(self._root, scene)
+            self._scene_warn = list(self._session_scene_warnings())
+        except dop.OpError as e:
+            self.scene_card.setPlainText(f"(scene sources unreadable: {e})")
+            self.scene_status.setText("")
+            return
+        if self.scene_card.toPlainText() != card["card"]:
+            self.scene_card.setPlainText(card["card"])
+        self.scene_status.setText(
+            f"status: {card['status']}  target: {card['target_words']} words  "
+            f"{{{{char}}}} = {card['char']}")
+        self.scene_warnings.setText("\n".join(self._scene_warn))
+        for edit, value in ((self.pov_edit, card["pov"]),
+                            (self.cast_edit, card["cast"])):
+            if edit.hasFocus() or (self._scene_edit_dirty.get(scene, False)):
+                continue
+            if edit.text() != value:
+                edit.setText(value)
+
+    def _session_scene_warnings(self):
+        """Per-scene warnings (earlier scenes) computed at scene switch."""
+        return getattr(self, "_scene_warn", [])
+    def save_pov(self):
+        self._dispatch_scene_field(lambda sink, token, scene:
+                                   dop.set_pov(self._root, scene,
+                                               self.pov_edit.text().strip(),
+                                               token=token))
+
+    def save_cast(self):
+        names = [x.strip() for x in self.cast_edit.text().split(",") if x.strip()]
+        self._dispatch_scene_field(lambda sink, token, scene:
+                                   dop.set_cast(self._root, scene, names,
+                                                token=token))
+
+    def _dispatch_scene_field(self, mkfn):
+        if self._busy or self._scene_sel is None:
+            return
+        scene = self._scene_sel
+        self._scene_edit_dirty[scene] = True
+        self._op_scene = scene
+
+        def fn(sink, token):
+            return mkfn(sink, token, scene)
+
+        self._dispatch(fn, kind="scene")
+
+    def mark_done(self):
+        if self._busy or self._scene_sel is None:
+            return
+        scene = self._scene_sel
+        self._op_scene = scene
+
+        def fn(sink, token):
+            return dop.mark_done(self._root, scene, token=token)
+
+        self._dispatch(fn, kind="scene")
+
+    def next_unfinished(self):
+        """First non-done scene; all-done explains explicit reopening."""
+        try:
+            rows = dop.scene_overview(self._root)
+        except dop.OpError as e:
+            self._status(str(e), error=True)
+            return
+        row = next((r for r in rows if r["status"] != "done"), None)
+        if row is None:
+            self._status("All scenes are done; select a scene in the sidebar "
+                         "to reopen it explicitly (like CLI --scene ID).")
+            return
+        self.select_item("manuscript", row["id"], None)
+        self._status(f"resumed {row['id']} — {row['title'] or '(untitled)'} "
+                     f"(status {row['status']})")
+
+    def inspect_context(self):
+        """Budget/sampler/lore report for captured inputs; never a call."""
+        scene = self._scene_sel
+        if scene is None:
+            self._status("Select a scene to inspect its context.")
+            return
+        try:
+            prep = dop.prepare_report(self._root, scene,
+                                      passage_words=self.length_spin.value())
+        except dop.OpError as e:
+            self._status(str(e), error=True)
+            return
+        self.context_view.setPlainText(self._format_report(prep))
+
+    def show_exact_prompt(self):
+        scene = self._scene_sel
+        if scene is None:
+            self._status("Select a scene to see its exact prompt.")
+            return
+        try:
+            prep = dop.prepare_report(self._root, scene,
+                                      passage_words=self.length_spin.value())
+        except dop.OpError as e:
+            self._status(str(e), error=True)
+            return
+        self.context_view.setPlainText(prep["prompt"])
+
+    def save_last_prompt(self):
+        """Exact prompt bytes to last_prompt.txt through the serial boundary."""
+        scene = self._scene_sel
+        if scene is None or self._busy:
+            return
+        self._op_scene = scene
+
+        def fn(sink, token):
+            return dop.dump_prompt(self._root, scene,
+                                   passage_words=self.length_spin.value())
+
+        self._dispatch(fn, kind="dump")
+
+    @staticmethod
+    def _format_report(prep):
+        import json
+        r = prep["report"]
+        lines = [f"context estimate (chars/token {r['ratio']}):"]
+        for k, v in r["parts"].items():
+            lines.append(f"  {k:<12} ~{v}")
+        lines.append(f"  {'TOTAL':<12} ~{r['total']}  (+{r['max_tokens']} "
+                     f"completion; ceiling {r['ceiling']} from {r['ceiling_source']})")
+        lines.append(f"  {{{{char}}}} = {r['char']}   {{{{user}}}} = {r['user']}   "
+                     f"mode = {'continue' if r['continuing'] else 'scene start'}")
+        lines.append("  samplers: " + json.dumps(prep["params"])
+                     + (f"   + {json.dumps(prep['extra'])}" if prep["extra"] else ""))
+        if r["lore"]:
+            lines.append("  lore injected:")
+            lines += ["    " + ln for ln in r["lore"]]
+        else:
+            lines.append("  lore injected: (none)")
+        lines += [f"  note: {n}" for n in r["notes"]]
+        if r["over"]:
+            lines.append("  OVER the context ceiling: trim the bible/state/"
+                         "lore or lower budgets in project.json")
+        return "\n".join(lines)
+
     # ------------------------------------------------------- draft actions
 
     def generate(self):
@@ -861,6 +1143,7 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             return dop.generate_candidates(
                 self._root, scene, count=self.count_spin.value(),
+                passage_words=self.length_spin.value(),
                 provider_factory=self._provider_factory, token=token,
                 events=sink)
 
@@ -1064,6 +1347,7 @@ class MainWindow(QMainWindow):
         self._update_pane(self.metadata, self._metadata_text())
         self._update_notes()
         self._update_steering_pane()
+        self._update_scene_tab()
         self._update_steering_ui()
 
     def _reconcile_selection(self):

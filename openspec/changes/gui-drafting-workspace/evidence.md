@@ -100,3 +100,28 @@ AttributeError: 'MainWindow' object has no attribute 'view_btn'
   Add extends the batch parent, Delete leaf removes only the leaf, both tray
   closes are non-destructive and the saved nodes/head survive reopen.
 - Full suite: 236 passed.
+
+## 1.5 — scene controls and no-call context inspection
+
+- Headless parity first (`tests/test_draft_parity.py`, +2 tests; red run:
+```
+FAILED tests/test_draft_parity.py::test_scene_controls_parity - AttributeError: ... 'set_cast'
+FAILED tests/test_draft_parity.py::test_prompt_dump_parity - StopIteration (test typo, fixed)
+```
+  then green): CLI `who`/`pov`/`d` route through `set_cast`/`set_pov`/
+  `mark_done` with identical scenes.json and byte-identical next prompts;
+  CLI `cp` and `dump_prompt` write identical `last_prompt.txt` bytes.
+- Offscreen `case_draft_scene_context` written first; red run:
+```
+AttributeError: module 'longform_core.gui_window' has no attribute 'SCENE'
+```
+- After implementing the Scene tab (read-only card, POV/cast saves, session
+  length, status, earlier-scene warnings, Mark done, Next unfinished) and the
+  Context tab (Inspect, Exact prompt, Save last_prompt.txt): the case passes —
+  inspection and exact prompt make zero provider calls, the dump equals the
+  shown bytes, POV/cast persist, Mark done names continuity as a separate
+  later step, Next unfinished selects the first non-done scene (all-done
+  explains explicit reopening), declining the model-end suggestion keeps the
+  post-accept status, and missing credentials disable only generation while
+  inspection stays usable.
+- Full suite: 238 passed.

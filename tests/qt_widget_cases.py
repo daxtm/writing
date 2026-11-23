@@ -961,6 +961,113 @@ def case_draft_candidate_tray(root):
     win2.close()
 
 
+def case_draft_scene_context(root):
+    """Scene tab controls and no-call context inspection with exact prompt
+    parity; Mark done, Next unfinished and the model-end suggestion."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _build_project(root / "p", scenes=[
+        _scene("s001", status="done"),
+        _scene("s002", title="Confession"),
+        _scene("s003", title="Departure"),
+    ], trees={
+        "s001": _tree({"n1": _node("n1", None, "Old prose.")}, head="n1"),
+        "s002": _tree({"n1": _node("n1", None, "Mara speaks.")}, head="n1"),
+        "s003": _tree({"n1": _node("n1", None, "Mara leaves.")}, head="n1"),
+    }, bible="# Story bible\n\nQuiet town.", state="Mara is at the yard.",
+        project_extra={"api_key": "sk-test"})
+    _write_json(project / "writer_preset.json", PRESET)
+    fake = FakeProvider(responses=["The scene ends. [SCENE END]",
+                                   "More prose follows."])
+    win = gw.MainWindow(str(project), choice=_no_dialogs("scene"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s002", None)
+    win.tabs.setCurrentIndex(gw.SCENE)
+    assert "Scene s002" in win.scene_card.toPlainText()
+    assert "planned" in win.scene_status.text()
+    assert "s001" in win.scene_warnings.text(), \
+        "earlier-scene warnings from the CLI prologue are visible"
+
+    win.pov_edit.setText("Tom")
+    win.save_pov_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.cast_edit.setText("Mara, Tom")
+    win.save_cast_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((project / "scenes.json").read_text())
+    assert scenes[1]["pov"] == "Tom"
+    assert scenes[1]["characters"] == ["Mara", "Tom"]
+
+    # session length changes the exact prompt; nothing is persisted
+    win.length_spin.setValue(350)
+    win.tabs.setCurrentIndex(gw.CONTEXT)
+    win.inspect_btn.click()
+    assert "context estimate" in win.context_view.toPlainText()
+    assert "samplers:" in win.context_view.toPlainText()
+    assert fake.calls == [], "inspection makes no provider call"
+    win.exact_prompt_btn.click()
+    prompt_text = win.context_view.toPlainText()
+    assert "about 350 words" in prompt_text
+    win.save_prompt_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "last_prompt.txt").read_text(encoding="utf-8") == prompt_text, \
+        "last_prompt.txt holds the exact prompt bytes"
+    assert fake.calls == []
+
+    # Mark done is explicit; continuity update stays a later separate step
+    win.tabs.setCurrentIndex(gw.SCENE)
+    win.mark_done_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((project / "scenes.json").read_text())
+    assert scenes[1]["status"] == "done"
+    assert "update-state" in win.status.text(), "continuity is named, not run"
+
+    # Next unfinished selects the first non-done scene
+    win.next_unfinished_btn.click()
+    assert win._sel_data[1] == "s003", "first non-done scene selected"
+
+    # accept an end-signalled candidate: declining leaves post-accept status
+    answers = ["Keep status"]
+    win._choice = lambda t, x, o: answers.pop(0)
+    win.count_spin.setValue(1)
+    win.generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.tray.setCurrentRow(0)
+    win.accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((project / "scenes.json").read_text())
+    assert scenes[2]["status"] == "drafting", \
+        "declining the end suggestion keeps the post-accept status"
+    assert fake.calls, "generation through the tray used the provider seam"
+
+    # an all-done project explains explicit reopening
+    done_project = _build_project(root / "alldone", scenes=[
+        _scene("s001", status="done"), _scene("s002", status="done")],
+        project_extra={"api_key": "sk-test"})
+    _write_json(done_project / "writer_preset.json", PRESET)
+    win2 = gw.MainWindow(str(done_project), choice=_no_dialogs("alldone"),
+                         provider_factory=lambda _p: fake)
+    win2.show()
+    win2.next_unfinished_btn.click()
+    assert "done" in win2.status.text().lower(), \
+        "all-done explains how to explicitly select a scene"
+
+    # missing credentials never block no-call inspection
+    nokey = _build_project(root / "nokey", scenes=[_scene("s001")],
+                           project_extra={})
+    _write_json(nokey / "writer_preset.json", PRESET)
+    win3 = gw.MainWindow(str(nokey), choice=_no_dialogs("nokey"))
+    win3.show()
+    win3.select_item("manuscript", "s001", None)
+    assert not win3.generate_btn.isEnabled(), "generation needs credentials"
+    assert "credentials" in win3.generate_note.text().lower()
+    win3.tabs.setCurrentIndex(gw.CONTEXT)
+    win3.inspect_btn.click()
+    assert win3.context_view.toPlainText(), "no-call inspection still works"
+    win.close(); win2.close(); win3.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -968,6 +1075,7 @@ CASES = {
     "case_draft_stop_and_close": case_draft_stop_and_close,
     "case_draft_stale_refusal": case_draft_stale_refusal,
     "case_draft_candidate_tray": case_draft_candidate_tray,
+    "case_draft_scene_context": case_draft_scene_context,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,

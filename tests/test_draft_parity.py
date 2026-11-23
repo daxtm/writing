@@ -318,6 +318,42 @@ def test_delete_leaf_rules(tmp_path, monkeypatch, capsys):
     assert after["head"] == "n2"
 
 
+def test_scene_controls_parity(tmp_path, monkeypatch, capsys):
+    """who/pov/d CLI semantics match the shared operations; prompts match."""
+    root = build(tmp_path / "p")
+    out = run_cli(root, ["who Mara, Tom\n", "pov Mara\n", "d\n"],
+                  monkeypatch, capsys)
+    assert "present: Mara, Tom" in out
+    assert "pov: Mara" in out
+    assert "scene s001 done. next step: update-state" in out
+    scenes = json.loads((root / "scenes.json").read_text(encoding="utf-8"))
+    assert scenes[0]["characters"] == ["Mara", "Tom"]
+    assert scenes[0]["pov"] == "Mara"
+    assert scenes[0]["status"] == "done"
+    cli_prompt = dop.prepare_report(root, "s001")["prompt"]
+
+    root2 = build(tmp_path / "p2")
+    dop.set_cast(root2, "s001", ["Mara", "Tom"])
+    dop.set_pov(root2, "s001", "Mara")
+    dop.mark_done(root2, "s001")
+    assert json.loads((root2 / "scenes.json").read_text(encoding="utf-8")) == scenes
+    assert dop.prepare_report(root2, "s001")["prompt"] == cli_prompt, \
+        "next prompts are byte-identical after POV/cast changes"
+
+
+def test_prompt_dump_parity(tmp_path, monkeypatch, capsys):
+    """CLI cp and the operation write the same exact bytes; no call."""
+    root = build(tmp_path / "p")
+    out = run_cli(root, ["cp\n", "q\n"], monkeypatch, capsys)
+    assert "wrote" in out and "last_prompt.txt" in out
+    dumped = (root / "last_prompt.txt").read_bytes()
+
+    root2 = build(tmp_path / "p2")
+    res = dop.dump_prompt(root2, "s001")
+    assert (root2 / "last_prompt.txt").read_bytes() == dumped
+    assert res["path"].endswith("last_prompt.txt")
+
+
 def test_accept_matches_shared_operation(tmp_path, monkeypatch, capsys):
     """Accept moves head, planned->drafting; other candidates stay branches."""
     root = build(tmp_path / "p")

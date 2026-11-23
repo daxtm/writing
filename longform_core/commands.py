@@ -835,13 +835,21 @@ def cmd_draft(p, args):
             elif cmd == "who":
                 names = [x.strip() for x in arg.split(",") if x.strip()]
                 if names:
-                    sc["characters"] = names
-                    p.save_scenes(scenes)
+                    try:
+                        dop.set_cast(p.root, sc["id"], names)
+                    except dop.OpError as e:
+                        _op_fail(e)
+                    scenes = p.scenes()
+                    sc = scenes[p.scene_index(scenes, sc["id"])]
                 print("present: " + (", ".join(sc.get("characters") or []) or "(none)"))
             elif cmd == "pov":
                 if arg:
-                    sc["pov"] = arg
-                    p.save_scenes(scenes)
+                    try:
+                        dop.set_pov(p.root, sc["id"], arg)
+                    except dop.OpError as e:
+                        _op_fail(e)
+                    scenes = p.scenes()
+                    sc = scenes[p.scene_index(scenes, sc["id"])]
                 print(f"pov: {sc.get('pov', '')}  -> {{{{char}}}} = {pov_name(sc)}")
             elif cmd == "lb":
                 lore.sync(scenes)
@@ -945,8 +953,10 @@ def cmd_draft(p, args):
                     print(col(f"last {n} chars (head {tree.head}):", "36"))
                     print(tail_trim_chars(n, tree.text(), marker="…"))
             elif cmd == "d":
-                sc["status"] = "done"
-                p.save_scenes(scenes)
+                try:
+                    dop.mark_done(p.root, sc["id"])
+                except dop.OpError as e:
+                    _op_fail(e)
                 print(f"scene {sc['id']} done. next step: update-state {p.root} --scene {sc['id']}")
                 return
             else:

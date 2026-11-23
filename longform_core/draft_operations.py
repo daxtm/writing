@@ -17,8 +17,8 @@ import httpx
 from .api import Api, HttpErr, NoAnswerErr
 from .cancel import Cancelled
 from .config import SAMPLING_KEYS
-from .lore import Lore
-from .prompt import build_writer_prompt, clean_continuation, print_report, writer_sampling
+from .lore import Lore, pov_name
+from .prompt import build_writer_prompt, clean_continuation, format_card, writer_sampling
 from .reader_model import _no_symlink_below
 from .tree import Tree
 from .utils import FatalError, write_text
@@ -320,6 +320,61 @@ def delete_leaf(root, scene_id, nid, *, token=None, events=None):
     _save_tree(tree, p, scene_id, baseline)
     _emit(events, "deleted", nid=nid)
     return {"deleted": nid, "head": tree.head}
+
+
+def set_cast(root, scene_id, names, *, token=None):
+    """Set the characters physically present in the scene (CLI `who`)."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    names = [n for n in (names or []) if n]
+    baseline = _capture(p, ["scenes.json"])
+    if token:
+        token.check()
+    if names:
+        sc["characters"] = names
+        _save_scenes(scenes, p, baseline)
+    return {"cast": sc.get("characters") or []}
+
+
+def set_pov(root, scene_id, name, *, token=None):
+    """Set the POV character ({{char}}) for the scene (CLI `pov`)."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    baseline = _capture(p, ["scenes.json"])
+    if token:
+        token.check()
+    if name:
+        sc["pov"] = name
+        _save_scenes(scenes, p, baseline)
+    return {"pov": sc.get("pov", ""), "char": pov_name(sc)}
+
+
+def mark_done(root, scene_id, *, token=None):
+    """Mark the scene done; continuity update stays an explicit later step."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    baseline = _capture(p, ["scenes.json"])
+    if token:
+        token.check()
+    sc["status"] = "done"
+    _save_scenes(scenes, p, baseline)
+    return {"status": "done", "scene": scene_id,
+            "hint": f"scene {scene_id} done. next step: update-state {p.root} --scene {scene_id}"}
+
+
+def scene_card(root, scene_id):
+    """Read-only scene card and fields for the desktop Scene pane."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    return {"card": format_card(sc), "pov": sc.get("pov", ""),
+            "cast": ", ".join(sc.get("characters") or []),
+            "status": sc.get("status", ""),
+            "target_words": sc.get("target_words", 0),
+            "char": pov_name(sc)}
+
+
+def scene_overview(root):
+    """Ordered [{id,status,title}] for Next unfinished / explicit reopen."""
+    p = _project_of(root)
+    scenes = _scenes_or_error(p)
+    return [{"id": s["id"], "status": s.get("status", ""), "title": s.get("title", "")}
+            for s in scenes]
 
 
 # ------------------------------------------------------ session/inspection
