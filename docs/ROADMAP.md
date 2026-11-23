@@ -4,13 +4,16 @@
 
 Make `longform.py` safe to change through observable offline regression tests,
 then extract only the boundaries the prototype actually needs. Preserve
-`uv run --script longform.py …` and existing project files and reports.
+`uv run --script longform.py …` and existing project files and reports. Add a
+local read-only browser window for all saved draft branches alongside the CLI.
 
 ## Out of scope
 
-New writing features, model/provider changes, live API tests, a web UI, private
-sample/preset fixtures, and speculative packaging. Dependency provisioning may
-use network; test execution must not.
+New generation features, browser editing/generation, remote hosting,
+authentication/multi-user access, rich text, model/provider changes, live API
+tests, private sample/preset fixtures, new dependencies, and speculative
+packaging. Dependency provisioning may use network; test execution must not
+contact external services.
 
 ## Phase 0 — Walking skeleton: source, checks, and project facts
 
@@ -75,6 +78,27 @@ Result: `uv run --script longform.py --help`, the full offline suite, and
 fixed-fixture reports/prompts; 154 tests pass. One-file portability is
 sacrificed even though the launcher command stays the same.
 
+## Phase 4 — Local read-only reader
+
+- [ ] add-reader-gui — Keep active manuscript, every saved branch, and supporting writing readable in an automatically refreshed local browser.
+
+Observe with `uv run --script longform.py view /path/to/project --no-browser --port 0`:
+stdout prints `Reader: http://127.0.0.1:<assigned-port>/`. Open that URL to see
+title/progress and scene links; select a scene to read the active manuscript,
+full branch tree, inactive swipes, and metadata. Retained trees without current
+scene cards remain linked. `/notes` shows the bible, continuity state, scene/arc
+summaries, checks, and critiques as escaped plain text. Saving another draft
+branch makes it appear on the next two-second refresh cycle without a terminal
+reading command or export. Ctrl-C stops the reader.
+
+ADR-0004 fixes the architecture: standard-library HTTP, literal loopback bind,
+read-only content allowlist, trusted inline assets, and no build step. No
+configuration secrets or arbitrary files are served. Tests use temporary
+synthetic projects, `http.client`, and an ephemeral in-process listener under a
+port-specific exception to the existing offline guard. `./scripts/check.sh`
+discovers the reader tests and passes alongside the existing suite; no hosted
+CI phase is introduced.
+
 ## Decisions
 
 - [ADR-0001: Record architecture decisions](adr/0001-record-architecture-decisions.md).
@@ -84,3 +108,6 @@ sacrificed even though the launcher command stays the same.
 - [ADR-0003: Split the CLI into a package now](adr/0003-split-into-package.md)
   records the owner's deliberate override of the ADR-0002 gate and the package
   layout.
+- [ADR-0004: Use a read-only standard-library local web reader](adr/0004-local-web-reader.md)
+  records the local browser architecture and keeps browser mutation and remote
+  access outside this feature.
