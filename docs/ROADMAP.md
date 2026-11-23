@@ -74,6 +74,11 @@ Observe with `uv run --script longform.py --help`, then
 the same commands and regression outputs continue to work. A package sacrifices
 standalone one-file portability even though the launcher command stays the same.
 
+Gate check (2026-11-23): 2,771 lines; no second consumer; tests call the
+in-script helpers directly. Not triggered — re-check at ~3,000 lines, a new
+consumer, or a testability need. Splitting without a trigger requires a new ADR
+superseding ADR-0002.
+
 ## Decisions
 
 - [ADR-0001: Record architecture decisions](adr/0001-record-architecture-decisions.md).
