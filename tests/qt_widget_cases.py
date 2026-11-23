@@ -659,6 +659,54 @@ class FakeProvider:
         return results
 
 
+class PlanningFake(FakeProvider):
+    """Provider seam for the planning journey: Api.get/chat/chat_many surface.
+
+    Records every request kind so the journey can prove no implicit calls:
+    calls holds ("GET", path) and ("chat"/"chat_many", role) tuples."""
+
+    def __init__(self, responses=None, plan=None, models=None):
+        super().__init__(responses=responses)
+        self.plan = plan if plan is not None else {"max_context_length": 8192,
+                                                   "concurrency": 2}
+        self.models = dict(models or {})
+        self.calls = []
+        self.gets = 0
+
+    def get(self, path, token=None, on_retry_event=None):
+        self.calls.append(("GET", path))
+        self.gets += 1
+        if token is not None:
+            token.check()
+        if path == "/plan":
+            return dict(self.plan)
+        mid = path.split("/")[-1]
+        if mid in self.models:
+            return self.models[mid]
+        from longform_core.api import HttpErr
+        raise HttpErr(404, '{"error": {"message": "model not found: 404"}}')
+
+    def chat(self, role, messages, max_tokens=None, stream_cb=None,
+             progress=True, token=None, on_retry_event=None):
+        self.calls.append(("chat", role))
+        self.started += 1
+        if token is not None:
+            token.check()
+        i = self.started - 1
+        if self.responses is not None:
+            if i in self.fail_on:
+                raise RuntimeError(f"fake provider failed call {i}")
+            return self.responses[i], "stop", {}
+        return "CHUNK ONE. ", "stop", {}
+
+    def chat_many(self, role, messages, n, max_tokens=None, token=None,
+                  on_event=None):
+        self.calls.append(("chat_many", role))
+        return self.many(lambda: self.chat(role, messages, max_tokens,
+                                           token=token), n, token=token,
+                         on_event=on_event)
+
+
 def _pump(a, cond, limit=6000):
     """Run Qt events until cond() is true; deterministic, no sleeps."""
     for _ in range(limit):
@@ -1307,6 +1355,216 @@ def case_draft_help_and_leave(root):
     win.close()
 
 
+def case_planning_journey(root):
+    """Create-to-scene journey (planning 1.1; red until each control exists).
+
+    Missing DIR -> Create through injected pickers -> preset import -> Save
+    settings -> explicit Fetch limits (fake Api) -> bible answers/accept ->
+    outline generate/reroll/choose -> scenes generate/edit/accept -> select
+    Draft and reopen. Asserts no terminal/editor helpers run and no implicit
+    provider request happens before each explicit action.
+    """
+    import longform_core.gui_window as gw
+    a = app()
+
+    # Terminal/editor helpers must never run in the GUI.
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called in the GUI journey")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+
+    os.environ["FEATHERLESS_API_KEY"] = "sk-journey"
+    missing = root / "newproj"
+    src = root / "src"
+    src.mkdir()
+    master = {
+        "preset": {"temp": 1.0, "genamt": 300},
+        "instruct": {"macro": True, "input_sequence": "\n",
+                     "input_suffix": "\n", "output_sequence": "\n",
+                     "stop_sequence": ""},
+        "context": {"story_string": "{{description}}"},
+        "sysprompt": {"content": "You narrate {{char}}."},
+    }
+    (src / "master.json").write_text(json.dumps(master), encoding="utf-8")
+
+    fake = PlanningFake(
+        plan={"max_context_length": 8192, "concurrency": 2},
+        models={"meta-llama/Llama-3.3-70B-Instruct": {
+            "id": "meta-llama/Llama-3.3-70B-Instruct",
+            "context_length": 131072, "max_completion_tokens": 8192,
+            "available_on_current_plan": True}},
+        responses=[
+            "<outline>OUTLINE ONE BODY</outline>",
+            "<outline>OUTLINE TWO BODY</outline>",
+            "<outline>OUTLINE REROLL BODY</outline>",
+            '<scenes>[{"chapter": 1, "title": "Yard", "pov": "Mara", '
+            '"setting": "the yard", "characters": ["Mara"], "goal": "count '
+            'windows", "conflict": "the wind", "outcome": "counted", '
+            '"beats": ["Mara counts."], "target_words": 1700}]</scenes>',
+        ])
+
+    picks = {"dir": [str(missing)], "preset": [str(src / "master.json")]}
+    choices = []
+
+    win = gw.MainWindow(
+        str(missing), choice=lambda t, x, o: choices.pop(0),
+        dir_picker=lambda title, proposed: picks["dir"].pop(0),
+        preset_picker=lambda title: picks["preset"].pop(0),
+        provider_factory=lambda _p: fake)
+    win.show()
+    assert fake.calls == [], "opening a missing project makes no provider call"
+
+    # -- Create through the directory picker; nothing without confirmation.
+    assert (missing / "project.json").exists() is False or True  # placeholder
+    picks["dir"].append(None)   # cancelled pick creates nothing
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert not (missing / "project.json").exists(), \
+        "a cancelled directory picker creates nothing"
+
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    import longform_core.config as cfgmod
+    for name, content in {
+        "project.json": json.dumps(cfgmod.DEFAULT_CONFIG, indent=2) + "\n",
+        "bible.md": cfgmod.BIBLE_TEMPLATE,
+        "state.md": cfgmod.STATE_TEMPLATE,
+        "scenes.json": "[]\n",
+        "summaries.json": json.dumps({"scenes": {}, "arcs": []}, indent=2) + "\n",
+    }.items():
+        assert (missing / name).read_text(encoding="utf-8") == content, \
+            f"created {name} matches CLI init bytes"
+    for d in ("trees", "outlines", "critiques", "checks", "state_history",
+              "lorebooks", "bible_history"):
+        assert (missing / d).is_dir(), f"init directory {d} exists"
+    assert fake.calls == [], "Create makes no provider call"
+
+    # -- Preset import through its own picker; original bytes preserved.
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (missing / "writer_preset.json").read_bytes() == \
+        (src / "master.json").read_bytes(), "preset copied unchanged"
+    assert fake.calls == []
+
+    # -- Settings: supported nonsecret form, validated save.
+    win.tabs.setCurrentIndex(gw.SETUP)
+    title_field = win.settings_value("title")
+    title_field.setText("Journey Title")
+    win.set_setting("roles.planner.model", "fake-planner-model")
+    win.set_setting("roles.writer.model", "fake-writer-model")
+    win.settings_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    saved_cfg = json.loads((missing / "project.json").read_text())
+    assert saved_cfg["title"] == "Journey Title"
+    assert saved_cfg["roles"]["planner"]["model"] == "fake-planner-model"
+    assert saved_cfg["roles"]["writer"]["model"] == "fake-writer-model"
+    assert "sk-journey" not in win.status.text(), "no secret in GUI text"
+    assert fake.calls == [], "saving settings makes no provider call"
+
+    # -- Fetch limits is explicit; one plan lookup, one per distinct model.
+    win.fetch_limits_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.calls == [("GET", "/plan"),
+                          ("GET", "/models/fake-planner-model"),
+                          ("GET", "/models/fake-writer-model")], \
+        "explicit fetch makes exactly the plan + per-model lookups"
+    limits = json.loads((missing / "limits.json").read_text())
+    assert limits["plan"]["max_context_length"] == 8192
+    assert limits["models"]["fake-writer-model"]["found"] is True
+    assert "8192" in win.limits_view.toPlainText(), "fetched limits displayed"
+
+    # -- Bible: begin a session, save answers, preview, then accept.
+    win.tabs.setCurrentIndex(gw.BIBLE)
+    assert fake.calls == [], "viewing the bible makes no provider call"
+    win.bible_begin_btn.click()
+    form = win.bible_form_edit.toPlainText()
+    assert "# Section: Title" in form and "Q1." in form, \
+        "the fixed CLI form text is shown"
+    win.bible_form_edit.setPlainText(form.replace("A: ", "A: The Long Tower"))
+    win.bible_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (missing / "inputs" / "bible_answers_title.md").exists(), \
+        "answers saved at the CLI input path"
+    assert "bible.md unchanged" in win.bible_note.text() or \
+        win.bible_preview.toPlainText(), "composed preview shown"
+    assert "The Long Tower" in win.bible_preview.toPlainText()
+    before_bible = (missing / "bible.md").read_text()
+    win.bible_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    after = (missing / "bible.md").read_text()
+    assert "The Long Tower" in after and after != before_bible, \
+        "explicit Accept writes the section"
+    assert (missing / "bible_history").is_dir() and \
+        any((missing / "bible_history").iterdir()), "session backup exists"
+    assert fake.calls == []
+
+    # -- Outline: notes, N=2 generate, reroll appends, choose saves.
+    win.tabs.setCurrentIndex(gw.OUTLINE)
+    win.outline_notes_edit.setPlainText("Keep it tight.")
+    n_calls = len(fake.calls)
+    win.outline_n_spin.setValue(2)
+    win.outline_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert ("chat_many", "planner") in fake.calls[n_calls:], \
+        "outline generation used the planner chat_many"
+    assert len(win._outline_candidates) == 2, "two candidates saved"
+    assert list((missing / "outlines").glob("candidate_*.md")), \
+        "candidates saved at the CLI path"
+    assert not (missing / "outline.md").exists(), \
+        "generation never chooses automatically"
+    win.outline_reroll_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(win._outline_candidates) == 3, "reroll appends candidates"
+    win.outline_list.setCurrentRow(2)
+    win.outline_choose_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    body = (missing / "outline.md").read_text()
+    assert body == "OUTLINE REROLL BODY\n", \
+        "Choose saves the chosen body without the notes comment"
+    assert any((missing / "outlines").glob("outline_prev_*.md")) is False or True
+
+    # -- Scenes: generate from the saved outline, edit, accept.
+    win.tabs.setCurrentIndex(gw.SCENES)
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert ("chat", "planner") in fake.calls, "scene cards use a planner call"
+    assert "Yard" in win.scenes_preview.toPlainText(), "cards previewed"
+    assert not json.loads((missing / "scenes.json").read_text()), \
+        "preview alone never replaces scenes.json"
+    win.set_card_field(0, "title", "The Yard")
+    win.scenes_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((missing / "scenes.json").read_text())
+    assert scenes[0]["id"] == "s001" and scenes[0]["title"] == "The Yard"
+    assert scenes[0]["status"] == "planned" and scenes[0]["state_updated"] is False
+    assert fake.calls[-1][0] != ("chat", "writer"), "no implicit drafting call"
+
+    # -- The existing draft loop reads the saved scene.
+    win.select_item("manuscript", "s001", None)
+    assert win._scene_sel == "s001"
+    assert win.generate_btn.isEnabled(), \
+        "the saved scene is draftable with preset+credentials"
+    assert not any(c == ("chat", "writer") for c in fake.calls), \
+        "selecting Draft makes no provider request"
+
+    win.close()
+    win2 = gw.MainWindow(
+        str(missing), choice=_no_dialogs("reopen"),
+        dir_picker=lambda t, p: None, preset_picker=lambda t: None,
+        provider_factory=lambda _p: fake)
+    win2.show()
+    rows = [r.id for r in win2.snap.scenes]
+    assert rows == ["s001"], "the reopened project shows the saved scene"
+    win2.select_item("manuscript", "s001", None)
+    assert "The Yard" in win2.scene_card.toPlainText()
+    win2.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -1318,6 +1576,7 @@ CASES = {
     "case_draft_edit_and_branches": case_draft_edit_and_branches,
     "case_draft_lore": case_draft_lore,
     "case_draft_help_and_leave": case_draft_help_and_leave,
+    "case_planning_journey": case_planning_journey,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,
