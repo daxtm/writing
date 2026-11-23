@@ -443,6 +443,180 @@ def test_archive_contains_no_private_or_test_inputs(archive_contents):
         assert not any(fragment in n for n in names), f"private/test input {fragment!r} in bundle"
 
 
+# ---------------------------------------------------------------------------
+# External editor invocation (tasks 2.1)
+# ---------------------------------------------------------------------------
+
+ENV_EDITOR_SH = """\
+#!/bin/sh
+{
+  printf 'LD_LIBRARY_PATH=[%s]\\n' "$LD_LIBRARY_PATH"
+  printf 'LD_LIBRARY_PATH_SET=[%s]\\n' "${LD_LIBRARY_PATH+set}"
+  printf 'LD_LIBRARY_PATH_ORIG=[%s]\\n' "$LD_LIBRARY_PATH_ORIG"
+  printf 'LD_LIBRARY_PATH_ORIG_SET=[%s]\\n' "${LD_LIBRARY_PATH_ORIG+set}"
+} > "$EDITOR_DUMP"
+printf 'EDITED BY FAKE EDITOR\\n' >> "$1"
+"""
+
+
+def make_env_editor(tmp_path):
+    dump = tmp_path / "editor-env-dump.txt"
+    editor = tmp_path / "env-editor.sh"
+    editor.write_text(ENV_EDITOR_SH, encoding="utf-8")
+    editor.chmod(0o755)
+    return editor, dump
+
+
+def read_env_dump(dump):
+    fields = {}
+    for line in dump.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"(\w+)=\[(.*)\]", line)
+        if m:
+            fields[m.group(1)] = m.group(2)
+    return fields
+
+
+def test_frozen_edit_text_restores_library_path(tmp_path, monkeypatch):
+    """Frozen only: the editor child must see the host's original library search
+    path instead of the extraction directory."""
+    from longform_core import utils
+    editor, dump = make_env_editor(tmp_path)
+    monkeypatch.setenv("VISUAL", str(editor))
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.setenv("EDITOR_DUMP", str(dump))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/frozen/extraction/dir")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/host/original/lib")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    result = utils.edit_text("original text\n")
+    assert "original text" in result and "EDITED BY FAKE EDITOR" in result
+    env = read_env_dump(dump)
+    assert env["LD_LIBRARY_PATH"] == "/host/original/lib"
+
+
+def test_frozen_edit_text_without_original_library_path_removes_it(tmp_path, monkeypatch):
+    from longform_core import utils
+    editor, dump = make_env_editor(tmp_path)
+    monkeypatch.setenv("VISUAL", str(editor))
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.setenv("EDITOR_DUMP", str(dump))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/frozen/extraction/dir")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    utils.edit_text("text\n")
+    env = read_env_dump(dump)
+    assert env["LD_LIBRARY_PATH_SET"] != "set", "extraction path must not leak into the editor"
+
+
+def test_source_edit_text_behavior_unchanged(tmp_path, monkeypatch):
+    """Without frozen execution the env is inherited exactly as before."""
+    from longform_core import utils
+    editor, dump = make_env_editor(tmp_path)
+    monkeypatch.setenv("VISUAL", str(editor))
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.setenv("EDITOR_DUMP", str(dump))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/host/whatever/lib")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/elsewhere/lib")
+    monkeypatch.delattr(sys, "frozen", raising=False)
+
+    result = utils.edit_text("text\n")
+    env = read_env_dump(dump)
+    assert env["LD_LIBRARY_PATH"] == "/host/whatever/lib"
+    assert "text" in result and "EDITED BY FAKE EDITOR" in result
+
+
+# ---------------------------------------------------------------------------
+# Synthetic projects used by frozen-command tests
+# ---------------------------------------------------------------------------
+
+WRITER_PRESET = {
+    "preset": {"temp": 1.0, "genamt": 50},
+    "instruct": {"macro": True, "input_sequence": "\n", "input_suffix": "\n",
+                 "output_sequence": "\n", "stop_sequence": ""},
+    "context": {"story_string": "{{description}}"},
+    "sysprompt": {"content": "You narrate {{char}}."},
+}
+
+TREE_1 = {
+    "nodes": {
+        "n1": {"id": "n1", "parent": None, "text": "Opening.", "sep": "\n\n",
+               "source": "model", "created": "2026-01-01 10:00", "model": "test-model",
+               "steer": "keep quiet"},
+        "n2": {"id": "n2", "parent": None, "text": "An inactive branch not exported.",
+               "sep": "\n\n", "source": "model", "created": "2026-01-01 10:01",
+               "model": "test-model"},
+    },
+    "head": "n1", "counter": 2,
+}
+
+ACTIVE_TEXT_1 = "Opening."
+
+
+def make_project(root: Path, scenes=None, trees=None, banned=None, preset=True, summaries=None):
+    """A fixed synthetic project (no API use): config, optional preset, scenes
+    and per-scene trees, including inactive branches."""
+    root.mkdir(parents=True, exist_ok=True)
+    cfg = {"title": "Frozen parity test"}
+    if banned is not None:
+        cfg["banned_phrases"] = banned
+    (root / "project.json").write_text(json.dumps(cfg) + "\n", encoding="utf-8")
+    if preset:
+        (root / "writer_preset.json").write_text(json.dumps(WRITER_PRESET) + "\n", encoding="utf-8")
+    (root / "bible.md").write_text("# Story bible\n\nA quiet town.\n", encoding="utf-8")
+    (root / "state.md").write_text("Mara is at the yard.\n", encoding="utf-8")
+    (root / "scenes.json").write_text(json.dumps(scenes if scenes is not None else [
+        {"id": "s001", "chapter": 1, "title": "Yard", "pov": "Mara",
+         "characters": ["Mara"], "goal": "count the windows", "target_words": 100,
+         "status": "drafting"},
+    ]) + "\n", encoding="utf-8")
+    (root / "summaries.json").write_text(json.dumps(summaries if summaries is not None
+                                                    else {"scenes": {}, "arcs": []}) + "\n",
+                                         encoding="utf-8")
+    (root / "trees").mkdir(exist_ok=True)
+    for sid, tree in (trees or {"s001": TREE_1}).items():
+        (root / "trees" / f"{sid}.json").write_text(json.dumps(tree) + "\n", encoding="utf-8")
+    return root
+
+
+def test_frozen_binary_draft_edit_saves_through_fake_editor(built, tmp_path):
+    """A synthetic draft session in the copied executable edits the steering note
+    with a user-supplied fake editor; the editor must see the host's original
+    library search environment, and its edits must be saved through the draft
+    flow."""
+    root = make_project(tmp_path / "editor project")
+    editor, dump = make_env_editor(tmp_path)
+
+    # Case 1: an original host library path exists (as LD_LIBRARY_PATH_ORIG set
+    # before the freeze).
+    env = frozen_env(tmp_path, built.guard_so, extra={
+        "VISUAL": str(editor), "EDITOR": str(editor), "EDITOR_DUMP": str(dump),
+        "LD_LIBRARY_PATH_ORIG": "/host/original/lib",
+    })
+    r = run_frozen(built.copied, ["draft", str(root), "--scene", "s001"], env=env,
+                   stdin="se\nq\n", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "steer set: EDITED BY FAKE EDITOR" in r.stdout
+    tree = json.loads((root / "trees" / "s001.json").read_text(encoding="utf-8"))
+    assert tree["steer"] == "EDITED BY FAKE EDITOR"
+    fields = read_env_dump(dump)
+    assert fields["LD_LIBRARY_PATH"] == "/host/original/lib", \
+        "the bundled extraction path must not leak into the editor"
+
+    # Case 2: no original library path; the editor child sees none.
+    dump.unlink()
+    env = frozen_env(tmp_path, built.guard_so, extra={
+        "VISUAL": str(editor), "EDITOR": str(editor), "EDITOR_DUMP": str(dump),
+    })
+    r = run_frozen(built.copied, ["draft", str(root), "--scene", "s001"], env=env,
+                   stdin="se\nq\n", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    fields = read_env_dump(dump)
+    assert fields.get("LD_LIBRARY_PATH_SET") != "set", \
+        f"editor saw a library search path it must not see: {fields}"
+    assert fields.get("LD_LIBRARY_PATH_ORIG_SET") != "set"
+
+
 def test_build_script_fails_without_uv(tmp_path):
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
     r = subprocess.run(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
