@@ -94,9 +94,20 @@ dependency and CA-certificate updates); there is no auto-updater.
 
 ## Testing
 
-`./scripts/check.sh` builds the executable once and runs
-`tests/test_standalone.py`: the copied binary is exercised away from the
-checkout (with Python/uv and the source import paths absent) against synthetic
-projects, in parity with the source CLI, under a native network guard that
-denies Internet access inside the frozen process and its children. Missing
-compiler or build prerequisites fail the checks; nothing is skipped.
+`./scripts/check.sh` prints `== standalone`, builds the executable once through
+`scripts/build-standalone.sh` (provisioning build dependencies; may use the
+network), runs `tests/test_standalone.py` against that artifact, and then runs
+the source regression suite. The direct documented pytest invocation,
+`uv run --with pytest --with httpx pytest -q tests`, runs the same coverage: it
+includes the frozen tests and provisions/builds through the production script
+whenever `dist/longform` is missing or older than the build inputs (the frozen
+tests reuse a freshly built artifact rather than rebuilding).
+
+The copied binary is exercised away from the checkout (with Python/uv and the
+source import paths absent) against synthetic projects, in parity with the
+source CLI, under a native network guard that denies Internet access inside the
+frozen process and its children (proven by a compiled challenge probe, without
+Python on PATH). Missing compiler, missing build prerequisites, a failed build
+or a failing frozen test fails the checks with a nonzero exit; nothing is
+skipped. Source-side monkeypatch/sitecustomize network guards are retained for
+the source runs.

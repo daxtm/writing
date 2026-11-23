@@ -312,22 +312,29 @@ def run_source(args, root: Path, cwd=None, extra_env=None, timeout=300):
 @pytest.fixture(scope="session")
 def built(tmp_path_factory, net_guard):
     """Build once per session through the documented script, then copy only the
-    executable into a temporary directory with spaces."""
+    executable into a temporary directory with spaces. An artifact that is
+    newer than every build input (e.g. produced by ./scripts/check.sh moments
+    earlier) is reused; anything missing or stale is rebuilt by the script."""
     if not BUILD_SCRIPT.is_file():
         pytest.fail(f"scripts/build-standalone.sh not found at {BUILD_SCRIPT}: the documented "
                     "build entry point does not exist, so the standalone owner journey cannot run")
-    print("\nbuilding standalone executable via scripts/build-standalone.sh ...")
-    proc = subprocess.run(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
-                          capture_output=True, text=True, timeout=3600)
-    if proc.returncode != 0:
-        pytest.fail("scripts/build-standalone.sh failed:\n"
-                    + (proc.stdout or "") + "\n" + (proc.stderr or ""))
     exe = REPO / "dist" / BINARY_NAME
+    venv_py = REPO / "build" / "standalone" / "venv" / "bin" / "python"
+    inputs = [BUILD_SCRIPT, REPO / "scripts" / "standalone-requirements.txt", REPO / "longform.py"]
+    inputs += sorted((REPO / "longform_core").glob("*.py"))
+    fresh = (exe.is_file() and venv_py.is_file()
+             and all(p.stat().st_mtime_ns <= exe.stat().st_mtime_ns for p in inputs))
+    if not fresh:
+        print("\nbuilding standalone executable via scripts/build-standalone.sh ...")
+        proc = subprocess.run(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
+                              capture_output=True, text=True, timeout=3600)
+        if proc.returncode != 0:
+            pytest.fail("scripts/build-standalone.sh failed:\n"
+                        + (proc.stdout or "") + "\n" + (proc.stderr or ""))
     if not exe.is_file():
         pytest.fail(f"build script reported success but no artifact at {exe}")
     if not os.access(exe, os.X_OK):
         pytest.fail(f"{exe} is not executable")
-    venv_py = REPO / "build" / "standalone" / "venv" / "bin" / "python"
     if not venv_py.is_file():
         pytest.fail(f"build venv interpreter missing at {venv_py}; the build script did not "
                     "provision its documented build environment")
