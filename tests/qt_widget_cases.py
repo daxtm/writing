@@ -1403,7 +1403,15 @@ def case_planning_journey(root):
         models={"meta-llama/Llama-3.3-70B-Instruct": {
             "id": "meta-llama/Llama-3.3-70B-Instruct",
             "context_length": 131072, "max_completion_tokens": 8192,
-            "available_on_current_plan": True}},
+            "available_on_current_plan": True},
+            "fake-planner-model": {
+                "id": "fake-planner-model", "context_length": 4096,
+                "max_completion_tokens": 4096,
+                "available_on_current_plan": True},
+            "fake-writer-model": {
+                "id": "fake-writer-model", "context_length": 8192,
+                "max_completion_tokens": 4096,
+                "available_on_current_plan": True}},
         responses=[
             "<outline>OUTLINE ONE BODY</outline>",
             "<outline>OUTLINE TWO BODY</outline>",
@@ -1458,8 +1466,7 @@ def case_planning_journey(root):
 
     # -- Settings: supported nonsecret form, validated save.
     win.tabs.setCurrentIndex(gw.SETUP)
-    title_field = win.settings_value("title")
-    title_field.setText("Journey Title")
+    win.set_setting("title", "Journey Title")
     win.set_setting("roles.planner.model", "fake-planner-model")
     win.set_setting("roles.writer.model", "fake-writer-model")
     win.settings_save_btn.click()
@@ -1476,8 +1483,10 @@ def case_planning_journey(root):
     assert _pump(a, lambda: not win._busy)
     assert fake.calls == [("GET", "/plan"),
                           ("GET", "/models/fake-planner-model"),
-                          ("GET", "/models/fake-writer-model")], \
-        "explicit fetch makes exactly the plan + per-model lookups"
+                          ("GET", "/models/fake-writer-model"),
+                          ("GET", "/models/meta-llama/"
+                                  "Llama-3.3-70B-Instruct")], \
+        "explicit fetch makes exactly the plan + per-distinct-model lookups"
     limits = json.loads((missing / "limits.json").read_text())
     assert limits["plan"]["max_context_length"] == 8192
     assert limits["models"]["fake-writer-model"]["found"] is True
@@ -1485,8 +1494,9 @@ def case_planning_journey(root):
 
     # -- Bible: begin a session, save answers, preview, then accept.
     win.tabs.setCurrentIndex(gw.BIBLE)
-    assert fake.calls == [], "viewing the bible makes no provider call"
+    n_calls = len(fake.calls)
     win.bible_begin_btn.click()
+    assert _pump(a, lambda: not win._busy), "bible session started"
     form = win.bible_form_edit.toPlainText()
     assert "# Section: Title" in form and "Q1." in form, \
         "the fixed CLI form text is shown"
@@ -1506,7 +1516,7 @@ def case_planning_journey(root):
         "explicit Accept writes the section"
     assert (missing / "bible_history").is_dir() and \
         any((missing / "bible_history").iterdir()), "session backup exists"
-    assert fake.calls == []
+    assert len(fake.calls) == n_calls, "the bible flow makes no provider call"
 
     # -- Outline: notes, N=2 generate, reroll appends, choose saves.
     win.tabs.setCurrentIndex(gw.OUTLINE)
@@ -1522,6 +1532,7 @@ def case_planning_journey(root):
         "candidates saved at the CLI path"
     assert not (missing / "outline.md").exists(), \
         "generation never chooses automatically"
+    win.outline_n_spin.setValue(1)
     win.outline_reroll_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert len(win._outline_candidates) == 3, "reroll appends candidates"
@@ -1550,8 +1561,9 @@ def case_planning_journey(root):
     assert fake.calls[-1][0] != ("chat", "writer"), "no implicit drafting call"
 
     # -- The existing draft loop reads the saved scene.
-    win.select_item("manuscript", "s001", None)
-    assert win._scene_sel == "s001"
+    win.refresh(force=True)
+    win.select_item("manuscript", "s01", None)
+    assert win._scene_sel == "s01"
     assert win.generate_btn.isEnabled(), \
         "the saved scene is draftable with preset+credentials"
     assert not any(c == ("chat", "writer") for c in fake.calls), \
@@ -1564,7 +1576,7 @@ def case_planning_journey(root):
         provider_factory=lambda _p: fake)
     win2.show()
     rows = [r.id for r in win2.snap.scenes]
-    assert rows == ["s001"], "the reopened project shows the saved scene"
+    assert rows == ["s01"], "the reopened project shows the saved scene"
     win2.select_item("manuscript", "s01", None)
     assert "The Yard" in win2.scene_card.toPlainText()
     win2.close()
@@ -2195,6 +2207,120 @@ def case_planning_scenes(root):
     win2.close()
 
 
+def case_planning_card_edit(root):
+    """Saved-card editing: descriptive fields only, identity/status/state
+    flags and trees preserved, backups, no-op saves, dirty preservation and
+    refreshed sidebar/POV/cast readiness."""
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    proj = root / "p"
+    (proj / "trees").mkdir(parents=True)
+    _write_json(proj / "project.json", {"api_key": "sk-test"})
+    _write_json(proj / "scenes.json", [
+        {"id": "s01", "chapter": 1, "title": "Yard", "pov": "Old POV",
+         "setting": "yard", "characters": ["Old"], "goal": "g", "conflict":
+         "c", "outcome": "o", "beats": ["b"], "notes": "", "target_words":
+         100, "status": "drafting", "state_updated": True,
+         "custom_field": 7},
+        {"id": "s02", "chapter": 1, "title": "Second", "target_words": 900,
+         "status": "planned", "state_updated": False}])
+    _write_json(proj / "summaries.json", {"scenes": {}, "arcs": []})
+    _write_text(proj / "bible.md", "# Story bible\n\nQuiet town.\n")
+    _write_json(proj / "writer_preset.json", PRESET)
+    (proj / "trees" / "s01.json").write_text(
+        json.dumps({"nodes": {"n1": {"id": "n1", "parent": None, "text":
+                                     "Drafted prose.", "sep": "\n\n",
+                                     "created": "x", "history": []}},
+                    "head": "n1", "counter": 1}) + "\n", encoding="utf-8")
+    tree_before = (proj / "trees" / "s01.json").read_bytes()
+
+    win = gw.MainWindow(str(proj), choice=_no_dialogs("cardedit"),
+                        provider_factory=lambda _p: PlanningFake())
+    win.show()
+    win.tabs.setCurrentIndex(gw.SCENES)
+    win.scenes_load_btn.click()
+    assert win.scenes_list.count() == 2
+    assert "Yard" in win.scenes_preview.toPlainText()
+
+    # edit the drafted card descriptively; unknown fields survive
+    win.set_card_field(0, "title", "Renamed Yard")
+    win.set_card_field(0, "pov", "Mara")
+    win.set_card_field(0, "characters", "Mara, Tom")
+    win.set_card_field(0, "target_words", "150")
+    win.scenes_save_card_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    saved = json.loads((proj / "scenes.json").read_text())
+    assert saved[0]["title"] == "Renamed Yard"
+    assert saved[0]["pov"] == "Mara"
+    assert saved[0]["characters"] == ["Mara", "Tom"]
+    assert saved[0]["target_words"] == 150
+    assert saved[0]["status"] == "drafting"
+    assert saved[0]["state_updated"] is True
+    assert saved[0]["custom_field"] == 7, "unknown card data preserved"
+    assert saved[1]["title"] == "Second"
+    assert (proj / "trees" / "s01.json").read_bytes() == tree_before
+    prevs = list((proj / "outlines").glob("scenes_prev_*.json"))
+    assert prevs and json.loads(prevs[0].read_text())[0]["title"] == "Yard"
+
+    # the existing draft controls read the saved card without dropping prose
+    win.select_item("manuscript", "s01", None)
+    assert "Drafted prose." in win.reading.toPlainText(), \
+        "retained tree text stays readable"
+    win.tabs.setCurrentIndex(gw.SCENE)
+    assert "Mara" in win.pov_edit.text(), "POV control refreshed"
+    assert "Mara, Tom" in win.cast_edit.text(), "cast control refreshed"
+
+    # unchanged save is a no-op
+    before = (proj / "scenes.json").read_bytes()
+    win.tabs.setCurrentIndex(gw.SCENES)
+    win.scenes_load_btn.click()
+    win.scenes_save_card_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (proj / "scenes.json").read_bytes() == before
+    assert "no changes" in win.status.text().lower() or "no-op" in \
+        win.status.text().lower()
+
+    # invalid field values are refused and the dirty editor is preserved
+    win.set_card_field(0, "target_words", "-5")
+    win.scenes_save_card_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not saved" in win.status.text().lower() or \
+        "target_words" in win.status.text()
+    assert (proj / "scenes.json").read_bytes() == before
+    assert win._scene_cards[0]["target_words"] == "-5", \
+        "the unsaved entry remains for correction"
+    win.set_card_field(0, "target_words", "150")
+    win.scenes_save_card_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert json.loads((proj / "scenes.json").read_text())[0]["target_words"] \
+        == 150
+
+    # stale refusal keeps disk and edits
+    win.scenes_load_btn.click()
+    win.set_card_field(0, "title", "Stale Edit")
+    saved = json.loads((proj / "scenes.json").read_text())
+    saved[0]["title"] = "external"
+    _write_json(proj / "scenes.json", saved)
+    win.scenes_save_card_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "changed on disk" in win.status.text()
+    assert json.loads((proj / "scenes.json").read_text())[0]["title"] == \
+        "external"
+    assert win._scene_cards[0]["title"] == "Stale Edit"
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -2225,6 +2351,7 @@ CASES = {
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
     "case_planning_scenes": case_planning_scenes,
+    "case_planning_card_edit": case_planning_card_edit,
 }
 
 

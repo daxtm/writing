@@ -1298,3 +1298,119 @@ def test_scenes_generation_stop_saves_nothing(tmp_path):
                                   FakeSceneProvider(p))
     assert json.loads((root / "scenes.json").read_text()) == []
     assert not list((root / "outlines").glob("scenes_raw_*"))
+
+
+# ------------------------------------------------- saved-card editing (1.7)
+
+def saved_card(i=1, **kw):
+    d = {"id": f"s0{i}", "chapter": 1, "title": f"Card {i}", "pov": "Mara",
+         "setting": "yard", "characters": ["Mara"], "goal": "g", "conflict":
+         "c", "outcome": "o", "beats": ["b"], "notes": "", "target_words":
+         100, "status": "drafting", "state_updated": True, "extra_field":
+         {"keep": True}}
+    d.update(kw)
+    return d
+
+
+def test_card_edit_preserves_identity_and_unknown_fields(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    _write_json(root / "scenes.json", [saved_card(), saved_card(2)])
+    (root / "trees" / "s01.json").write_text("{}", encoding="utf-8")
+    tree_before = (root / "trees" / "s01.json").read_bytes()
+    base = plan.scenes_baseline(root)
+    out = plan.save_scene_cards(root, [
+        dict(saved_card(), title="Renamed", characters=["Mara", "Tom"],
+             target_words=150),
+        saved_card(2)], base)
+    assert out["changed"] == 1
+    saved = json.loads((root / "scenes.json").read_text())
+    assert saved[0]["id"] == "s01" and saved[1]["id"] == "s02"
+    assert saved[0]["title"] == "Renamed"
+    assert saved[0]["status"] == "drafting"
+    assert saved[0]["state_updated"] is True
+    assert saved[0]["extra_field"] == {"keep": True}
+    assert saved[0]["characters"] == ["Mara", "Tom"]
+    assert saved[0]["target_words"] == 150
+    assert (root / "trees" / "s01.json").read_bytes() == tree_before
+    prevs = list((root / "outlines").glob("scenes_prev_*.json"))
+    assert prevs and json.loads(prevs[0].read_text())[0]["title"] == "Card 1"
+
+
+def test_card_edit_noop_save(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    _write_json(root / "scenes.json", [saved_card()])
+    before = (root / "scenes.json").read_bytes()
+    base = plan.scenes_baseline(root)
+    out = plan.save_scene_cards(root, [saved_card()], base)
+    assert out["no_op"] is True and out["changed"] == 0
+    assert (root / "scenes.json").read_bytes() == before
+    assert not list((root / "outlines").glob("scenes_prev_*.json"))
+
+
+def test_card_edit_refuses_identity_and_status_changes(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    _write_json(root / "scenes.json", [saved_card()])
+    base = plan.scenes_baseline(root)
+    before = (root / "scenes.json").read_bytes()
+    assert plan.save_scene_cards(root, [saved_card()], base)["no_op"] is True
+    with pytest.raises(OpError) as e:
+        plan.save_scene_cards(root, [dict(saved_card(), status="planned")],
+                              base)
+    assert "status cannot be edited" in str(e.value)
+    with pytest.raises(OpError) as e:
+        plan.save_scene_cards(root, [dict(saved_card(), state_updated=False)],
+                              base)
+    assert "state_updated cannot be edited" in str(e.value)
+    # different id count / order
+    with pytest.raises(OpError) as e:
+        plan.save_scene_cards(root, [dict(saved_card(), id="s09")], base)
+    assert "identity or order changed" in str(e.value)
+    assert (root / "scenes.json").read_bytes() == before
+
+
+def test_card_edit_refuses_bad_values(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    _write_json(root / "scenes.json", [saved_card()])
+    base = plan.scenes_baseline(root)
+    for bad in ({"chapter": "abc"}, {"chapter": 0}, {"target_words": -1},
+                {"target_words": "abc"}, {"characters": ["Mara", 2]},
+                {"beats": "no"}, {"title": 5}):
+        with pytest.raises(OpError) as e:
+            plan.save_scene_cards(root, [dict(saved_card(), **bad)], base)
+        msg = str(e.value)
+        assert "card s01" in msg or "scenes" in msg, bad
+    saved = json.loads((root / "scenes.json").read_text())
+    assert saved[0]["title"] == "Card 1", "invalid edits write nothing"
+
+
+def test_card_edit_stale_and_unsafe_refusal(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    _write_json(root / "scenes.json", [saved_card()])
+    base = plan.scenes_baseline(root)
+    _write_json(root / "scenes.json", [saved_card(title="external")])
+    with pytest.raises(OpError) as e:
+        plan.save_scene_cards(root, [dict(saved_card(), title="mine")], base)
+    assert getattr(e.value, "stale", False)
+    assert json.loads((root / "scenes.json").read_text())[0]["title"] == \
+        "external"
+
+    (root / "scenes.json").rename(root / "scenes_keep.json")
+    (root / "scenes.json").symlink_to(root / "scenes_keep.json")
+    base2 = plan.scenes_baseline(root)
+    with pytest.raises(OpError) as e:
+        plan.save_scene_cards(root, [dict(saved_card(), title="mine")], base2)
+    assert "symlink" in str(e.value)
+
+
+def test_card_edit_refreshes_draft_reads(tmp_path):
+    """The existing draft controls read the current saved cards after a save."""
+    import longform_core.draft_operations as dop
+    root = scenes_project(tmp_path / "p")
+    _write_json(root / "scenes.json", [saved_card(pov="Old POV",
+                                                  characters=["Old"])])
+    base = plan.scenes_baseline(root)
+    plan.save_scene_cards(root, [dict(saved_card(), pov="Mara",
+                                      characters=["Mara", "Tom"])], base)
+    card = dop.scene_card(root, "s01")
+    assert card["pov"] == "Mara" and card["cast"] == "Mara, Tom"
+    assert card["status"] == "drafting"

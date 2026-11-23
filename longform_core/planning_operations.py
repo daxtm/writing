@@ -697,6 +697,117 @@ def scenes_baseline_stale(root, baseline):
                for k in ("scenes.json", "trees"))
 
 
+def save_scene_cards(root, cards, baseline, *, token=None, events=None):
+    """Descriptive-field edits of saved scene cards (Scenes tab editing).
+
+    Preserves IDs, order, status, state_updated and unknown card fields and
+    every tree; only chapter/title/pov/setting/characters/goal/conflict/
+    outcome/beats/notes/target_words may change. Unchanged input is a no-op;
+    a changed save uses the previous-scenes backup and stale/unsafe guards."""
+    p = _project_of(root)
+    saved = _scenes_or_error(p)
+    if not isinstance(cards, list) or not cards:
+        raise OpError("no cards to save", soft=True)
+    if len(cards) != len(saved) or \
+            [c.get("id") for c in cards if isinstance(c, dict)] != \
+            [s["id"] for s in saved]:
+        raise OpError("scene identity or order changed; scene IDs cannot be "
+                      "edited here (regenerate with force instead)",
+                      soft=True)
+    by_id = {s["id"]: s for s in saved}
+    editable = ("chapter", "title", "pov", "setting", "characters", "goal",
+                "conflict", "outcome", "beats", "notes", "target_words")
+    changed, warnings = 0, []
+    for k, c in enumerate(cards, 1):
+        if not isinstance(c, dict):
+            raise OpError(f"card {k} is not an object", soft=True)
+        old = by_id[c["id"]]
+        upd = {}
+        for key, value in c.items():
+            if key in ("id", "status", "state_updated"):
+                if key in ("status", "state_updated") and value != old.get(key):
+                    raise OpError(f"card {c['id']}: {key} cannot be edited "
+                                  "here", soft=True)
+                continue
+            if key not in editable:
+                continue   # unknown fields are preserved as-is
+            if key in ("chapter", "target_words") and isinstance(value, str) \
+                    and value.strip().isdigit():
+                value = int(value)   # integer-form numeric strings, like the CLI
+            upd[key] = value
+        # validate the descriptive update against the shared rules
+        probe = dict(old)
+        probe.update(upd)
+        _validate_descriptive(c["id"], probe)
+        new_card = dict(old)
+        new_card.update({k2: v2 for k2, v2 in upd.items()})
+        if new_card != old:
+            changed += 1
+        saved[k - 1] = new_card
+        if int(new_card.get("target_words") or 0) == 0:
+            warnings.append(f"card {c['id']} targets 0 words")
+    if token:
+        token.check()
+    if not changed:
+        _emit(events, "scene_cards_unchanged")
+        return {"changed": 0, "warnings": warnings, "no_op": True}
+    if not _no_symlink_below(p.root, "scenes.json"):
+        raise OpError("scenes.json is a symlink; refusing to write")
+    if not _no_symlink_below(p.root, "outlines"):
+        raise OpError("outlines/ is a symlink; refusing to back up")
+    _stale_check(p, {"scenes.json": baseline["scenes.json"]})
+    if saved:
+        p.f("outlines").mkdir(exist_ok=True)
+        dest_name = f"scenes_prev_{stamp()}.json"
+        dest = p.f("outlines", dest_name)
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = p.f("outlines", f"scenes_prev_{stamp()}_{n}.json")
+        import shutil
+        try:
+            shutil.copy2(p.f("scenes.json"), dest)
+        except OSError as e:
+            raise OpError(f"the scenes backup could not be written "
+                          f"({type(e).__name__})") from None
+    from .utils import write_json
+    write_json(p.f("scenes.json"), saved)
+    _emit(events, "scene_cards_saved", count=changed)
+    return {"changed": changed, "warnings": warnings,
+            "ids": [s["id"] for s in saved], "no_op": False}
+
+
+def _validate_descriptive(scene_id, card):
+    """Per-card validation reusing the generated-card rules."""
+    chapter = card.get("chapter", 1)
+    if isinstance(chapter, str) and chapter.strip().isdigit():
+        chapter = int(chapter)
+    if isinstance(chapter, bool) or not isinstance(chapter, int) or chapter < 1:
+        raise OpError(f"card {scene_id}: chapter must be a positive integer",
+                      soft=True)
+    twv = card.get("target_words", 0) or 0
+    if isinstance(twv, str) and twv.strip().isdigit():
+        twv = int(twv)
+    if isinstance(twv, bool) or not isinstance(twv, int) or twv < 0:
+        raise OpError(f"card {scene_id}: target_words must be a nonnegative "
+                      "integer", soft=True)
+    for key in ("title", "pov", "setting", "goal", "conflict", "outcome",
+                "notes"):
+        v = card.get(key, "")
+        if v is None:
+            v = ""
+        if not isinstance(v, str):
+            raise OpError(f"card {scene_id}: {key} must be text", soft=True)
+    for key in ("characters", "beats"):
+        v = card.get(key, [])
+        if v is None:
+            v = []
+        if not isinstance(v, list) or \
+                any(not isinstance(x, str) for x in v):
+            raise OpError(f"card {scene_id}: {key} must be a list of strings",
+                          soft=True)
+
+
 def _normalize_scene_cards(arr, tw):
     """Shared normalization/validation of generated scene cards (design 6):
     CLI defaults and IDs, integer-form numeric strings, recoverable field
@@ -886,6 +997,7 @@ def accept_scene_cards(root, cards, baseline, *, token=None, events=None):
     _stale_check(p, {"scenes.json": baseline["scenes.json"]})
     current = _scenes_or_error(p)
     if current:
+        p.f("outlines").mkdir(exist_ok=True)
         dest_name = f"scenes_prev_{stamp()}.json"
         dest = p.f("outlines", dest_name)
         n = 1

@@ -933,6 +933,20 @@ class MainWindow(QMainWindow):
         self.scenes_cancel_btn = QPushButton("Cancel preview")
         self.scenes_cancel_btn.clicked.connect(self.scenes_cancel)
         sbtns.addWidget(self.scenes_cancel_btn)
+        self.scenes_load_btn = QPushButton("Edit saved cards")
+        self.scenes_load_btn.setToolTip("Load the saved scene cards into the "
+                                        "editor; descriptive fields can be "
+                                        "changed without touching IDs, "
+                                        "order, status or trees")
+        self.scenes_load_btn.clicked.connect(self.scenes_load_saved)
+        sbtns.addWidget(self.scenes_load_btn)
+        self.scenes_save_card_btn = QPushButton("Save card edits")
+        self.scenes_save_card_btn.setToolTip("Save the changed descriptive "
+                                             "fields of saved cards through "
+                                             "the shared backed-up boundary; "
+                                             "unchanged saves are no-ops")
+        self.scenes_save_card_btn.clicked.connect(self.scenes_save_cards)
+        sbtns.addWidget(self.scenes_save_card_btn)
         sbtns.addStretch(1)
         l.addLayout(sbtns)
         l.addWidget(QLabel("Previewed cards (select one to edit its fields)"))
@@ -1124,6 +1138,45 @@ class MainWindow(QMainWindow):
         self._rebuild_scenes_preview()
         self.scenes_note.setText("; ".join([
             "preview cancelled; scenes.json unchanged"]))
+
+    def scenes_load_saved(self):
+        """Load saved cards for descriptive editing (no writes)."""
+        if self._busy:
+            return
+        over = self._scenes_overview or {}
+        saved = over.get("scenes") or []
+        if not saved:
+            self._status("No saved scene cards to edit.")
+            return
+        self._scene_cards = [dict(s) for s in saved]
+        self._scenes_preview_baseline = plan.scenes_baseline(
+            plan.canonical_root(self._root))
+        self._scenes_card_row = None
+        self._rebuild_scenes_preview()
+        self._status("Loaded the saved cards for editing; Save card edits "
+                     "applies changed fields only.")
+
+    def scenes_save_cards(self):
+        """Explicit save of descriptive card edits through the shared op."""
+        if self._busy:
+            return
+        cards = self._scene_cards
+        if not cards:
+            self._status("Load the saved cards first (Edit saved cards).")
+            return
+        base = self._scenes_preview_baseline
+        if not base:
+            self._status("Reload (Refresh) and edit again: the save needs a "
+                         "captured baseline.", error=True)
+            return
+        root = plan.canonical_root(self._root)
+
+        def fn(sink, token):
+            return plan.save_scene_cards(root, [dict(c) for c in cards],
+                                         dict(base), token=token,
+                                         events=sink)
+
+        self._dispatch(fn, kind="cards_save")
 
     def set_card_field(self, row, key, text):
         """Test/keyboard helper: edit one previewed card field."""
@@ -2272,6 +2325,10 @@ class MainWindow(QMainWindow):
             self._refresh_bible_overview()
             self._refresh_outline_overview()
             self._refresh_scenes_overview()
+            try:
+                self._session = dop.session_info(self._root)
+            except dop.OpError:
+                pass   # keep the last known session facts
         self._update_setup_tab()
         try:
             res = self._load(self._root, cache=self._cache, force=force)
@@ -2504,7 +2561,8 @@ class MainWindow(QMainWindow):
                   self.outline_choose_btn, self.outline_edit_btn,
                   self.outline_save_btn, self.outline_cancel_btn,
                   self.scenes_generate_btn, self.scenes_accept_btn,
-                  self.scenes_cancel_btn):
+                  self.scenes_cancel_btn, self.scenes_load_btn,
+                  self.scenes_save_card_btn):
             b.setEnabled(not self._busy)
         has_batch = bool(self._batch and self._batch.get("saved"))
         for b in (self.accept_btn, self.view_btn, self.reroll_btn,
@@ -2856,6 +2914,7 @@ class MainWindow(QMainWindow):
                 self._status("warning: " + w)
         elif kind == "outline_choose" and isinstance(value, dict):
             self._refresh_outline_overview()
+            self._refresh_scenes_overview()
             self.outline_body_edit.setReadOnly(True)
             self.outline_body_edit.setPlainText(
                 self._outline_overview.get("outline") or "")
@@ -2866,6 +2925,7 @@ class MainWindow(QMainWindow):
                          + "; no scene generation runs automatically")
         elif kind == "outline_save_body" and isinstance(value, dict):
             self._refresh_outline_overview()
+            self._refresh_scenes_overview()
             self._outline_body_loaded = None
             self.outline_body_edit.setReadOnly(True)
             self.outline_body_edit.setPlainText(
@@ -2901,6 +2961,20 @@ class MainWindow(QMainWindow):
                       if value.get("backup") else "")
                    + "; trees were kept and the draft scene list refreshed")
             self._status(msg)
+        elif kind == "cards_save" and isinstance(value, dict):
+            self._refresh_scenes_overview()
+            if value.get("no_op"):
+                self._status("No changes to save (unchanged cards are a "
+                             "no-op).")
+            else:
+                self.refresh(force=True)
+                msg = (f"saved {value['changed']} scene card edit(s); IDs, "
+                       "order, status and trees preserved"
+                       + (f"; previous list backed up to outlines/"
+                          "scenes_prev_<stamp>.json" if True else ""))
+                self._status(msg)
+                for w in value["warnings"]:
+                    self._status("warning: " + w)
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
