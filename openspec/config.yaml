@@ -1,0 +1,32 @@
+schema: spec-driven
+
+# Project context: what an agent can't infer from the code. Fill in the <placeholders>
+# (or ask OpenCode: "fill in the placeholders in openspec/config.yaml").
+context: |
+  Project: <one sentence: what it does and who uses it>
+  Stack: <language/runtime + version, framework, database, package manager>
+  Runs on: <local CLI, container, AKS, browser, ...>
+  Constraints: <hard limits: platforms, offline, budget, things not to touch>
+  The owner reviews behavior and output rather than code: plain language, observable results.
+
+rules:
+  proposal:
+    - Under 300 words, plain language; "Why" is at least two full sentences
+    - State what is out of scope
+    - Say how the owner will see it work (a command to run and the output to expect)
+  specs:
+    - A new capability's delta spec starts with "## Purpose" — one sentence of at least 60 characters
+    - Every requirement has a WHEN/THEN scenario a test can check
+    - Describe observable behavior, not implementation
+  design:
+    - Only decisions that matter; anything costly to reverse gets an ADR in docs/adr/
+    - Simplest approach that meets the spec; no speculative features
+  tasks:
+    - Each task is one small commit; its test sits right next to it
+    - The last task makes scripts/check.sh cover the new behavior and pass
+    - At most ~8 tasks; bigger means split the change
+
+operations:
+  archive:
+    guidance:
+      - Summarize what shipped in two or three plain sentences
