@@ -111,14 +111,39 @@ widget cases and synthetic missing-socket startup failures only.
   command order, that failing frozen tests/builds/missing uv exit nonzero
   without skipping, and that the real script runs the mandatory frozen GUI test
   functions with no skip/importorskip path.
-- Final `./scripts/check.sh` at source revision `44bdaf8` (clean tree):
-  `== syntax`, `== cli smoke`, `== standalone` → **40 passed in 19.29s**,
-  `== tests` → **392 passed in 4.88s**, exit 0. Artifact: 88,637,776 bytes,
-  SHA-256 `11a56ba9b0cc6fb04041ac2689694789fb9ee995698c8eab651879df37fbdba3`;
+- Final `./scripts/check.sh` at source revision `94ae0e8` (clean tree):
+  `== syntax`, `== cli smoke`, `== standalone` → **41 passed in 20.06s**,
+  `== tests` → **394 passed in 4.93s**, exit 0. Artifact: 88,639,184 bytes,
+  SHA-256 `67cc7789e7152b693d56408e44f0860d32c5efd206ba13ff34a73384e92b6d87`;
   `dist/longform-build.json` 35K, `dist/THIRD-PARTY-NOTICES.txt` 207K.
 - Direct documented invocation from a clean state, with the fresh artifact
   reused rather than rebuilt: `uv run --with pytest --with httpx --with
-  'pyside6>=6.12.0,<6.13' pytest -q tests` → **432 passed in 24.10s**.
+  'pyside6>=6.12.0,<6.13' pytest -q tests` → **435 passed in 25.05s**.
+
+### Task 1.8 — bare invocation defaults to the GUI
+
+- Red: the archived pre-change HEAD (`8231f69`) launched with no arguments
+  under `uv run --script longform.py` exited 2 with
+  `longform.py: error: the following arguments are required: cmd`; help still
+  showed `gui DIR`.
+- Green: `longform_core.cli` no longer requires a subcommand, defaults a bare
+  invocation to `gui`, passes the current working directory when DIR is absent,
+  and accepts `gui [DIR]`. `tests/test_gui_dispatch.py` adds
+  `test_no_arguments_dispatches_gui_in_current_directory` and
+  `test_gui_without_directory_dispatches_in_current_directory`.
+- Frozen
+  `test_copied_binary_with_no_arguments_launches_gui` starts the copied binary
+  with no arguments from a non-project directory and no usable Wayland socket:
+  it exits nonzero with `native Wayland is required`, names the copied
+  executable, never mentions uv or the former missing-command error, and
+  creates no files. The help regression now also requires `gui [DIR]`.
+- Manual check of the clean artifact from an empty working directory with
+  display variables absent and `WAYLAND_DISPLAY=missing-socket-0`: exit 134,
+  stderr begins
+  `longform gui: native Wayland is required. ... retry: QT_QPA_PLATFORM=wayland
+  /.../dist/longform gui DIR`; the empty directory stays empty. `--help` prints
+  `gui [DIR]` and the note that running with no command opens it. Opening an
+  actual window remains part of the blocked task 1.6 desktop acceptance.
 
 ## Task 1.6 — real copied-binary Wayland acceptance: PENDING
 
