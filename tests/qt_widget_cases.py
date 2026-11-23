@@ -586,8 +586,196 @@ def case_invalid_config_and_recovery(root):
     win.close()
 
 
+# ------------------------------------------------------------ draft loop
+
+import threading  # noqa: E402
+
+import longform_core  # noqa: E402  (provider seam references longform_core.cancel)
+
+PRESET = {
+    "preset": {"temp": 1.0, "genamt": 50},
+    "instruct": {
+        "macro": True,
+        "input_sequence": "\n",
+        "input_suffix": "\n",
+        "output_sequence": "\n",
+        "stop_sequence": "",
+    },
+    "context": {"story_string": "{{description}}"},
+    "sysprompt": {"content": "You narrate {{char}}."},
+}
+
+
+class FakeProvider:
+    """Provider seam for widget cases: same complete/many surface as Api."""
+
+    def __init__(self, chunks=("First chunk. ", "Second chunk.")):
+        self.chunks = list(chunks)
+        self.calls = []
+        self.started = 0
+        self.gate = None          # threading.Event: block between chunks when set
+        self.fail_after = None    # raise after this many chunks were delivered
+
+    def complete(self, role, prompt, params, extra=None, stream_cb=None,
+                 meta=None, token=None, **kw):
+        self.calls.append({"role": role, "prompt": prompt, "params": params,
+                           "extra": extra, "meta": meta})
+        self.started += 1
+        out = []
+        for i, ch in enumerate(self.chunks):
+            if self.gate is not None and i > 0 and not self.gate.wait(10):
+                raise AssertionError("fake provider gate never opened")
+            if token is not None:
+                token.check()
+            out.append(ch)
+            if stream_cb:
+                stream_cb(ch)
+            if self.fail_after is not None and i >= self.fail_after:
+                raise RuntimeError("fake provider failed midstream")
+        return "".join(out), "stop", {}
+
+    def many(self, fn, n, token=None, on_event=None):
+        results = []
+        for k in range(1, n + 1):
+            if token is not None:
+                token.check()
+            try:
+                results.append(fn())
+                if on_event:
+                    on_event({"type": "candidate_done", "k": k, "n": n})
+            except longform_core.cancel.Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001  (mirrors Api.many)
+                if on_event:
+                    on_event({"type": "candidate_failed", "k": k, "n": n,
+                              "why": f"{type(e).__name__}: {e}"})
+        return results
+
+
+def _pump(a, cond, limit=6000):
+    """Run Qt events until cond() is true; deterministic, no sleeps."""
+    for _ in range(limit):
+        if cond():
+            return True
+        a.processEvents()
+    return False
+
+
+def _draft_project(root, name="p", scenes=None, trees=None):
+    project = _build_project(root / name,
+                             scenes=scenes or [_scene("s001", title="Yard", pov="Mara",
+                                                      characters=["Mara"])],
+                             trees=trees if trees is not None else {
+                                 "s001": _tree({"n1": _node("n1", None,
+                                                            "Mara counts the lit windows.")},
+                                               head="n1")},
+                             bible="# Story bible\n\nQuiet town.",
+                             state="Mara is at the yard.",
+                             project_extra={"api_key": "sk-test"})
+    _write_json(project / "writer_preset.json", PRESET)
+    return project
+
+
+def case_draft_generate_acceptance(root):
+    """Type unsaved steering, Generate through the real worker + fake provider,
+    read while working, then Accept; reopen shows saved steering/text/branch."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(root)
+    fake = FakeProvider()
+    win = gw.MainWindow(str(project), choice=_no_dialogs("draft acceptance"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    assert win.generate_btn.isEnabled(), \
+        "Generate must be enabled for a writable scene with prerequisites"
+
+    win.steer_editor.setPlainText("Keep it slow.")
+    assert win.dirty()
+    win.count_spin.setValue(1)   # N=1 streams live into the preview
+    fake.gate = threading.Event()
+    win.generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 1), "generation started"
+    saved_tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert saved_tree.get("steer") == "Keep it slow.", \
+        "unsaved steering is captured and saved before the provider call"
+
+    assert _pump(a, lambda: "First chunk." in win.preview.toPlainText()), \
+        "streamed deltas reach the provisional preview"
+    head_before = saved_tree["head"]
+    win.select_item("node", "s001", "n1")
+    assert "Mara counts the lit windows." in win.reading.toPlainText(), \
+        "reading stays usable while a request is in flight"
+
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy), "worker settles"
+    assert "Second chunk." in win.preview.toPlainText()
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["head"] == head_before, "no head move until Accept"
+    assert set(t["nodes"]) == {"n1", "n2"}, \
+        "the complete response is saved as a candidate branch, head unchanged"
+    assert win._batch and win._batch["saved"], "completed candidate is offered"
+
+    win.tray.setCurrentRow(0)
+    win.accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["head"] != head_before, "Accept moves head to the candidate"
+    scenes = json.loads((project / "scenes.json").read_text())
+    assert scenes[0]["status"] == "drafting", "planned -> drafting on accept"
+    n2 = t["nodes"]["n2"]
+    assert n2["parent"] == head_before
+    assert n2["text"].strip() == "First chunk. Second chunk."
+    assert n2["source"] == "model" and n2["sep"] == ""
+    assert n2["steer"] == "Keep it slow."
+    assert n2["model"], "node keeps the writer model metadata"
+    win.close()
+
+    win2 = gw.MainWindow(str(project), choice=_no_dialogs("reopen"))
+    win2.select_item("manuscript", "s001", None)
+    assert "First chunk. Second chunk." in win2.reading.toPlainText()
+    assert win2.steer_editor.toPlainText() == "Keep it slow."
+    win2.select_item("node", "s001", "n2")
+    assert "First chunk. Second chunk." in win2.reading.toPlainText()
+    win2.close()
+
+
+def case_draft_midstream_failure(root):
+    """A provider failure after partial output saves no node, keeps head and
+    prior branches, and Generate can run again after the worker settles."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(root)
+    fake = FakeProvider()
+    win = gw.MainWindow(str(project), choice=_no_dialogs("failure"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    fake.fail_after = 0   # raise right after the first chunk is delivered
+    win.count_spin.setValue(1)
+    win.generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 1)
+    assert _pump(a, lambda: not win._busy)
+    assert "error" in win.status.text().lower(), "failure is reported"
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert set(t["nodes"]) == {"n1"}, "no partial node is created"
+    assert t["head"] == "n1"
+    assert not win._batch, "failed output cannot be accepted"
+    assert win.generate_btn.isEnabled(), "controls recover after an error"
+
+    fake.fail_after = None
+    win.generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert set(t["nodes"]) == {"n1", "n2"}, "a later generate can run"
+    assert t["head"] == "n1"
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
+    "case_draft_generate_acceptance": case_draft_generate_acceptance,
+    "case_draft_midstream_failure": case_draft_midstream_failure,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,

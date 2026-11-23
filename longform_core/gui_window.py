@@ -1,9 +1,11 @@
-"""PySide6 Qt Widgets shell: reading all saved branches and per-scene steering.
+"""PySide6 Qt Widgets shell: reading, steering and the complete draft loop.
 
-Presentation only (ADR-0006): no provider calls, no manuscript acceptance, no
-background worker — ADR-0007 keeps those for the gui-steered-drafting change.
-Widgets consume sanitized reader_model snapshots; steering writes go through
-the Qt-independent scene_steering adapter only.
+Presentation layer (ADR-0006): widgets consume sanitized reader_model
+snapshots; steering writes go through the Qt-independent scene_steering
+adapter, and every draft action (generation, acceptance, edits, branches,
+lore) runs as a shared draft_operations call on one background worker
+(ADR-0007) whose queued, operation-tagged signals are the only path that
+touches widgets. No terminal helpers, external editors or subprocesses.
 """
 
 import sys
@@ -17,8 +19,11 @@ from PySide6.QtWidgets import (
     QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from . import draft_operations as dop
 from . import reader_model as rm
 from . import scene_steering as ss
+from .cancel import CancellationToken
+from .draft_worker import OpThread
 
 PRE_START_GUIDANCE = (
     "longform gui: native Wayland is required. If startup fails, check your "
@@ -28,7 +33,7 @@ PRE_START_GUIDANCE = (
 REFRESH_MS = 2000
 
 # Tabs
-MANUSCRIPT, BRANCHES, NOTES = 0, 1, 2
+MANUSCRIPT, BRANCHES, DRAFT, NOTES = 0, 1, 2, 3
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -79,15 +84,19 @@ def _ask_choice(title, text, options):
 
 
 class MainWindow(QMainWindow):
-    """One window: sidebar navigation, read-only panes, per-scene steering."""
+    """One window: sidebar navigation, read-only panes, steering and the
+    draft loop through shared operations on one background worker."""
 
-    def __init__(self, dir_path, *, load=None, timer_factory=None, choice=None):
+    def __init__(self, dir_path, *, load=None, timer_factory=None, choice=None,
+                 provider_factory=None, picker=None):
         super().__init__()
         self._root = Path(dir_path)
         self._load = load or rm.load_snapshot
         self._cache = rm.SourceCache()
         self._choice = choice or _ask_choice
         self._timer_factory = timer_factory
+        self._provider_factory = provider_factory
+        self._picker = picker
 
         self.snap = None              # last valid Snapshot
         self._stale_config = False    # required configuration currently invalid
@@ -97,6 +106,22 @@ class MainWindow(QMainWindow):
         self._steer = None            # scene_steering.SteeringState
         self._notes_entries = []      # [(key, label, text)]
         self._notes_key = None
+
+        # Draft session state (ADR-0007): one worker, one token, one op at a time.
+        self._busy = False
+        self._op_id = 0
+        self._thread = None
+        self._token = CancellationToken()
+        self._batch = None            # {"scene","parent","saved","streamed"}
+        self._preview_text = ""
+        self._op_scene = None
+        try:
+            self._session = dop.session_info(self._root)
+        except dop.OpError as e:
+            self._session = {"swipes": 1, "passage_words": 220, "model": "",
+                             "preset_found": False, "creds_ok": False,
+                             "api_key_env": "", "warnings": [str(e)],
+                             "scene_ok": False}
 
         self.setWindowTitle("longform — reading and steering")
         self.resize(1150, 760)
@@ -149,6 +174,7 @@ class MainWindow(QMainWindow):
         self.metadata.setReadOnly(True)
         self.tabs.addTab(self.reading, "Manuscript")
         self.tabs.addTab(self.metadata, "Branches")
+        self.tabs.addTab(self._build_draft_tab(), "Draft")
         self.tabs.addTab(self._build_notes_tab(), "Notes")
         right_l.addWidget(self.tabs, 1)
 
@@ -168,19 +194,25 @@ class MainWindow(QMainWindow):
         self.save_btn.clicked.connect(self.save_steering)
         self.clear_btn = QPushButton("Clear saved")
         self.clear_btn.clicked.connect(self.clear_steering)
-        self.generate_btn = QPushButton("Generate")
-        self.generate_btn.setEnabled(False)
-        self.generate_btn.setToolTip(
-            "Drafting is not available yet: generation, preview, and acceptance "
-            "come with the gui-steered-drafting change")
-        self.generate_note = QLabel(
-            "Generate is disabled: drafting is not available in this reading "
-            "shell yet.")
         btns.addWidget(self.save_btn)
         btns.addWidget(self.clear_btn)
         btns.addStretch(1)
+        btns.addWidget(QLabel("Candidates"))
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 99)
+        self.count_spin.setValue(int(self._session.get("swipes", 1)))
+        self.count_spin.setToolTip(
+            "Candidate count for Generate (default: writer.swipes)")
+        btns.addWidget(self.count_spin)
+        self.generate_btn = QPushButton("Generate")
+        self.generate_btn.clicked.connect(self.generate)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop)
         btns.addWidget(self.generate_btn)
+        btns.addWidget(self.stop_btn)
         steer_l.addLayout(btns)
+        self.generate_note = QLabel("")
         steer_l.addWidget(self.generate_note)
         right_l.addWidget(steer_box)
         split.addWidget(right)
@@ -190,6 +222,34 @@ class MainWindow(QMainWindow):
 
         self.status = QLabel("")
         self.statusBar().addWidget(self.status, 1)
+
+    def _build_draft_tab(self):
+        """Provisional preview and completed candidate tray (never accepts)."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.preview_label = QLabel("Preview — provisional streaming text (not saved)")
+        l.addWidget(self.preview_label)
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText(
+            "Streaming output appears here while the provider works; it is "
+            "never accepted or saved until a complete candidate is saved.")
+        l.addWidget(self.preview, 2)
+        l.addWidget(QLabel("Saved candidates (branches; nothing is accepted until you press Accept)"))
+        self.tray = QListWidget()
+        self.tray.setToolTip("Completed candidates for this batch, newest "
+                             "siblings of the batch's captured head")
+        l.addWidget(self.tray, 3)
+        tbtns = QHBoxLayout()
+        self.accept_btn = QPushButton("Accept selected")
+        self.accept_btn.setToolTip("Make the selected candidate the active "
+                                   "head; other candidates stay saved branches")
+        self.accept_btn.clicked.connect(self.accept_candidate)
+        tbtns.addWidget(self.accept_btn)
+        tbtns.addStretch(1)
+        l.addLayout(tbtns)
+        return box
 
     def _build_notes_tab(self):
         notes_split = QSplitter(Qt.Orientation.Horizontal)
@@ -457,10 +517,192 @@ class MainWindow(QMainWindow):
                         and self._steer.baseline is not None
                         and not self._stale_config
                         and self._missing_node is None
-                        and scene_ok)
+                        and scene_ok
+                        and not self._busy)
         self.save_btn.setEnabled(editable)
         self.clear_btn.setEnabled(editable)
+        self._update_draft_actions()
         self._update_steering_label()
+
+    def _update_draft_actions(self):
+        """Generate/Stop/Accept availability with recovery guidance."""
+        scene_ok = (self._scene_sel is not None
+                    and self._scene_sel in self._card_ids()
+                    and self._steer is not None and self._steer.editable
+                    and self._steer.baseline is not None
+                    and not self._stale_config
+                    and self._missing_node is None)
+        missing = []
+        if not self._session.get("preset_found"):
+            missing.append("a writer preset (writer_preset.json)")
+        if not self._session.get("creds_ok"):
+            env = self._session.get("api_key_env") or "the configured key variable"
+            missing.append(f"provider credentials (api_key in project.json or export {env}=...)")
+        if missing:
+            self.generate_note.setText(
+                "Generate is unavailable: supply " + " and ".join(missing) + ".")
+        elif self._scene_sel is None or not scene_ok:
+            self.generate_note.setText(
+                "Generate needs a selected scene with a writable card; "
+                "select one in the sidebar.")
+        else:
+            self.generate_note.setText("")
+        can_generate = bool(scene_ok and not missing and not self._busy)
+        self.generate_btn.setEnabled(can_generate)
+        self.generate_btn.setToolTip(
+            "Generate saves your current steering first, then asks the "
+            "provider for candidate passages as siblings of the active head"
+            + (("; unavailable: " + "; ".join(missing)) if missing else ""))
+        self.stop_btn.setEnabled(self._busy)
+        has_batch = bool(self._batch and self._batch.get("saved"))
+        self.accept_btn.setEnabled(has_batch and not self._busy)
+
+    # -------------------------------------------------------------- worker
+
+    def _dispatch(self, fn):
+        """Start one operation on the worker thread; refuses when busy."""
+        if self._busy:
+            return False
+        self._op_id += 1
+        op_id = self._op_id
+        self._token = CancellationToken()
+        thread = OpThread(op_id, lambda sink: fn(sink, self._token), parent=self)
+        thread.event_sig.connect(self._on_worker_event)
+        thread.done_sig.connect(self._on_worker_done)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        self._busy = True
+        self._update_steering_ui()
+        self._status(f"Working (operation {op_id})…")
+        thread.start()
+        return True
+
+    def _on_worker_event(self, op_id, payload):
+        """Queued progress event; late payloads of superseded ops are ignored."""
+        if op_id != self._op_id or not self._busy:
+            return
+        kind = payload.get("type")
+        if kind == "delta":
+            self._preview_text += payload.get("text", "")
+            self.preview.setPlainText(self._preview_text)
+            bar = self.preview.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        elif kind == "reset":
+            self._preview_text = ""
+            self.preview.setPlainText("")
+        elif kind == "stream_start":
+            self._preview_text = ""
+            self.preview.setPlainText("")
+            self._status("Streaming… (provisional preview; nothing is saved yet)")
+        elif kind in ("candidate_done", "candidate_failed"):
+            self._status(payload.get("msg", ""))
+        elif kind == "progress":
+            self._status(payload.get("msg", ""))
+        elif kind == "note":
+            self._status("warning: " + payload.get("text", ""))
+        elif kind == "shortfall":
+            self._status(f"warning: only {payload.get('got')} of "
+                         f"{payload.get('wanted')} responses came back")
+        elif kind == "skipped_empty":
+            self._status("warning: a response cleaned to empty and was discarded")
+
+    def _on_worker_done(self, op_id, outcome, value):
+        if op_id != self._op_id:
+            return  # a superseded operation settled late
+        self._busy = False
+        self._thread = None
+        if outcome == "ok":
+            self._on_op_ok(value)
+        self._update_steering_ui()
+        if outcome == "cancelled":
+            self._preview_text = ""
+            self.preview.setPlainText("")
+            self._status("Stopped; nothing was saved. Head and saved "
+                         "branches are unchanged.")
+        else:
+            self._status(str(value), error=True)
+            if getattr(value, "stale", False):
+                self._status(str(value) + " — Reload (Refresh) or retry.",
+                             error=True)
+
+    def _on_op_ok(self, value):
+        if isinstance(value, dop.GenerateResult):
+            self._batch = {"scene": self._op_scene, "parent": value.parent,
+                           "saved": list(value.saved),
+                           "streamed": value.streamed}
+            self.tray.clear()
+            for k, nid in enumerate(value.saved, 1):
+                self.tray.addItem(QListWidgetItem(f"[{k}] {nid}"))
+            if value.over:
+                self._status("Generation refused: the prompt is over the "
+                             "context ceiling (trim bible/state/lore or lower "
+                             "budgets in project.json). No provider call ran.",
+                             error=True)
+            elif value.saved:
+                self._status(
+                    f"{len(value.saved)} candidate(s) saved as branches for "
+                    f"{self._op_scene}; head is unchanged. Select one and "
+                    "press Accept when ready.")
+            else:
+                self._status("No complete candidate came back; head and "
+                             "saved branches are unchanged.")
+        elif isinstance(value, dict) and "head" in value:
+            self._batch = None
+            self.tray.clear()
+            self._preview_text = ""
+            self.preview.setPlainText("")
+            self.refresh(force=True)
+            msg = f"accepted {value['head']}; head moved, other candidates stay saved branches"
+            if value.get("ended"):
+                msg += (" — the model signalled scene end; Mark done is "
+                        "available in the Scene tab")
+            self._status(msg)
+
+    # ------------------------------------------------------- draft actions
+
+    def generate(self):
+        """Generate candidates for the selected scene; saves steering first."""
+        scene = self._scene_sel
+        if scene is None or self._busy:
+            return
+        if self.dirty():
+            if not self._persist(self.steer_editor.toPlainText()):
+                return  # status already explains; no provider request starts
+        self._op_scene = scene
+
+        def fn(sink, token):
+            return dop.generate_candidates(
+                self._root, scene, count=self.count_spin.value(),
+                provider_factory=self._provider_factory, token=token,
+                events=sink)
+
+        self._dispatch(fn)
+
+    def accept_candidate(self):
+        """Accept the tray-selected candidate; never implicit."""
+        if self._busy:
+            return
+        batch = self._batch
+        if not batch or not batch.get("saved"):
+            self._status("No completed candidate to accept.", error=True)
+            return
+        row = self.tray.currentRow()
+        nid = batch["saved"][row if 0 <= row < len(batch["saved"]) else 0]
+        self._op_scene = batch["scene"]
+
+        def fn(sink, token):
+            return dop.accept_candidate(self._root, batch["scene"], nid,
+                                        token=token, events=sink)
+
+        self._dispatch(fn)
+
+    def stop(self):
+        """Cooperative Stop: the token is observed at request/chunk/save
+        boundaries; repeated Stop is safe."""
+        if self._busy:
+            self._token.cancel()
+            self._status("Stopping — waiting for the active request to "
+                         "settle (bounded by its configured timeout)…")
 
     def _reading_text(self):
         kind, tree_id, node_id = self._sel_data or (None, None, None)
@@ -576,6 +818,10 @@ class MainWindow(QMainWindow):
 
     def _persist(self, text):
         """Save (or clear) steering through the narrow adapter only."""
+        if self._busy:
+            self._status("An operation is running; steering writes are paused "
+                         "until it settles.", error=True)
+            return False
         if self._steer is None or not self._steer.editable:
             reason = self._steer.reason if self._steer else "no scene selected"
             self._status(f"Steering is read-only: {reason}", error=True)
@@ -684,6 +930,13 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- close
 
     def closeEvent(self, ev):
+        if self._busy:
+            # Full Stop-and-wait / Keep-open handling arrives with the worker
+            # hardening task; until then closing during work is refused safely.
+            ev.ignore()
+            self._status("An operation is running; Stop it (or wait for it to "
+                         "settle) before closing.", error=True)
+            return
         if self._scene_sel is not None and self.dirty():
             pick = self._choice(
                 "Unsaved steering",

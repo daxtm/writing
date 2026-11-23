@@ -20,9 +20,23 @@ def col(s, code):
     return f"\033[{code}m{s}\033[0m" if COLOR else s
 
 
+class FatalError(SystemExit):
+    """Raised by die(): the message is already on stderr; CLI main exits 1.
+
+    Subclasses SystemExit so existing `except SystemExit` expectations and the
+    process exit code are unchanged, while shared operations can catch it and
+    turn user-correctable failures into sanitized outcomes instead of killing
+    a worker thread (ADR-0007).
+    """
+
+    def __init__(self, msg):
+        super().__init__(1)
+        self.msg = msg
+
+
 def die(msg):
     print(col("error: ", "31") + msg, file=sys.stderr)
-    sys.exit(1)
+    raise FatalError(msg)
 
 
 def warn(msg):
