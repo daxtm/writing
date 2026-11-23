@@ -291,6 +291,301 @@ def case_readonly_panes(root):
     win.close()
 
 
+def case_dirty_scene_choices(root):
+    """Save/Discard/Cancel on scene switch; Save proceeds only on success."""
+    import longform_core.gui_window as gw
+    app()
+    project = _build_project(root / "p", scenes=[
+        _scene("s001"), _scene("s002")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A.")}, head="n1"),
+        "s002": _tree({"n1": _node("n1", None, "B.")}, head="n1"),
+    }, bible="B")
+    answers = []
+    win = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0))
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.steer_editor.setPlainText("for s001")
+
+    answers.append("Save")
+    win.select_item("manuscript", "s002", None)
+    assert json.loads((project / "trees" / "s001.json").read_text())["steer"] \
+        == "for s001", "Save choice persists the old scene before switching"
+    assert win.steer_editor.toPlainText() == "", "new scene steering loaded"
+
+    win.select_item("manuscript", "s001", None)
+    win.steer_editor.setPlainText("discard me")
+    answers.append("Discard")
+    win.select_item("manuscript", "s002", None)
+    assert json.loads((project / "trees" / "s001.json").read_text())["steer"] \
+        == "for s001", "Discard writes nothing"
+
+    win.select_item("manuscript", "s001", None)
+    win.steer_editor.setPlainText("keep me dirty")
+    answers.append("Cancel")
+    win.select_item("manuscript", "s002", None)
+    assert win._sel_data[1] == "s001", "Cancel keeps the original scene"
+    assert win.dirty()
+
+    answers.append("Discard")
+    win.close()
+
+    # failed Save during a scene switch behaves like Cancel plus an error
+    win2 = gw.MainWindow(str(project),
+                         choice=lambda t, x, o: answers.pop(0))
+    win2.show()
+    win2.select_item("manuscript", "s001", None)
+    win2.steer_editor.setPlainText("switch with failing save")
+    # the dirty scene's own tree becomes a symlink: its Save must fail
+    (project / "trees" / "s001.json").rename(project / "trees" / "keep.json")
+    (project / "trees" / "s001.json").symlink_to(project / "trees" / "keep.json")
+    answers.extend(["Save"])
+    win2.select_item("manuscript", "s002", None)
+    assert win2._sel_data[1] == "s001", "failed Save keeps the original scene"
+    assert "not saved" in win2.status.text()
+    assert win2.dirty()
+    answers.append("Discard")  # closing without saving
+    win2.close()
+
+
+def case_close_choices(root):
+    """Close with unsaved steering: Save persists, Cancel keeps the window."""
+    import longform_core.gui_window as gw
+    app()
+    project = _build_project(root / "p", scenes=[_scene("s001")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A.")}, head="n1")}, bible="B")
+    answers = []
+    win = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0))
+    win.show()
+    win.steer_editor.setPlainText("saved on close")
+    answers.append("Save")
+    win.close()
+    assert json.loads((project / "trees" / "s001.json").read_text())["steer"] \
+        == "saved on close"
+
+    win2 = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0))
+    win2.show()
+    win2.steer_editor.setPlainText("not yet")
+    answers.append("Cancel")
+    win2.close()
+    assert win2.isVisible(), "Cancel keeps the window open"
+    assert win2.dirty()
+    assert json.loads((project / "trees" / "s001.json").read_text())["steer"] \
+        == "saved on close", "Cancel writes nothing"
+    answers.append("Discard")
+    win2.close()
+
+
+def case_stale_conflict(root):
+    """External tree edit: Save offers Reload/Keep editing; refresh never
+    acknowledges on behalf of the owner."""
+    import longform_core.gui_window as gw
+    app()
+    project = _build_project(root / "p", scenes=[_scene("s001")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A.")}, head="n1")}, bible="B")
+    answers = []
+    win = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0))
+    win.show()
+    win.steer_editor.setPlainText("my unsaved line")
+
+    # external CLI-style change after the baseline was captured
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    t["nodes"]["n2"] = _node("n2", "n1", "external branch")
+    t["steer"] = "external direction"
+    _write_json(project / "trees" / "s001.json", t)
+
+    answers.append("Keep editing")
+    win.save_btn.click()
+    assert win.dirty() and win.steer_editor.toPlainText() == "my unsaved line"
+    assert "changed on disk" in win.status.text()
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["steer"] == "external direction", "disk untouched by Keep editing"
+
+    answers.append("Reload saved steering")
+    win.save_btn.click()
+    assert not win.dirty()
+    assert win.steer_editor.toPlainText() == "external direction"
+    assert win._steer.text == "external direction"
+
+    # refresh alone never replaces dirty text even when disk differs
+    win.steer_editor.setPlainText("still editing")
+    win._auto_refresh()
+    assert win.steer_editor.toPlainText() == "still editing"
+    answers.append("Discard")
+    win.close()
+
+
+def case_refresh_preserves_state(root):
+    """Cached ~2s refresh and forced refresh keep IDs, tab, scroll, focus,
+    cursor and dirty text stable."""
+    import longform_core.gui_window as gw
+    from longform_core.reader_model import SourceCache, load_snapshot
+    app()
+    prose = "word " * 400
+    project = _build_project(root / "p", scenes=[
+        _scene("s001"), _scene("s002")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A."), "n2": _node("n2", "n1", prose)},
+                      head="n1"),
+        "s002": _tree({"n1": _node("n1", None, "B.")}, head="n1"),
+    }, bible="BIBLE BODY", state="state body")
+
+    class FakeTimer:
+        def __init__(self):
+            self.ms = None
+            self._cb = None
+            self.timeout = self
+
+        def connect(self, cb):
+            self._cb = cb
+
+        def start(self, ms):
+            self.ms = ms
+
+        def fire(self):
+            self._cb()
+
+    timers = []
+    loads = []
+
+    def load(root, cache=None, force=False):
+        if cache is not None:
+            del cache.reads[:]  # record only this call's fresh reads
+        res = load_snapshot(root, cache=cache, force=force)
+        loads.append((force, list(cache.reads) if cache else None))
+        return res
+
+    def timer_factory():
+        t = FakeTimer()
+        timers.append(t)
+        return t
+
+    win = gw.MainWindow(str(project), load=load, timer_factory=timer_factory,
+                        choice=lambda *a: "Discard")
+    win.show()
+    assert timers and timers[0].ms == gw.REFRESH_MS == 2000
+
+    loads.clear()
+    timers[0].fire()  # automatic refresh with unchanged sources
+    assert loads == [(False, [])], "unchanged sources are not reread"
+
+    loads.clear()
+    win.refresh_btn.click()  # explicit refresh forces reads
+    assert loads and loads[0][0] is True and loads[0][1], "force rereads sources"
+
+    # select inactive node, scroll it, switch tab, type dirty steering
+    win.select_item("node", "s001", "n2")
+    win.reading.verticalScrollBar().setValue(37)
+    win.tabs.setCurrentIndex(gw.NOTES)
+    win.select_note("bible")
+    win.notes_view.verticalScrollBar().setValue(2)
+    win.tabs.setCurrentIndex(gw.MANUSCRIPT)
+    win.steer_editor.setPlainText("dirty during refresh")
+    cur = win.steer_editor.textCursor()
+    cur.setPosition(3)
+    win.steer_editor.setTextCursor(cur)
+
+    # external content change to the selected node + tree steering change
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    t["nodes"]["n2"]["text"] = prose + " APPENDED"
+    t["steer"] = "external steer"
+    _write_json(project / "trees" / "s001.json", t)
+    loads.clear()
+    timers[0].fire()
+    assert loads == [(False, ["trees/s001.json"])], \
+        "only the changed source is reread; unchanged sources stay cached"
+    assert "APPENDED" in win.reading.toPlainText(), "changed panes update"
+    assert win.reading.verticalScrollBar().value() == \
+        min(37, win.reading.verticalScrollBar().maximum()), "scroll kept (clamped)"
+    assert win.tabs.currentIndex() == gw.MANUSCRIPT
+    assert win._sel_data == ("node", "s001", "n2"), "node selection kept"
+    assert win.steer_editor.toPlainText() == "dirty during refresh", \
+        "dirty text is never replaced by refresh"
+    assert win.steer_editor.textCursor().position() == 3, "cursor kept"
+
+    # notes view kept its content/position
+    win.tabs.setCurrentIndex(gw.NOTES)
+    assert "BIBLE BODY" in win.notes_view.toPlainText()
+    win.tabs.setCurrentIndex(gw.MANUSCRIPT)
+
+    # dirty steering remains despite disk steering change: stale indication
+    assert "changed on disk" in win.status.text()
+
+    win.close()  # closing a dirty window offers the choices; discards here
+
+
+def case_removed_node_and_scene(root):
+    """Removed selections are marked unavailable; removed dirty scenes keep
+    their text with writes disabled."""
+    import longform_core.gui_window as gw
+    app()
+    project = _build_project(root / "p", scenes=[
+        _scene("s001"), _scene("s002")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A."), "n2": _node("n2", "n1", "B.")},
+                      head="n1"),
+        "s002": _tree({"n1": _node("n1", None, "B.")}, head="n1"),
+    }, bible="B")
+    win = gw.MainWindow(str(project), choice=lambda *a: "Discard")
+    win.show()
+    win.select_item("node", "s001", "n2")
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    del t["nodes"]["n2"]
+    _write_json(project / "trees" / "s001.json", t)
+    win._auto_refresh()
+    assert "n2" in win.reading.toPlainText() and "no longer present" \
+        in win.reading.toPlainText(), "removed node is explicitly unavailable"
+    assert win._sel_data == ("node", "s001", "n2"), "no silent reselection"
+
+    # removed dirty scene: text kept, writes disabled
+    win.select_item("manuscript", "s002", None)
+    win.steer_editor.setPlainText("unsaved for s002")
+    scenes = json.loads((project / "scenes.json").read_text())
+    scenes = [s for s in scenes if s["id"] != "s002"]
+    _write_json(project / "scenes.json", scenes)
+    (project / "trees" / "s002.json").unlink()
+    win._auto_refresh()
+    assert win.steer_editor.toPlainText() == "unsaved for s002"
+    assert not win.save_btn.isEnabled()
+    assert "no longer present" in win.steer_label.text()
+    win.close()
+    # discarding on close wrote nothing
+    assert not (project / "trees" / "s002.json").exists()
+
+
+def case_invalid_config_and_recovery(root):
+    """Invalid required configuration keeps the last view labeled stale and
+    disables writes; a later refresh recovers without restart."""
+    import longform_core.gui_window as gw
+    from longform_core.reader_model import LoadResult, load_snapshot
+    app()
+    project = _build_project(root / "p", scenes=[_scene("s001")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A.")}, head="n1")}, bible="B")
+    fail = []
+
+    def load(root, cache=None, force=False):
+        if fail:
+            return LoadResult(None, ["project.json is missing or unreadable"])
+        return load_snapshot(root, cache=cache, force=force)
+
+    win = gw.MainWindow(str(project), load=load, choice=lambda *a: "Discard")
+    win.show()
+    assert win.save_btn.isEnabled()
+    win.steer_editor.setPlainText("dirty before outage")
+
+    fail.append(1)
+    win._auto_refresh()
+    assert "stale" in win.status.text()
+    assert not win.save_btn.isEnabled()
+    assert win.steer_editor.toPlainText() == "dirty before outage"
+    assert "BIBLE BODY" not in win.reading.toPlainText(), "view unchanged"
+
+    fail.clear()
+    (project / "bible.md").write_text("RECOVERED BIBLE", encoding="utf-8")
+    win._auto_refresh()
+    assert "recovered" in win.status.text().lower()
+    win.select_note("bible")
+    assert "RECOVERED BIBLE" in win.notes_view.toPlainText()
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "owner_flow_steering": case_owner_flow_steering,
@@ -300,6 +595,12 @@ CASES = {
     "case_enter_inserts_newline": case_enter_inserts_newline,
     "case_palette_and_prose_size": case_palette_and_prose_size,
     "case_readonly_panes": case_readonly_panes,
+    "case_dirty_scene_choices": case_dirty_scene_choices,
+    "case_close_choices": case_close_choices,
+    "case_stale_conflict": case_stale_conflict,
+    "case_refresh_preserves_state": case_refresh_preserves_state,
+    "case_removed_node_and_scene": case_removed_node_and_scene,
+    "case_invalid_config_and_recovery": case_invalid_config_and_recovery,
 }
 
 
