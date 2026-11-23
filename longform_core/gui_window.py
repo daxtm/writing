@@ -131,7 +131,10 @@ class MainWindow(QMainWindow):
         self._scene_edit_dirty = {}   # scene -> user edited pov/cast fields
         self._editor_target = None
         self._pending_root = None     # project root bound after Create/Open ok
+        self._pending_action = None   # ("create"/"open", root) after a dirty save
         self._import_src = None       # picked preset source bytes identity
+        self._settings_touched = {}   # field path -> user edited
+        self._settings_state = {}     # last loaded shared settings state
         try:
             self._session = dop.session_info(self._root)
         except dop.OpError as e:
@@ -905,14 +908,231 @@ class MainWindow(QMainWindow):
         self.setup_note = QLabel("")
         self.setup_note.setWordWrap(True)
         l.addWidget(self.setup_note)
-        l.addStretch(1)
+
+        l.addWidget(QLabel("Settings (supported nonsecret project.json "
+                           "fields; unknown fields and any existing key are "
+                           "preserved)"))
+        self.settings_note = QLabel("")
+        self.settings_note.setWordWrap(True)
+        sbtns = QHBoxLayout()
+        self.settings_save_btn = QPushButton("Save settings")
+        self.settings_save_btn.setToolTip("Validate and save only the fields "
+                                          "you changed; blank clears an "
+                                          "optional field")
+        self.settings_save_btn.clicked.connect(self.save_settings)
+        sbtns.addWidget(self.settings_save_btn)
+        self.settings_cancel_btn = QPushButton("Cancel settings")
+        self.settings_cancel_btn.setToolTip("Discard unsaved entries; the "
+                                            "saved configuration is used")
+        self.settings_cancel_btn.clicked.connect(self.cancel_settings)
+        sbtns.addWidget(self.settings_cancel_btn)
+        sbtns.addStretch(1)
+        l.addLayout(sbtns)
+        self.settings_form = self._build_settings_form()
+        l.addWidget(self.settings_form, 2)
+
+        l.addWidget(QLabel("Limits (fetched only by explicit action; a "
+                           "model 404 is a found:false result)"))
+        lbtns = QHBoxLayout()
+        self.fetch_limits_btn = QPushButton("Fetch limits")
+        self.fetch_limits_btn.setToolTip("One /plan request plus one lookup "
+                                         "per distinct configured model "
+                                         "through the shared Api; saves "
+                                         "limits.json in the CLI shape")
+        self.fetch_limits_btn.clicked.connect(self.fetch_limits)
+        lbtns.addWidget(self.fetch_limits_btn)
+        lbtns.addStretch(1)
+        l.addLayout(lbtns)
+        self.limits_view = QPlainTextEdit()
+        self.limits_view.setReadOnly(True)
+        self.limits_view.setPlaceholderText(
+            "Fetched time, plan context/concurrency and each role's model "
+            "context, max completion and plan availability appear here; "
+            "credentials are never displayed.")
+        l.addWidget(self.limits_view, 2)
         return box
+
+    def _build_settings_form(self):
+        """Generated validated form from the shared field allowlist."""
+        from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout,
+                                       QLineEdit, QScrollArea)
+        inner = QWidget()
+        grid = QGridLayout(inner)
+        grid.setVerticalSpacing(2)
+        self._setting_editors = {}
+        for row, (path, label, kind) in enumerate(plan.SETTING_FIELDS):
+            lab = QLabel(label)
+            lab.setToolTip(path)
+            grid.addWidget(lab, row, 0)
+            if kind == "bool":
+                w = QCheckBox()
+                w.stateChanged.connect(
+                    lambda _s, p=path: self._touch_setting(p))
+            elif kind.startswith("enum:"):
+                w = QComboBox()
+                w.addItems([""] + kind.split(":", 1)[1].split("|"))
+                w.currentIndexChanged.connect(
+                    lambda _i, p=path: self._touch_setting(p))
+            elif kind == "lines":
+                w = QPlainTextEdit()
+                w.setFixedHeight(46)
+                w.textChanged.connect(lambda p=path: self._touch_setting(p))
+            else:
+                w = QLineEdit()
+                w.setPlaceholderText("(unset)" if ".preset_overrides." in
+                                     path or kind not in ("text", "nonblank",
+                                                          "url", "envname")
+                                     else "")
+                w.textEdited.connect(lambda _t, p=path: self._touch_setting(p))
+            self._setting_editors[path] = (w, kind)
+            grid.addWidget(w, row, 1)
+        grid.setColumnStretch(1, 1)
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        return scroll
+
+    def _touch_setting(self, path):
+        self._settings_touched[path] = True
+        self._update_steering_ui()
+
+    def settings_value(self, path):
+        """Test/keyboard helper: the editor widget for one field."""
+        return self._setting_editors[path][0]
+
+    def set_setting(self, path, text):
+        """Test/keyboard helper: set one field's raw text and mark it dirty."""
+        w, kind = self._setting_editors[path]
+        if kind == "bool":
+            w.setChecked(str(text).lower() in ("1", "true", "yes"))
+        elif kind.startswith("enum:"):
+            w.setCurrentText(str(text))
+        elif kind == "lines":
+            w.setPlainText(str(text))
+        else:
+            w.setText(str(text))
+        self._touch_setting(path)
+
+    def _load_settings_form(self):
+        """Fill the form from the shared read-only state (no calls)."""
+        try:
+            state = plan.settings_state(self._root)
+        except dop.OpError as e:
+            self.settings_note.setText(f"(settings unavailable: {e})")
+            return
+        self._settings_state = dict(state)
+        self._settings_touched = {}
+        try:
+            self._settings_state["baseline"] = dict(
+                plan.settings_baseline(self._root))
+        except dop.OpError:
+            self._settings_state["baseline"] = None
+        for path, value in state["values"].items():
+            w, kind = self._setting_editors[path]
+            w.blockSignals(True)   # programmatic fill never marks dirty
+            if kind == "bool":
+                w.setChecked(bool(value))
+            elif kind.startswith("enum:"):
+                w.setCurrentText(str(value or ""))
+            elif kind == "lines":
+                w.setPlainText("\n".join(value) if isinstance(value, list)
+                               else str(value or ""))
+            else:
+                w.setText("" if value is None else str(value))
+            w.blockSignals(False)
+        notes = list(state["warnings"])
+        if not state["creds_ok"]:
+            notes.append("no credentials: provider calls (Fetch limits, "
+                         "generation) are unavailable, local editing still "
+                         "works")
+        self.settings_note.setText("; ".join(notes))
+
+    def settings_dirty(self):
+        return bool(self._settings_touched)
+
+    def _settings_payload(self):
+        values = {}
+        for path in self._settings_touched:
+            w, kind = self._setting_editors[path]
+            if kind == "bool":
+                values[path] = "true" if w.isChecked() else "false"
+            elif kind.startswith("enum:"):
+                values[path] = w.currentText() or None
+            elif kind == "lines":
+                text = w.toPlainText()
+                values[path] = text if text.strip() else None
+            else:
+                values[path] = w.text().strip() or None
+        return values
+
+    def save_settings(self):
+        """Validate and save the touched fields through the shared op."""
+        if self._busy:
+            self._status("An operation is running; settings writes are "
+                         "paused until it settles.", error=True)
+            return False
+        values = self._settings_payload()
+        root = plan.canonical_root(self._root)
+        base = self._settings_state.get("baseline")
+        if not base:
+            try:
+                base = dict(plan.settings_baseline(root))
+            except dop.OpError as e:
+                self._status(str(e), error=True)
+                return False
+
+        def fn(sink, token):
+            return plan.save_settings(root, values, baseline=dict(base),
+                                      token=token, events=sink)
+
+        self._dispatch(fn, kind="settings_save")
+        return True
+
+    def cancel_settings(self):
+        """Discard unsaved entries; the saved configuration stays."""
+        self._settings_touched = {}
+        self._load_settings_form()
+        self._status("Settings unchanged; saved configuration in use.")
+
+    def fetch_limits(self):
+        """Explicit limits fetch; never runs on Create/Open/Save/tab change."""
+        if self._busy:
+            return
+        root = plan.canonical_root(self._root)
+
+        def fn(sink, token):
+            return plan.fetch_limits(
+                root, provider_factory=self._provider_factory,
+                token=token, events=sink)
+
+        self._dispatch(fn, kind="limits")
+
+    def _limits_text(self, view):
+        import json
+        lines = [f"fetched: {view['fetched']}"]
+        lines.append(f"plan: max context {view['plan_max_context']}, "
+                     f"concurrency {view['plan_concurrency']}")
+        for r in view["roles"]:
+            if not r["found"]:
+                lines.append(f"{r['role']:<10} {r['model']}: NOT FOUND "
+                             "(check the exact id)")
+                continue
+            lines.append(f"{r['role']:<10} {r['model']}")
+            lines.append(f"           context {r['context']}, max completion "
+                         f"{r['max_completion']}, available on your plan: "
+                         f"{r['available']}")
+            if r["available"] is False:
+                lines.append("           not available on your current plan")
+            raw = r.get("raw")
+            if raw is not None:
+                lines.append("           raw: " + json.dumps(raw)[:400])
+        return "\n".join(lines)
 
     # ------------------------------------------------------------- create/open
 
     def _resolve_dirty(self):
         """Resolve unsaved input before a destructive transition (project
-        Create/Open); False cancels the transition."""
+        Create/Open); False cancels or defers the transition."""
         if self._scene_sel is not None and self.dirty():
             pick = self._choice(
                 "Unsaved steering",
@@ -923,7 +1143,47 @@ class MainWindow(QMainWindow):
                     return False
             elif pick != "Discard":
                 return False
+        if self._planning_dirty():
+            pick = self._choice(
+                "Unsaved planning input",
+                "Settings, bible, outline or scene editing has unsaved "
+                "changes. Save before continuing?",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self._save_planning_dirty():
+                    return False   # the transition resumes after settlement
+                return False
+            if pick == "Discard":
+                self._discard_planning_dirty()
+                return True
+            return False
         return True
+
+    def _planning_dirty(self):
+        return self.settings_dirty()
+
+    def _save_planning_dirty(self):
+        return self.save_settings()
+
+    def _discard_planning_dirty(self):
+        self._settings_touched = {}
+
+    def _run_pending_action(self):
+        """Continue a Create/Open deferred behind a dirty-form Save."""
+        action = self._pending_action
+        self._pending_action = None
+        if action is None:
+            return
+        kind, target = action
+        self._pending_root = target
+        if kind == "create":
+            def fn(sink, token):
+                return plan.init_project(target, token=token, events=sink)
+            self._dispatch(fn, kind="init")
+        else:
+            def fn(sink, token):
+                return plan.project_overview(target)
+            self._dispatch(fn, kind="open")
 
     def create_project(self):
         """Desktop Create: pick a location, initialize create-missing-only."""
@@ -939,6 +1199,11 @@ class MainWindow(QMainWindow):
             self._status("No location picked; nothing was created.")
             return
         target = plan.canonical_root(picked)
+        self._pending_action = ("create", target)
+        if not self._resolve_dirty():
+            self._pending_action = None
+            return
+        self._pending_action = None
         self._pending_root = target
 
         def fn(sink, token):
@@ -967,6 +1232,11 @@ class MainWindow(QMainWindow):
             self.refresh(force=True)
             self._status("Reopened the current project.")
             return
+        self._pending_action = ("open", target)
+        if not self._resolve_dirty():
+            self._pending_action = None
+            return
+        self._pending_action = None
         self._pending_root = target
 
         def fn(sink, token):
@@ -996,6 +1266,11 @@ class MainWindow(QMainWindow):
     def _update_setup_tab(self):
         """Refresh the setup pane from the read-only overview."""
         p = self._plan
+        if self._settings_state.get("root") != p["root"] or \
+                (not self._settings_touched and
+                 not self._settings_state.get("loaded")):
+            self._load_settings_form()
+            self._settings_state["loaded"] = True
         lines = [f"project: {p['root']}"]
         if not p["exists"]:
             lines.append("The directory does not exist yet. Create "
@@ -1371,7 +1646,9 @@ class MainWindow(QMainWindow):
             + ("; you left the draft loop (Leave draft again to re-enter)"
                if self._draft_left else ""))
         self.stop_btn.setEnabled(self._busy)
-        for b in (self.create_btn, self.open_btn, self.preset_import_btn):
+        for b in (self.create_btn, self.open_btn, self.preset_import_btn,
+                  self.settings_save_btn, self.settings_cancel_btn,
+                  self.fetch_limits_btn):
             b.setEnabled(not self._busy)
         has_batch = bool(self._batch and self._batch.get("saved"))
         for b in (self.accept_btn, self.view_btn, self.reroll_btn,
@@ -1466,6 +1743,8 @@ class MainWindow(QMainWindow):
                          "branches are unchanged.")
         else:
             self._update_steering_ui()
+            self._pending_action = None   # a failed save never continues a
+            self._pending_root = None     # deferred transition
             if getattr(value, "collision", False) and self._op_kind == "import":
                 self._on_import_collision(value)
                 return
@@ -1631,6 +1910,23 @@ class MainWindow(QMainWindow):
             self._status(f"imported {value['imported']} "
                          f"({value['bytes']} bytes copied unchanged); "
                          "readiness refreshed")
+        elif kind == "settings_save" and isinstance(value, dict):
+            self._load_settings_form()
+            self._settings_state["loaded"] = True
+            self.refresh(force=True)
+            msg = (f"saved {len(value['saved'])} setting(s)"
+                   + (f", cleared {len(value['cleared'])}"
+                      if value["cleared"] else "") + "; unknown fields and "
+                   "any existing key are preserved")
+            self._status(msg)
+            if self._pending_action is not None:
+                self._run_pending_action()
+        elif kind == "limits" and isinstance(value, dict):
+            self.limits_view.setPlainText(self._limits_text(value["view"]))
+            msg = ("limits fetched and saved to limits.json"
+                   + (f"; not found: {', '.join(value['not_found'])}"
+                      if value["not_found"] else ""))
+            self._status(msg)
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""

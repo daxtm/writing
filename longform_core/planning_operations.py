@@ -14,10 +14,11 @@ import os
 import re
 from pathlib import Path
 
+from .api import Api, HttpErr
 from .cancel import Cancelled
 from .config import BIBLE_TEMPLATE, DEFAULT_CONFIG, STATE_TEMPLATE
 from .draft_operations import (_advance, _capture, _emit, _project_of,
-                               _read_bytes, _stale_check, OpError)
+                               _provider, _read_bytes, _stale_check, OpError)
 from .project import Project
 from .utils import (FatalError, deep_merge, now, read_text, save_input, stamp,
                     write_text)
@@ -266,3 +267,492 @@ def _escapes(root, rel):
     except (OSError, ValueError):
         return True
     return False
+
+
+# -------------------------------------------------------------- settings
+
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_HTTP_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+/?")
+
+_CONSUMED_OVERRIDES = ("temp", "top_p", "top_k", "min_p", "rep_pen",
+                       "freq_pen", "presence_pen", "genamt", "max_length",
+                       "dry_multiplier", "dry_base", "dry_allowed_length",
+                       "dry_sequence_breakers", "dry_penalty_last_n")
+
+CHAT_ROLES = ("planner", "summarizer", "critic", "editor")
+CHAT_SAMPLERS = ("temperature", "top_p", "top_k", "min_p",
+                 "repetition_penalty", "presence_penalty", "frequency_penalty",
+                 "min_tokens", "max_tokens")
+
+
+def _setting_fields():
+    """The explicit allowlist of supported nonsecret fields (design 3)."""
+    f = []
+    a = f.append
+    a(("title", "Title", "text"))
+    a(("target_words", "Target words", "posint"))
+    a(("api_base", "API base URL", "url"))
+    a(("api_key_env", "API key environment variable NAME", "envname"))
+    a(("max_context_fallback", "Max context fallback", "posint"))
+    a(("context_safety_margin", "Context safety margin [0,1)", "margin"))
+    a(("prompt_budget", "Prompt budget (tokens)", "posint"))
+    a(("chars_per_token_default", "Chars per token (estimation ratio)", "posnum"))
+    a(("max_parallel", "Max parallel requests", "posint"))
+    a(("request_timeout_s", "Request timeout (s)", "posnum"))
+    for role in ("planner", "writer", "summarizer", "critic", "editor"):
+        a((f"roles.{role}.model", f"{role} model", "nonblank"))
+        if role == "writer":
+            a(("roles.writer.preset", "Writer preset path", "nonblank"))
+            a(("roles.writer.swipes", "Writer swipes", "posint"))
+            a(("roles.writer.passage_words", "Passage words", "posint"))
+            a(("roles.writer.user_name", "User name", "text"))
+            a(("roles.writer.absent_character_lore",
+               "Absent-character lore", "enum:reference|exclude"))
+            a(("roles.writer.lore_match_whole_words",
+               "Lore matches whole words", "bool"))
+            for k in _CONSUMED_OVERRIDES:
+                a((f"roles.writer.preset_overrides.{k}",
+                   f"Writer preset override: {k}", _override_kind(k)))
+        else:
+            for k in CHAT_SAMPLERS:
+                a((f"roles.{role}.{k}", f"{role} {k}", _sampler_kind(k)))
+            a((f"roles.{role}.thinking", f"{role} thinking", "bool"))
+            a((f"roles.{role}.thinking_budget", f"{role} thinking budget",
+               "nonnegint"))
+    for k in ("bible", "scene_card", "summary", "state", "lore", "recent",
+              "steer"):
+        a((f"budget_tokens.{k}", f"Budget {k} (tokens)", "nonnegint"))
+    for k in ("detailed_recent_scenes", "detailed_words", "brief_words",
+              "arc_words"):
+        a((f"summary.{k}", f"Summary {k}", "nonnegint"))
+    a(("banned_phrases", "Banned phrases (one per line)", "lines"))
+    a(("ngram.n", "Repeated n-gram size n", "posint"))
+    a(("ngram.min_count", "Repeated n-gram min count", "posint"))
+    a(("ngram.top", "Repeated n-gram top list size", "posint"))
+    return f
+
+
+def _override_kind(k):
+    if k in ("top_k", "dry_allowed_length", "dry_penalty_last_n", "genamt",
+             "max_length"):
+        return "nonnegint"
+    if k in ("dry_sequence_breakers",):
+        return "lines"
+    if k in ("rep_pen", "dry_base"):
+        return "posnum"
+    if k in ("temp", "dry_multiplier"):
+        return "nonnegnum"
+    if k in ("top_p", "min_p", "freq_pen", "presence_pen"):
+        return "prob01" if k in ("top_p", "min_p") else "num"
+    return "num"
+
+
+def _sampler_kind(k):
+    if k in ("top_k", "min_tokens"):
+        return "nonnegint"
+    if k == "max_tokens":
+        return "posint"
+    if k in ("temperature", "dry_multiplier"):
+        return "nonnegnum"
+    if k in ("top_p", "min_p"):
+        return "prob01"
+    if k == "repetition_penalty":
+        return "posnum"
+    return "num"
+
+
+SETTING_FIELDS = _setting_fields()
+_SETTING_PATHS = {path for path, _label, _kind in SETTING_FIELDS}
+
+
+def _nested(d, dotted):
+    cur = d
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def _get_setting(cfg, dotted):
+    v = _nested(cfg, dotted)
+    return "" if v is None else v
+
+
+def settings_state(root):
+    """Read-only settings view: supported values (merged with defaults),
+    credential name/availability booleans, ignored-sampler warnings and the
+    unknown fields the patch must preserve. Never includes a key value."""
+    root = canonical_root(root)
+    p = _project_of(root)
+    raw = _read_bytes(p.f("project.json"), "project.json")
+    try:
+        parsed = json.loads(raw.decode("utf-8")) if raw is not None else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise OpError("project.json is not valid JSON") from None
+    if not isinstance(parsed, dict):
+        raise OpError("project.json is not a JSON object")
+    from .utils import deep_merge
+    cfg = deep_merge(DEFAULT_CONFIG, parsed)
+    values = {path: _get_setting(cfg, path) for path, _l, _k in SETTING_FIELDS}
+    values = _display_values(cfg, parsed)
+    warnings = []
+    rc = cfg["roles"]["writer"]
+    stale = [k for k in ("temperature", "top_p", "top_k", "min_p",
+                         "repetition_penalty", "presence_penalty",
+                         "frequency_penalty", "seed", "stop", "min_tokens",
+                         "max_tokens") if k in rc]
+    if stale:
+        warnings.append("writer keys " + ", ".join(stale) +
+                        " in project.json are ignored: writer samplers come "
+                        "from the preset")
+    extras = sorted(set((rc.get("preset_overrides") or {})) - set(_CONSUMED_OVERRIDES))
+    if extras:
+        warnings.append("writer preset override keys " + ", ".join(extras) +
+                        " are preserved but have no control here (not sent "
+                        "to the provider)")
+    unknown = _unknown_paths(parsed)
+    env = str(cfg.get("api_key_env") or "")
+    state = {"root": str(root), "values": values, "warnings": warnings,
+             "unknown_fields": unknown, "api_key_env": env,
+             "env_set": bool(env) and bool(os.environ.get(env, "").strip()),
+             "inline_key": bool(str(cfg.get("api_key") or "").strip()),
+             "env_value": os.environ.get(env, "") if env else ""}
+    state["creds_ok"] = state["inline_key"] or state["env_set"]
+    return state
+
+
+def _display_values(cfg, parsed):
+    """Values to show: merged with defaults for every supported control;
+    Save commits only touched fields, so untouched defaults are never
+    materialized into project.json."""
+    return {path: _get_setting(cfg, path) for path, _l, _k in SETTING_FIELDS}
+
+
+def _unknown_paths(parsed, prefix=""):
+    out = []
+    for k, v in parsed.items():
+        dotted = f"{prefix}{k}"
+        if dotted in _SETTING_PATHS or (prefix.startswith("roles.") and
+                                        dotted.endswith(".model")):
+            if isinstance(v, dict) and dotted not in _SETTING_PATHS:
+                out += _unknown_paths(v, dotted + ".")
+            continue
+        if isinstance(v, dict):
+            out += _unknown_paths(v, dotted + ".")
+        else:
+            out.append(dotted)
+    return out
+
+
+def _parse_raw(kind, text):
+    """Parse one form string into a typed value; returns (value, error).
+    None value means 'unset' (remove the key)."""
+    text = (text or "").strip()
+    if kind == "bool":
+        if text in ("", "false", "False", "no"):
+            return False, None
+        if text in ("true", "True", "yes"):
+            return True, None
+        return None, "must be true or false"
+    if kind == "enum:reference|exclude":
+        if text in ("reference", "exclude"):
+            return text, None
+        return None, "must be 'reference' or 'exclude'"
+    if kind == "lines":
+        items = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        return items, None
+    if kind in ("text", "nonblank", "url", "envname"):
+        if kind == "nonblank" and not text:
+            return None, "must not be blank"
+        if kind == "envname":
+            if not _ENV_NAME_RE.fullmatch(text or ""):
+                return None, ("must be the NAME of an environment variable "
+                              "(letters, digits, underscores)")
+            return text, None
+        if kind == "url":
+            if not text.startswith(("http://", "https://")):
+                return None, "must be an http(s) URL"
+            rest = text.split("://", 1)[1]
+            if "@" in rest.split("/", 1)[0] or "?" in text or "#" in text:
+                return None, "must not contain userinfo, query or fragment"
+            if not rest:
+                return None, "must be an http(s) URL"
+            return text, None
+        return text, None
+    # numeric kinds
+    num_error = "must be a finite number"
+    try:
+        v = float(text)
+    except ValueError:
+        return None, num_error
+    if v != v or v in (float("inf"), float("-inf")):
+        return None, num_error
+    if kind == "posint":
+        if v != int(v) or v < 1:
+            return None, "must be a positive integer"
+        return int(v), None
+    if kind == "nonnegint":
+        if v != int(v) or v < 0 or isinstance(v, bool):
+            return None, "must be a nonnegative integer"
+        return int(v), None
+    if kind == "posnum":
+        if v <= 0:
+            return None, "must be a positive number"
+        return v, None
+    if kind == "nonnegnum":
+        if v < 0:
+            return None, "must be a nonnegative number"
+        return v, None
+    if kind == "margin":
+        if not 0 <= v < 1:
+            return None, "must be in [0, 1)"
+        return v, None
+    if kind == "prob01":
+        if not 0 <= v <= 1:
+            return None, "must be in [0, 1]"
+        return v, None
+    if kind == "num":
+        return v, None
+    return None, f"unsupported field kind {kind}"
+
+
+def validate_settings(values):
+    """Local domain validation of {path: raw-string-or-None}; returns a list
+    of 'path: message' errors. None values (unset) are always allowed."""
+    errors = []
+    for path, raw in values.items():
+        if raw is None:
+            continue
+        field = next((f for f in SETTING_FIELDS if f[0] == path), None)
+        if field is None:
+            errors.append(f"{path}: unsupported field")
+            continue
+        _path, _label, kind = field
+        if kind == "lines":
+            continue  # any multiline text is a list of strings
+        _v, err = _parse_raw(kind, raw if isinstance(raw, str) else str(raw))
+        if err:
+            errors.append(f"{path}: {err}")
+    # min_tokens <= max_tokens per chat role
+    for role in CHAT_ROLES:
+        mn, mx = values.get(f"roles.{role}.min_tokens"), values.get(
+            f"roles.{role}.max_tokens")
+        def _num(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+        if mn is not None and mx is not None:
+            a, b = _num(mn), _num(mx)
+            if a is not None and b is not None and a > b:
+                errors.append(f"roles.{role}.min_tokens: min_tokens must not "
+                              "exceed max_tokens")
+    return errors
+
+
+def settings_baseline(root):
+    """Opaque baseline for a settings edit session: exact project.json bytes."""
+    root = canonical_root(root)
+    p = _project_of(root)
+    return _capture(p, ["project.json"])
+
+
+def save_settings(root, values, *, baseline=None, token=None, events=None):
+    """Validate and commit a settings patch over the original JSON object.
+
+    Only the given paths change; unknown fields and any existing inline
+    api_key are preserved opaquely. A path mapped to None removes that key
+    (unset). Refusing leaves disk unchanged."""
+    errors = validate_settings(values)
+    if errors:
+        raise OpError("settings were not saved: " + "; ".join(errors))
+    root = canonical_root(root)
+    p = _project_of(root)
+    if baseline is None:
+        baseline = _capture(p, ["project.json"])
+    if token:
+        token.check()
+    raw = baseline["project.json"]
+    try:
+        parsed = json.loads(raw.decode("utf-8")) if raw is not None else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise OpError("project.json is not valid JSON; not saved") from None
+    if not isinstance(parsed, dict):
+        raise OpError("project.json is not a JSON object; not saved")
+    changed, cleared = [], []
+    for path, value in values.items():
+        parts = path.split(".")
+        cur = parsed
+        for part in parts[:-1]:
+            nxt = cur.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cur[part] = nxt
+            cur = nxt
+        leaf = parts[-1]
+        if value is None or value == "":
+            if leaf in cur:
+                del cur[leaf]
+                cleared.append(path)
+            continue
+        field = next((f for f in SETTING_FIELDS if f[0] == path), None)
+        if field is None:
+            raise OpError(f"{path}: unsupported field")
+        _p, _label, kind = field
+        if kind == "lines":
+            items = [ln.strip() for ln in str(value).splitlines()
+                     if ln.strip()]
+            cur[leaf] = items
+        else:
+            v, err = _parse_raw(kind, str(value))
+            if err:
+                raise OpError(f"settings were not saved: {path}: {err}")
+            cur[leaf] = v
+        changed.append(path)
+    _stale_check(p, baseline)
+    write_text(p.f("project.json"), json.dumps(parsed, indent=2,
+                                               ensure_ascii=False) + "\n")
+    _advance(p, baseline, "project.json")
+    _emit(events, "settings_saved", saved=len(changed))
+    return {"saved": changed, "cleared": cleared,
+            "warnings": settings_state(root)["warnings"]}
+
+
+# ---------------------------------------------------------------- limits
+
+_SECRET_KEY_RE = re.compile(r"api[-_]?key|secret|authorization|bearer",
+                            re.I)
+
+
+def _scrub_text(p, text):
+    """Remove resolved credential values from provider text (GUI only)."""
+    key = str(p.cfg.get("api_key") or "").strip()
+    env = str(p.cfg.get("api_key_env") or "")
+    envval = os.environ.get(env, "").strip() if env else ""
+    out = text or ""
+    for secret in (key, envval):
+        if secret:
+            out = out.replace(secret, "[redacted]")
+    return out
+
+
+def _sanitize_raw(obj, p=None):
+    """Drop credential-ish keys and scrub resolved secrets from model
+    metadata before GUI display (limits.json keeps the CLI shape)."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_raw(v, p) for k, v in obj.items()
+                if not _SECRET_KEY_RE.search(str(k))}
+    if isinstance(obj, list):
+        return [_sanitize_raw(x, p) for x in obj]
+    if isinstance(obj, str) and p is not None:
+        return _scrub_text(p, obj)
+    return obj
+
+
+def _first_int(d, keys):
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, int) and v > 0:
+            return v
+    return None
+
+
+def fetch_limits(root, *, provider_factory=None, token=None, events=None):
+    """Explicit limits fetch through the shared Api (CLI `limits`).
+
+    One /plan request and one /models/<id> lookup per distinct configured
+    model; 404 is a found:false result, transport/plan/unexpected failures or
+    Stop keep the previous limits.json. The saved shape matches cmd_limits."""
+    p = _project_of(root)
+    key = str(p.cfg.get("api_key") or "").strip()
+    env = str(p.cfg.get("api_key_env") or "")
+    if not key and not (env and os.environ.get(env, "").strip()):
+        raise OpError(
+            f'no API key: set "api_key" in project.json, or export {env}=...',
+            soft=True)
+    provider = _provider(p, provider_factory)
+    baseline = _capture(p, ["project.json", "limits.json"])
+    if token:
+        token.check()
+
+    plan = None
+    try:
+        plan = provider.get("/plan", token=token,
+                            on_retry_event=None if events is None else (
+                                lambda why, delay: _emit(events, "retry",
+                                                         why=why, delay=delay)))
+    except Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001 — sanitized outcome, file untouched
+        raise OpError(f"limits fetch failed: {_scrub_text(p, str(e))}",
+                      soft=True) from None
+    out = {"fetched": now(), "plan": plan, "models": {}}
+    _emit(events, "plan_fetched", plan_max=(
+        plan.get("max_context_length") if isinstance(plan, dict) else None))
+    for role, rc in p.cfg["roles"].items():
+        mid = rc["model"]
+        if mid in out["models"]:
+            continue
+        if token:
+            token.check()
+        try:
+            entry = provider.get("/models/" + mid, token=token,
+                                 on_retry_event=None if events is None else (
+                                     lambda why, delay: _emit(events, "retry",
+                                                              why=why,
+                                                              delay=delay)))
+        except HttpErr as e:
+            if e.status == 404:
+                entry = None   # a model 404 is a found:false result
+            else:
+                raise OpError(f"limits fetch failed: "
+                              f"{_scrub_text(p, str(e))}", soft=True) from None
+        except Cancelled:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise OpError(f"limits fetch failed: {_scrub_text(p, str(e))}",
+                          soft=True) from None
+        if isinstance(entry, dict) and "id" not in entry and entry.get("data"):
+            d = entry["data"]
+            entry = d[0] if isinstance(d, list) and d else (
+                d if isinstance(d, dict) else None)
+        if not isinstance(entry, dict):
+            out["models"][mid] = {"found": False}
+        else:
+            out["models"][mid] = {
+                "found": True,
+                "context": _first_int(entry, ("context_length",
+                                              "max_context_length",
+                                              "context_size", "max_model_len",
+                                              "context_window")),
+                "max_completion": _first_int(entry, ("max_completion_tokens",
+                                                     "max_output_tokens")),
+                "available_on_current_plan": entry.get(
+                    "available_on_current_plan"),
+                "raw": entry,
+            }
+    if token:
+        token.check()
+    _stale_check(p, baseline)
+    from .utils import write_json
+    write_json(p.f("limits.json"), out)
+    _advance(p, baseline, "limits.json")
+    view = {"fetched": out["fetched"],
+            "plan_max_context": (plan.get("max_context_length")
+                                 if isinstance(plan, dict) else None),
+            "plan_concurrency": (plan.get("concurrency")
+                                 if isinstance(plan, dict) else None),
+            "roles": []}
+    for role, rc in p.cfg["roles"].items():
+        m = out["models"][rc["model"]]
+        view["roles"].append({
+            "role": role, "model": rc["model"], "found": m["found"],
+            "context": m.get("context"), "max_completion": m.get("max_completion"),
+            "available": m.get("available_on_current_plan"),
+            "raw": _sanitize_raw(m.get("raw"), p) if m["found"] else None,
+        })
+    _emit(events, "limits_saved")
+    return {"saved": str(p.f("limits.json")), "view": view,
+            "not_found": [k for k, v in out["models"].items() if not v["found"]]}
+

@@ -675,12 +675,17 @@ class PlanningFake(FakeProvider):
 
     def get(self, path, token=None, on_retry_event=None):
         self.calls.append(("GET", path))
+        if getattr(self, "get_fail_on", None) and (self.gets - 1) in \
+                self.get_fail_on:
+            raise RuntimeError("fake provider failed GET with "
+                               "sk-inline-keep echoed")
         self.gets += 1
         if token is not None:
             token.check()
         if path == "/plan":
             return dict(self.plan)
-        mid = path.split("/")[-1]
+        mid = path[len("/models/"):] if path.startswith("/models/") else \
+            path.split("/")[-1]
         if mid in self.models:
             return self.models[mid]
         from longform_core.api import HttpErr
@@ -1694,6 +1699,141 @@ def case_planning_create_open(root):
     win.close()
 
 
+def case_planning_settings_limits(root):
+    """Settings form roundtrip/validation/secret rules and explicit limits
+    fetch with duplicate-model lookup, 404s, missing creds and Stop."""
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+
+    proj = root / "p"
+    (proj / "trees").mkdir(parents=True)
+    _write_json(proj / "project.json", {
+        "title": "Original", "api_key": "sk-inline-keep",
+        "custom": {"n": 1}})
+    _write_json(proj / "scenes.json", [])
+    _write_json(proj / "summaries.json", {"scenes": {}, "arcs": []})
+
+    fake = PlanningFake(plan={"max_context_length": 8192, "concurrency": 2},
+                        models={"meta-llama/Llama-3.3-70B-Instruct": {
+                            "id": "meta-llama/Llama-3.3-70B-Instruct",
+                            "context_length": 131072,
+                            "max_completion_tokens": 8192,
+                            "available_on_current_plan": True,
+                            "api_key": "sk-server-side"}})
+    win = gw.MainWindow(str(proj), choice=_no_dialogs("settings"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.tabs.setCurrentIndex(gw.SETUP)
+    assert "sk-inline-keep" not in win.settings_note.text() and \
+        "sk-inline-keep" not in win.setup_status.text(), \
+        "the inline key is never displayed"
+
+    # save touched nonsecret fields; unknown fields and key preserved
+    win.set_setting("title", "Configured")
+    win.set_setting("target_words", "9000")
+    win.set_setting("max_parallel", "2")
+    win.set_setting("roles.writer.preset_overrides.temp", "0.75")
+    win.settings_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    saved = json.loads((proj / "project.json").read_text())
+    assert saved["title"] == "Configured" and saved["target_words"] == 9000
+    assert saved["max_parallel"] == 2
+    assert saved["roles"]["writer"]["preset_overrides"]["temp"] == 0.75
+    assert saved["api_key"] == "sk-inline-keep"
+    assert saved["custom"] == {"n": 1}
+    assert "max_context_fallback" not in saved, \
+        "untouched defaults are not materialized"
+    assert not win.settings_dirty()
+    assert fake.calls == [], "saving settings makes no provider call"
+
+    # validation: invalid values leave disk and dirty form intact
+    before = (proj / "project.json").read_bytes()
+    win.set_setting("max_parallel", "0")
+    win.set_setting("roles.planner.model", "  ")
+    win.settings_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not saved" in win.status.text().lower()
+    assert (proj / "project.json").read_bytes() == before
+    assert win.settings_dirty(), "unsaved entries remain for correction"
+    win.settings_cancel_btn.click()
+    assert not win.settings_dirty()
+    assert win.settings_value("title").text() == "Configured"
+
+    # clear an override: unset removes the key
+    win.set_setting("roles.writer.preset_overrides.temp", "")
+    win.settings_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    saved = json.loads((proj / "project.json").read_text())
+    assert "temp" not in saved["roles"]["writer"]["preset_overrides"]
+
+    # explicit Fetch limits: plan + one lookup per distinct model
+    win.fetch_limits_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.calls == [("GET", "/plan"),
+                          ("GET", "/models/meta-llama/Llama-3.3-70B-Instruct")], \
+        "one lookup per distinct configured model"
+    limits = json.loads((proj / "limits.json").read_text())
+    assert limits["plan"]["max_context_length"] == 8192
+    assert limits["models"]["meta-llama/Llama-3.3-70B-Instruct"]["found"] is True
+    text = win.limits_view.toPlainText()
+    assert "131072" in text and "8192" in text and "concurrency 2" in text
+    assert "sk-server-side" not in text, "raw metadata is sanitized for display"
+    assert "sk-inline-keep" not in text
+
+    # fetch failure keeps the previous limits.json and explains the error
+    fake.get_fail_on = {1}   # the /models lookup fails, echoing the inline key
+    fake.calls = []
+    win.fetch_limits_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "error" in win.status.text().lower()
+    assert "sk-inline-keep" not in win.status.text(), \
+        "a provider error echoing the key is sanitized"
+    assert json.loads((proj / "limits.json").read_text()) == limits, \
+        "a failed fetch leaves the previous file unchanged"
+    assert win.fetch_limits_btn.isEnabled(), "controls recover after failure"
+
+    # Stop during a held request settles and saves nothing
+    fake.get_fail_on = set()
+    fake.calls = []
+    fake.gate = threading.Event()
+    win.fetch_limits_btn.click()
+    assert _pump(a, lambda: fake.gets >= 1)
+    win.stop_btn.click()
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    assert json.loads((proj / "limits.json").read_text()) == limits, \
+        "a stopped fetch saves nothing"
+    win.close()
+
+    # missing credentials: fetch is refused before any request
+    nokey = root / "nokey"
+    (nokey / "trees").mkdir(parents=True)
+    _write_json(nokey / "project.json", {})
+    _write_json(nokey / "scenes.json", [])
+    _write_json(nokey / "summaries.json", {"scenes": {}, "arcs": []})
+    win2 = gw.MainWindow(str(nokey), choice=_no_dialogs("nokey"),
+                         provider_factory=lambda _p: fake)
+    win2.show()
+    win2.tabs.setCurrentIndex(gw.SETUP)
+    assert "no credentials" in win2.settings_note.text().lower()
+    win2.fetch_limits_btn.click()
+    assert _pump(a, lambda: not win2._busy)
+    assert "no api key" in win2.status.text().lower()
+    assert fake.calls == [], "no request without credentials"
+    assert win2.settings_value("title").text() == "Untitled", \
+        "local editing still works without credentials"
+    win2.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -1720,6 +1860,7 @@ CASES = {
     "case_invalid_config_and_recovery": case_invalid_config_and_recovery,
     "case_planning_journey": case_planning_journey,
     "case_planning_create_open": case_planning_create_open,
+    "case_planning_settings_limits": case_planning_settings_limits,
 }
 
 

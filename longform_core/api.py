@@ -81,13 +81,21 @@ class Api:
         self.timeout = httpx.Timeout(float(p.cfg["request_timeout_s"]), connect=30.0)
         self.extra_ok = True
 
-    def get(self, path):
+    def get(self, path, token=None, on_retry_event=None):
+        """GET with optional cooperative cancellation and retry events.
+
+        `token` is checked before each attempt and interrupts retry backoff;
+        `on_retry_event(why, delay)` replaces the terminal retry line. Both
+        default to the unchanged CLI behavior."""
         def once():
             r = httpx.get(self.base + path, headers=self.headers, timeout=self.timeout)
             if r.status_code != 200:
                 raise HttpErr(r.status_code, r.text)
             return r.json()
-        return self._retry(once)
+        if on_retry_event is not None:
+            return self._retry(once, lambda why, delay: on_retry_event(why, delay),
+                               token=token)
+        return self._retry(once, self._on_retry, token=token)
 
     def _retry(self, fn, on_retry=None, token=None):
         delay = 2.0
@@ -177,9 +185,14 @@ class Api:
     def _on_retry(why, delay):
         print(col(f"\n  [{why}; retrying in {delay:.0f}s]", "33"), flush=True)
 
-    def chat(self, role, messages, max_tokens=None, stream_cb=None, progress=True):
+    def chat(self, role, messages, max_tokens=None, stream_cb=None, progress=True,
+             token=None, on_retry_event=None):
         """Returns (answer, finish_reason, usage). Thinking never reaches the answer: it is split off
-        by the reasoning field or </think>, and an unfinished thought raises NoAnswerErr."""
+        by the reasoning field or </think>, and an unfinished thought raises NoAnswerErr.
+
+        `token` adds cooperative cancellation checks around the request;
+        `on_retry_event(why, delay)` replaces the terminal retry line. Both
+        default to the unchanged CLI behavior."""
         rc = self.p.cfg["roles"][role]
         body = {"model": rc["model"], "messages": messages}
         for k in SAMPLING_KEYS:
@@ -198,10 +211,14 @@ class Api:
         thinking_on = bool(kwargs.get("enable_thinking", kwargs.get("thinking", think is None)))
         t0 = time.time()
         prog = Progress(f"{role} ({rc['model']})") if progress and stream_cb is None else None
+        if on_retry_event is not None:
+            retry_cb = lambda why, delay: on_retry_event(why, delay)
+        else:
+            retry_cb = self._on_retry
         try:
             content, finish, usage, reasoning, bad = self._retry(
-                lambda: self._post(self.base + "/chat/completions", body, stream_cb, "chat", prog, thinking_on),
-                self._on_retry)
+                lambda: self._post(self.base + "/chat/completions", body, stream_cb, "chat", prog, thinking_on, token=token),
+                retry_cb, token=token)
         finally:
             if prog:
                 prog.done()
@@ -319,7 +336,11 @@ class Api:
         else:
             print(col(msg, color), flush=True)
 
-    def chat_many(self, role, messages, n, max_tokens=None):
+    def chat_many(self, role, messages, n, max_tokens=None, token=None, on_event=None):
+        """n planner-style calls; optional token/on_event pass through to many()
+        and each chat (defaults keep the unchanged CLI output)."""
         one_at_a_time = max(1, min(n, int(self.p.cfg["max_parallel"]))) == 1
-        return self.many(lambda: self.chat(role, messages, max_tokens, progress=one_at_a_time), n)
+        return self.many(
+            lambda: self.chat(role, messages, max_tokens, progress=one_at_a_time, token=token),
+            n, token=token, on_event=on_event)
 
