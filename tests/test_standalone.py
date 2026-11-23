@@ -280,7 +280,9 @@ def source_env(root: Path) -> dict:
     env = dict(os.environ)
     for var in CREDENTIAL_VARS:
         env.pop(var, None)
-    guard_dir = root / "netguard"
+    root.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    guard_dir = Path(tempfile.mkdtemp(prefix="longform-netguard-"))
     guard_dir.mkdir(exist_ok=True)
     (guard_dir / "sitecustomize.py").write_text(textwrap.dedent("""
         import socket
@@ -615,6 +617,183 @@ def test_frozen_binary_draft_edit_saves_through_fake_editor(built, tmp_path):
     assert fields.get("LD_LIBRARY_PATH_SET") != "set", \
         f"editor saw a library search path it must not see: {fields}"
     assert fields.get("LD_LIBRARY_PATH_ORIG_SET") != "set"
+
+
+# ---------------------------------------------------------------------------
+# Frozen/source CLI parity (tasks 2.2)
+# ---------------------------------------------------------------------------
+
+STAMP_RE = re.compile(r"\(\d{4}-\d{2}-\d{2}T[^)]*\)")
+
+
+def normalize(text, roots=(), prog_name=True):
+    """Only documented normalizations: temporary roots, program name, and the
+    known fixture timestamps. argparse wraps the usage block according to the
+    program-name length, so the wrapped usage is compared whitespace-collapsed
+    (a consequence of the permitted program-name difference)."""
+    for root in roots:
+        text = text.replace(str(root), "ROOT")
+    if prog_name:
+        text = text.replace("longform.py", "longform")
+        usage_re = re.compile(r"^usage:[^\n]*\n(?:[ \t][^\n]*\n?)*", re.M)
+        m = usage_re.search(text)
+        if m:
+            text = text[:m.start()] + " ".join(m.group(0).split()) + "\n" + text[m.end():]
+    return STAMP_RE.sub("(STAMP)", text)
+
+
+def parity(built, tmp_path, args, *, stdin=None, cwd="frozen-work", extra=None):
+    """Run the same command through the copied binary and the source launcher on
+    separate synthetic projects and compare output/exit status after
+    normalization."""
+    f_root = tmp_path / "frozen-root"
+    s_root = tmp_path / "source-root"
+    f_cwd = tmp_path / cwd
+    f_cwd.mkdir(parents=True, exist_ok=True)
+    s_cwd = tmp_path / (cwd + "-src")
+    s_cwd.mkdir(parents=True, exist_ok=True)
+
+    f_args = [a.replace("@ROOT@", str(f_root)) for a in args]
+    s_args = [a.replace("@ROOT@", str(s_root)) for a in args]
+
+    fr = run_frozen(built.copied, f_args, env=frozen_env(tmp_path, built.guard_so, extra=extra),
+                    cwd=f_cwd, stdin=stdin)
+    sr = run_source(s_args, root=s_root, cwd=s_cwd, extra_env=None)
+    assert fr.returncode == sr.returncode, \
+        f"exit status mismatch: frozen {fr.returncode} vs source {sr.returncode}\n" \
+        f"frozen stderr: {fr.stderr}\nsource stderr: {sr.stderr}"
+    f_norm = normalize(fr.stdout, roots=(f_root,)) + "|||" + normalize(fr.stderr, roots=(f_root,))
+    s_norm = normalize(sr.stdout, roots=(s_root,)) + "|||" + normalize(sr.stderr, roots=(s_root,))
+    assert f_norm == s_norm, (
+        "frozen/source output mismatch:\n--- frozen ---\n" + f_norm + "\n--- source ---\n" + s_norm)
+    return fr, sr, f_root, s_root
+
+
+def test_parity_help(built, tmp_path):
+    parity(built, tmp_path, ["--help"])
+
+
+def test_parity_invalid_command(built, tmp_path):
+    parity(built, tmp_path, ["definitely-not-a-command"])
+
+
+def test_parity_missing_required_argument(built, tmp_path):
+    parity(built, tmp_path, ["revise"])
+
+
+def test_parity_missing_project_directory(built, tmp_path):
+    parity(built, tmp_path, ["status", "/definitely/not/a/project/path"])
+
+
+def test_parity_init_first_and_repeated(built, tmp_path):
+    _, _, f_root, s_root = parity(built, tmp_path, ["init", "@ROOT@"])
+    # Same files with the same contents on both sides.
+    f_files = {p.relative_to(f_root).as_posix(): p for p in f_root.rglob("*") if p.is_file()}
+    s_files = {p.relative_to(s_root).as_posix(): p for p in s_root.rglob("*") if p.is_file()}
+    assert f_files and set(f_files) == set(s_files)
+    for rel, fpath in f_files.items():
+        assert fpath.read_bytes() == s_files[rel].read_bytes(), rel
+    f_dirs = {p.relative_to(f_root).as_posix() for p in f_root.rglob("*") if p.is_dir()}
+    s_dirs = {p.relative_to(s_root).as_posix() for p in s_root.rglob("*") if p.is_dir()}
+    assert f_dirs == s_dirs
+    # Repeated init changes nothing.
+    parity(built, tmp_path, ["init", "@ROOT@"], cwd="frozen-work-2")
+
+
+def test_parity_init_with_preset(tmp_path, built):
+    """--preset copies a fixed synthetic SillyTavern-style preset on both sides."""
+    preset = tmp_path / "synthetic preset.json"
+    preset.write_text(json.dumps(WRITER_PRESET) + "\n", encoding="utf-8")
+    f_root = tmp_path / "frozen-root"
+    s_root = tmp_path / "source-root"
+    fr = run_frozen(built.copied, ["init", str(f_root), "--preset", str(preset)],
+                    env=frozen_env(tmp_path, built.guard_so), cwd=tmp_path)
+    sr = run_source(["init", str(s_root), "--preset", str(preset)], root=tmp_path, cwd=tmp_path)
+    assert fr.returncode == sr.returncode == 0, (fr.stderr, sr.stderr)
+    assert normalize(fr.stdout, roots=(f_root,)) == normalize(sr.stdout, roots=(s_root,))
+    assert (f_root / "writer_preset.json").read_bytes() == (s_root / "writer_preset.json").read_bytes()
+
+
+def test_parity_status_with_inactive_branch(built, tmp_path):
+    root = make_project(tmp_path / "frozen-root")
+    make_project(tmp_path / "source-root")
+    parity(built, tmp_path, ["status", "@ROOT@"], cwd="parity-status")
+
+
+def test_parity_check_reports(built, tmp_path):
+    banned = ["red dragon", "spine"]
+    scenes = [
+        {"id": "s001", "chapter": 1, "title": "One", "characters": [], "target_words": 100},
+        {"id": "s002", "chapter": 1, "title": "Two", "characters": [], "target_words": 100},
+    ]
+    text1 = "Shivers down her spine. The red dragon flew over green hills. " * 3
+    trees = {
+        "s001": {
+            "nodes": {
+                "n1": {"id": "n1", "parent": None, "text": text1, "sep": "\n\n",
+                       "source": "model", "created": "2026-01-01 10:00", "model": "m"},
+                "n2": {"id": "n2", "parent": None, "text": "An inactive branch with the red dragon.",
+                       "sep": "\n\n", "source": "model", "created": "2026-01-01 10:01", "model": "m"},
+            },
+            "head": "n1", "counter": 2,
+        },
+        "s002": {
+            "nodes": {
+                "n1": {"id": "n1", "parent": None, "text": "Shivers down another spine.",
+                       "sep": "\n\n", "source": "model", "created": "2026-01-01 10:02", "model": "m"},
+            },
+            "head": "n1", "counter": 1,
+        },
+    }
+    make_project(tmp_path / "frozen-root", scenes=scenes, trees=trees, banned=banned)
+    make_project(tmp_path / "source-root", scenes=scenes, trees=trees, banned=banned)
+    parity(built, tmp_path, ["check", "@ROOT@"], cwd="parity-check")
+    # Reports written on both sides are identical after stamp normalization.
+    f_report = (tmp_path / "frozen-root" / "checks" / "all.md").read_text(encoding="utf-8")
+    s_report = (tmp_path / "source-root" / "checks" / "all.md").read_text(encoding="utf-8")
+    assert STAMP_RE.sub("(STAMP)", f_report) == STAMP_RE.sub("(STAMP)", s_report)
+    assert "inactive branch" not in f_report, "inactive branch text must not be checked"
+
+
+def test_parity_export_active_branch(built, tmp_path):
+    make_project(tmp_path / "frozen-root")
+    make_project(tmp_path / "source-root")
+    fr, sr, f_root, s_root = parity(built, tmp_path, ["export", "@ROOT@"],
+                                    cwd="parity-export")
+    f_ms = (f_root / "manuscript.md").read_text(encoding="utf-8")
+    s_ms = (s_root / "manuscript.md").read_text(encoding="utf-8")
+    assert f_ms == s_ms
+    assert "An inactive branch not exported." not in f_ms
+    assert ACTIVE_TEXT_1 in f_ms
+    # Relative --out resolves against the caller's working directory, not the
+    # executable or extraction dir.
+    work = tmp_path / "caller cwd"
+    work.mkdir()
+    env = frozen_env(tmp_path, built.guard_so)
+    r = run_frozen(built.copied, ["export", str(f_root), "--out", "relative.md"], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert (work / "relative.md").is_file()
+    assert (work / "relative.md").read_text(encoding="utf-8") == f_ms
+
+
+def test_parity_limits_without_credentials(built, tmp_path):
+    make_project(tmp_path / "frozen-root", preset=False)
+    make_project(tmp_path / "source-root", preset=False)
+    parity(built, tmp_path, ["limits", "@ROOT@"], cwd="parity-limits")
+
+
+def test_no_writes_to_bundle_or_extraction_paths(built, tmp_path):
+    """Frozen runs leave the dist/build sidecars untouched and the extraction
+    TMPDIR clean (checked by run_frozen for every invocation)."""
+    dist_before = {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in (REPO / "dist").iterdir()}
+    build_marker = REPO / "build" / "standalone"
+    build_before = {p.name: p.stat().st_mtime_ns for p in build_marker.iterdir()}
+    env = frozen_env(tmp_path, built.guard_so)
+    run_frozen(built.copied, ["--help"], env=env)
+    dist_after = {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in (REPO / "dist").iterdir()}
+    build_after = {p.name: p.stat().st_mtime_ns for p in build_marker.iterdir()}
+    assert dist_before == dist_after
+    assert build_before == build_after
 
 
 def test_build_script_fails_without_uv(tmp_path):
