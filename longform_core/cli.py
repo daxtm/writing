@@ -25,6 +25,7 @@ Every command is its own step. No command runs another one for you.
   revise DIR --scene ID        passage-by-passage line edit using critiques/ID.md and/or checks/ID.md
   status DIR                   project overview
   export DIR [--out FILE]      write manuscript.md
+  gui DIR                      open the native read-only desktop reader (blocking; Tk)
 
 API key: "api_key" in project.json, or else the environment variable named by "api_key_env"
 (default: export FEATHERLESS_API_KEY=...).
@@ -76,10 +77,15 @@ def main():
     add("status")
     sp = add("export")
     sp.add_argument("--out")
+    add("gui")
     args = ap.parse_args()
 
     if args.cmd == "init":
         return cmd_init(args)
+    if args.cmd == "gui":
+        from . import gui as reader_gui
+        reader_gui.launch(args.dir)
+        return
     p = Project(args.dir)
     {
         "limits": cmd_limits, "bible": cmd_bible, "outline": cmd_outline, "scenes": cmd_scenes, "draft": cmd_draft,

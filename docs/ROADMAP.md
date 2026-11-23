@@ -4,13 +4,16 @@
 
 Make `longform.py` safe to change through observable offline regression tests,
 then extract only the boundaries the prototype actually needs. Preserve
-`uv run --script longform.py …` and existing project files and reports.
+`uv run --script longform.py …` and existing project files and reports. Add a
+native read-only desktop window for all saved draft branches alongside the CLI.
 
 ## Out of scope
 
-New writing features, model/provider changes, live API tests, a web UI, private
-sample/preset fixtures, and speculative packaging. Dependency provisioning may
-use network; test execution must not.
+New generation features, GUI editing/generation, browser/HTML interfaces, remote hosting,
+authentication/multi-user access, rich text, model/provider changes, live API
+tests, private sample/preset fixtures, new dependencies, and speculative
+packaging. Dependency provisioning may use network; test execution must not
+contact external services.
 
 ## Phase 0 — Walking skeleton: source, checks, and project facts
 
@@ -75,6 +78,38 @@ Result: `uv run --script longform.py --help`, the full offline suite, and
 fixed-fixture reports/prompts; 154 tests pass. One-file portability is
 sacrificed even though the launcher command stays the same.
 
+## Phase 4 — Native read-only desktop reader
+
+- [ ] add-desktop-reader — Read active manuscript, every saved branch, and supporting notes in a native Tkinter/ttk window with position-preserving refresh.
+
+After implementation, observe with
+`uv run --script longform.py gui /path/to/project`: a native project-titled
+read-only window opens and the command blocks until it closes. The left scene
+list includes ID, title, status, words, and a separate retained-tree group.
+Selecting a scene drives Manuscript (full active chain), Branches (every saved
+node, including inactive descendants, full detail/history, parent/child
+navigation), and Notes (project-wide bible, state, summaries, checks, critiques).
+All writing is plain, selectable, scrollable text, not HTML or rich text.
+
+Save another branch in the CLI: it appears on the next approximately two-second
+auto-refresh, preserving selected scene/node, tab, and reading position. Toolbar
+Refresh now/F5 forces a reload; Auto-refresh can be disabled. Status shows last
+refresh time and current-project actual/target words. Ctrl+Q or window close
+cancels the timer and returns to the terminal. No server, browser, provider
+calls, editing controls, or configuration/credential viewer is introduced.
+
+[ADR-0005](adr/0005-desktop-gui.md) fixes Tkinter/ttk and display-independent
+allowlisted snapshots, with no new dependencies. The owner verified Tk 9.0.4
+under uv-managed Python 3.13 and a working desktop display; system Python lacks
+Tk libraries, so use the same uv runtime as the CLI. Snapshot/CLI tests always
+run offline; withdrawn-window smoke tests run only with available Tk/display
+and skip cleanly headless. `./scripts/check.sh` discovers both and must pass in
+both environments without weakening the existing network guard.
+
+The owner rejected the unimplemented HTML plan. Its `add-reader-gui` change was
+deleted, not archived as shipped; ADR-0004 remains historical, superseded by
+ADR-0005. This phase is a proposal only, not an implemented GUI.
+
 ## Decisions
 
 - [ADR-0001: Record architecture decisions](adr/0001-record-architecture-decisions.md).
@@ -84,3 +119,9 @@ sacrificed even though the launcher command stays the same.
 - [ADR-0003: Split the CLI into a package now](adr/0003-split-into-package.md)
   records the owner's deliberate override of the ADR-0002 gate and the package
   layout.
+- [ADR-0004: Use a read-only standard-library local web reader](adr/0004-local-web-reader.md)
+  records the rejected, unimplemented browser architecture; superseded by
+  ADR-0005.
+- [ADR-0005: Use Tkinter and ttk for the native read-only desktop reader](adr/0005-desktop-gui.md)
+  records the native toolkit, uv runtime requirement, read-only model/widget
+  boundary, and headless/display testing trade-offs.
