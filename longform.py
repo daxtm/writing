@@ -1146,9 +1146,12 @@ def tail_trim(p, model, text, budget, marker="..."):
     return marker + cut
 
 
-def layered_summary(p, scenes, idx, budget, model):
-    sums = p.summaries()
-    cfg = p.cfg["summary"]
+def layered_summary_core(sums, cfg, scenes, idx, budget, est, model, root):
+    """Pure selection/rendering of layered scene summaries; returns (text, notes).
+
+    `sums` is the loaded summaries.json content, `cfg` the summary config, `est`
+    a (model, text) -> int token estimator, `root` the project root shown in notes.
+    """
     notes = []
     pos = {s["id"]: i for i, s in enumerate(scenes)}
     arcs = []
@@ -1174,7 +1177,7 @@ def layered_summary(p, scenes, idx, budget, model):
             entries.append({"kind": "scene", "label": label, "detailed": rec["detailed"], "brief": rec["brief"]})
         else:
             entries.append({"kind": "missing", "label": label, "detailed": "", "brief": ""})
-            notes.append(f"{s['id']} has no summary (run: update-state {p.root} --scene {s['id']})")
+            notes.append(f"{s['id']} has no summary (run: update-state {root} --scene {s['id']})")
         j += 1
     if not entries:
         return "", notes
@@ -1197,16 +1200,22 @@ def layered_summary(p, scenes, idx, budget, model):
     dropped = 0
     text = render(indexed, detailed, dropped)
     order = sorted(detailed)
-    while p.est(model, text) > budget and order:
+    while est(model, text) > budget and order:
         detailed.discard(order.pop(0))
         text = render(indexed, detailed, dropped)
-    while p.est(model, text) > budget and len(indexed) > 1:
+    while est(model, text) > budget and len(indexed) > 1:
         indexed.pop(0)
         dropped += 1
         text = render(indexed, detailed, dropped)
     if dropped:
         notes.append(f"summary over budget: {dropped} oldest entries dropped (run: compress)")
     return text, notes
+
+
+def layered_summary(p, scenes, idx, budget, model):
+    sums = p.summaries()
+    cfg = p.cfg["summary"]
+    return layered_summary_core(sums, cfg, scenes, idx, budget, p.est, model, p.root)
 
 
 def render_story_string(tpl, fields):
