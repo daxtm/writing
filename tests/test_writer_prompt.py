@@ -133,8 +133,8 @@ def test_compose_writer_prompt_is_pure_and_deterministic(tmp_path):
         system="Sys.", out_seq="### Mara:\n", sums=sums, summary_cfg={"detailed_recent_scenes": 1},
         est=est, ratio=ratio, model="m", root="/proj",
     )
-    first = longform.compose_writer_prompt(3000, 5000, **common)
-    second = longform.compose_writer_prompt(3000, 5000, **common)
+    first = longform.compose_writer_prompt(longform.PromptInputs(rb=3000, sb=5000, **common))
+    second = longform.compose_writer_prompt(longform.PromptInputs(rb=3000, sb=5000, **common))
     assert first == second
     prompt, parts, snotes = first
     assert parts["bible"] == est("m", "The bible.")
@@ -143,7 +143,7 @@ def test_compose_writer_prompt_is_pure_and_deterministic(tmp_path):
     # a missing summary surfaces the deterministic note through the composition
     two = [{"id": "s1", "chapter": 1, "title": "One", "characters": ["Mara"], "target_words": 50},
            {"id": "s2", "chapter": 1, "title": "Two", "characters": ["Mara"], "target_words": 50}]
-    _, _, snotes = longform.compose_writer_prompt(
-        3000, 5000, **{**common, "scenes": two, "idx": 1,
-                       "sums": {"scenes": {}, "arcs": []}})
+    _, _, snotes = longform.compose_writer_prompt(longform.PromptInputs(
+        rb=3000, sb=5000, **{**common, "scenes": two, "idx": 1,
+                             "sums": {"scenes": {}, "arcs": []}}))
     assert snotes == ["s1 has no summary (run: update-state /proj --scene s1)"]

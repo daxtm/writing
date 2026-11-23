@@ -51,6 +51,7 @@ import threading
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1261,50 +1262,91 @@ def writer_sampling(preset, mac):
     return params, extra, ignored
 
 
-def compose_writer_prompt(rb, sb, scenes, idx, ins, story_string, mac, char, user,
-                          bible, state, card, scene_text, continuing, prev_src,
-                          steer, passage_words, lfields, cast, progress, system,
-                          out_seq, sums, summary_cfg, est, ratio, model, root):
+@dataclass
+class PromptInputs:
+    """Loaded and derived values for the pure writer-prompt composition.
+
+    Named fields keep the call site readable; the object carries no file,
+    project, or network handles.
+    """
+
+    rb: int
+    sb: int
+    scenes: list
+    idx: int
+    ins: dict
+    story_string: str
+    mac: object
+    char: str
+    user: str
+    bible: str
+    state: str
+    card: str
+    scene_text: str
+    continuing: bool
+    prev_src: str
+    steer: str
+    passage_words: int
+    lfields: dict
+    cast: str
+    progress: str
+    system: str
+    out_seq: str
+    sums: dict
+    summary_cfg: dict
+    est: object
+    ratio: object
+    model: str
+    root: Path | str
+
+
+def compose_writer_prompt(inp):
     """Pure writer prompt composition from already-loaded strings and objects.
 
-    Returns the exact (prompt, parts, summary_notes) for the given recent (`rb`)
-    and summary (`sb`) budgets; no file, project, or network access.
+    Returns the exact (prompt, parts, summary_notes) for the given recent and
+    summary budgets; no file, project, or network access.
     """
-    summary, snotes = layered_summary_core(sums, summary_cfg, scenes, idx, sb, est, model, root)
-    scenario = bible
+    rb, sb = inp.rb, inp.sb
+    summary, snotes = layered_summary_core(
+        inp.sums, inp.summary_cfg, inp.scenes, inp.idx, sb, inp.est, inp.model, inp.root)
+    scenario = inp.bible
     if summary:
         scenario += "\n\nStory so far:\n" + summary
-    scenario += "\n\nContinuity state:\n" + (state or "(none yet)")
+    scenario += "\n\nContinuity state:\n" + (inp.state or "(none yet)")
     fields = {
-        "system": system, "wiBefore": mac(lfields["wiBefore"]), "description": mac(lfields["description"]),
-        "personality": "", "persona": "", "scenario": mac(scenario), "wiAfter": mac(lfields["wiAfter"]),
-        "mesExamples": "", "char": char, "user": user,
+        "system": inp.system, "wiBefore": inp.mac(inp.lfields["wiBefore"]),
+        "description": inp.mac(inp.lfields["description"]),
+        "personality": "", "persona": "", "scenario": inp.mac(scenario),
+        "wiAfter": inp.mac(inp.lfields["wiAfter"]),
+        "mesExamples": "", "char": inp.char, "user": inp.user,
     }
-    story = render_story_string(story_string, fields)
-    a = [card]
-    if cast:
-        a.append(cast)
-    a.append(progress)
-    if not continuing and prev_src:
-        a.append("End of the previous scene (context only; this scene begins now):\n" + tail_trim_chars(int(rb * ratio(model)), prev_src))
-    if not continuing and idx == 0:
+    story = render_story_string(inp.story_string, fields)
+    a = [inp.card]
+    if inp.cast:
+        a.append(inp.cast)
+    a.append(inp.progress)
+    if not inp.continuing and inp.prev_src:
+        a.append("End of the previous scene (context only; this scene begins now):\n"
+                 + tail_trim_chars(int(rb * inp.ratio(inp.model)), inp.prev_src))
+    if not inp.continuing and inp.idx == 0:
         a.append("This is the opening of the story.")
-    if steer:
-        a.append("Direction for this passage: " + steer)
+    if inp.steer:
+        a.append("Direction for this passage: " + inp.steer)
     a.append(
-        f"Write this scene as prose from {char}'s point of view, following the POV, tense and style rules in the scenario. "
-        + ("Continue from exactly where the text leaves off" if continuing else "Begin the scene")
-        + f", about {passage_words} words. Never repeat what is already written. Stay inside this scene. "
+        f"Write this scene as prose from {inp.char}'s point of view, following the POV, tense and style rules in the scenario. "
+        + ("Continue from exactly where the text leaves off" if inp.continuing else "Begin the scene")
+        + f", about {inp.passage_words} words. Never repeat what is already written. Stay inside this scene. "
         "When the scene's outcome has been reached, finish at a natural stopping point and write [SCENE END] on its own line."
     )
-    author = mac("\n\n".join(a))
-    prefill = tail_trim_chars(int(rb * ratio(model)), scene_text, marker="") if continuing else ""
-    prompt = story + mac(ins.get("input_sequence", ""), user) + author + ins.get("input_suffix", "") + mac(out_seq, char) + prefill
+    author = inp.mac("\n\n".join(a))
+    prefill = tail_trim_chars(int(rb * inp.ratio(inp.model)), inp.scene_text, marker="") if inp.continuing else ""
+    prompt = (story + inp.mac(inp.ins.get("input_sequence", ""), inp.user) + author
+              + inp.ins.get("input_suffix", "") + inp.mac(inp.out_seq, inp.char) + prefill)
     parts = {
-        "sysprompt": est(model, system), "bible": est(model, bible), "summary": est(model, summary),
-        "state": est(model, state),
-        "lore": est(model, lfields["wiBefore"] + lfields["description"] + lfields["wiAfter"]),
-        "author_turn": est(model, author), "prefill": est(model, prefill),
+        "sysprompt": inp.est(inp.model, inp.system), "bible": inp.est(inp.model, inp.bible),
+        "summary": inp.est(inp.model, summary), "state": inp.est(inp.model, inp.state),
+        "lore": inp.est(inp.model, inp.lfields["wiBefore"] + inp.lfields["description"] + inp.lfields["wiAfter"]),
+        "author_turn": inp.est(inp.model, author), "prefill": inp.est(inp.model, prefill),
     }
     return prompt, parts, snotes
 
@@ -1360,11 +1402,13 @@ def build_writer_prompt(p, preset, lore, scenes, idx, tree, steer, passage_words
     system = mac(preset["sysprompt"].get("content", ""))
 
     def compose(rb, sb):
-        return compose_writer_prompt(
-            rb, sb, scenes, idx, ins, preset["context"]["story_string"], mac, char, user,
-            bible, state, card, scene_text, continuing, prev_src, steer, passage_words,
-            lfields, cast, progress, system, out_seq, p.summaries(), p.cfg["summary"],
-            p.est, p.ratio, model, p.root)
+        return compose_writer_prompt(PromptInputs(
+            rb=rb, sb=sb, scenes=scenes, idx=idx, ins=ins,
+            story_string=preset["context"]["story_string"], mac=mac, char=char, user=user,
+            bible=bible, state=state, card=card, scene_text=scene_text, continuing=continuing,
+            prev_src=prev_src, steer=steer, passage_words=passage_words, lfields=lfields,
+            cast=cast, progress=progress, system=system, out_seq=out_seq, sums=p.summaries(),
+            summary_cfg=p.cfg["summary"], est=p.est, ratio=p.ratio, model=model, root=p.root))
 
     ceil, max_comp, src = p.writer_ceiling(preset)
     max_tokens = int(params.get("max_tokens") or 300)
