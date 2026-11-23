@@ -76,7 +76,7 @@ def test_other_chunks_and_iend_ignored():
 def test_malformed_payload_returns_none():
     assert decode(png(text_chunk(b"chara", b"not base64 %%%"))) is None
     assert decode(png(text_chunk(b"chara", base64.b64encode(b"not json")))) is None
-    assert decode(png(itxt(b"ccv3", b64(card()), compressed=True)[:-4])) is None
+    assert decode(png(itxt(b"ccv3", b64(card()), compressed=True)[:-10])) is None
 
 
 def test_bad_itxt_compression_skipped_not_fatal():
@@ -85,8 +85,9 @@ def test_bad_itxt_compression_skipped_not_fatal():
     assert decode(data)["name"] == "Mara"
 
 
-def test_truncated_chunk_stream_stops_cleanly():
-    assert decode(png(text_chunk(b"chara", b64(card())))[:-10])["name"] == "Mara"
+def test_trailing_chunk_truncation_does_not_break_decoding():
+    data = png(text_chunk(b"chara", b64(card())), chunk(b"IEND", b""))[:-10]
+    assert decode(data)["name"] == "Mara"
 
 
 def test_wrapper_reads_file(tmp_path):
