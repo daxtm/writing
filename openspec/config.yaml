@@ -5,6 +5,10 @@ context: |
   Project: longform.py helps writers plan and collaboratively draft long-form fiction using Featherless.ai.
   Stack: Python 3.11+, argparse, uv with PEP 723 inline httpx>=0.27; JSON/Markdown project files, no database.
   Runs on: Local CLI via uv run --script longform.py; shell checks via scripts/check.sh and ock check; no hosted CI workflow.
+  Current implementation: main has no GUI command. The unmerged feat/reader-gui branch contains a read-only Tkinter/ttk reader, safe reader_model snapshots, and ADR-0004/0005; do not describe it as integrated.
+  Planned desktop target: docs/ROADMAP.md GUI milestones cover a native Wayland writing workspace with buttons for the existing full flow and persistent per-scene multiline steering. ADR-0006 chooses PySide6/Qt Widgets, replacing the pending reader's presentation; ADR-0007 chooses incremental shared writing operations and a single background GUI worker. These decisions do not mean those features or dependencies are implemented.
+  GUI delivery: preserve CLI prompts, sampling and file formats; reuse Project/Tree/Lore/Api and reader snapshots, not terminal automation or duplicated prompts. Keep Qt imports lazy. Tests use fake providers, temporary projects and existing network guards; operation/model tests are headless, Qt widget tests use offscreen execution, and actual Wayland/compositor/scaling acceptance is separate. Every new behavior must be covered by scripts/check.sh.
+  Roadmap process: create OpenSpec changes only when selected for build; no new change artifacts for the roadmap itself. ADR-0004/0005 are allocated on feat/reader-gui; preserve their numbering on integration.
   Constraints: Offline deterministic tests with MockTransport/fakes, never live API calls; dependency provisioning may use network. Never commit API keys or .env. Keep private generated myfic/ and the third-party preset JSON untracked and out of fixtures. Keep longform.py as a thin PEP 723 launcher over the longform_core/ package (ADR-0003); behavior, output, and file formats are frozen behind the test suite. scripts/check.sh discovers tests/; checks run locally (ock check, ock ship).
   The owner reviews behavior and output rather than code: plain language, observable results.
 
@@ -21,6 +25,7 @@ rules:
     - Only decisions that matter; anything costly to reverse gets an ADR in docs/adr/
     - Simplest approach that meets the spec; no speculative features
   tasks:
+    - The first task is a failing test of the behavior the owner will observe
     - Each task is one small commit; its test sits right next to it
     - The last task makes scripts/check.sh cover the new behavior and pass
     - At most ~8 tasks; bigger means split the change

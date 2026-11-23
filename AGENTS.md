@@ -11,6 +11,23 @@ Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27`; argparse CLI, JSON
 Suite: `uv run --with pytest --with httpx pytest -q tests`; no lint/build step.
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
+Current main has no `gui` command. The separate `feat/reader-gui` branch contains
+a read-only Tkinter/ttk GUI and `reader_model` snapshots; do not assume that
+branch is already integrated.
+
+## Planned desktop workspace
+`docs/ROADMAP.md` extends the completed CLI foundation with three GUI milestones:
+Wayland steer/generate/accept, setup/planning and draft controls, then continuity/
+review/revision/export. These are plans, not implemented commands or OpenSpec changes.
+ADR-0006 selects PySide6/Qt Widgets for the expanded native Wayland workspace;
+ADR-0007 selects incremental shared operations and one background GUI worker.
+Reuse existing commands/core behavior and the pending reader's safe snapshots,
+not terminal automation or a second writing engine. Keep CLI prompts/files
+compatible. Verify the actual uv/Qt/Wayland runtime before claiming support.
+The implementation must add offline operation/button-flow tests to
+`scripts/check.sh`; model tests stay headless, Qt widget tests use offscreen
+execution, and real Wayland desktop acceptance is separate. Do not weaken the
+existing network guard or claim headless tests establish compositor support.
 
 ## Layout
 - `longform.py`: thin PEP 723 launcher; re-exports the package's public names so `import longform` keeps working.
@@ -21,6 +38,8 @@ Run / demo: `uv run --script longform.py --help` prints commands without API cal
 
 ## Rules
 - Specs: `openspec/`. Decisions: `docs/adr/`. Plan: `docs/ROADMAP.md`.
+- Roadmap changes get OpenSpec artifacts only when selected for implementation;
+  no speculative change directories. ADR-0004/0005 are reserved on `feat/reader-gui`.
 - Keep `myfic/` and the third-party `56295265-LLam_ception-1.3.json` preset untracked.
 - Never commit API keys or `.env`; synthetic test credentials only.
 - Tests are offline/deterministic: no live API calls; use MockTransport/fakes and temporary projects.
