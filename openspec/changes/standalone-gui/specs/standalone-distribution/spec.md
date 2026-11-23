@@ -17,7 +17,7 @@ package directory on the documented compatible runtime.
 
 #### Scenario: Run only the copied executable
 - **WHEN** a writer copies only `dist/longform` to an unrelated directory on the documented compatible Linux runtime and runs `./longform --help` without Python, uv, or the checkout available
-- **THEN** it exits 0 and lists the existing CLI commands and `gui DIR`
+- **THEN** it exits 0 and lists the existing CLI commands and `gui [DIR]`
 - **AND** it neither downloads dependencies nor requires an adjacent package directory
 
 #### Scenario: Use the CLI without a display
@@ -80,6 +80,19 @@ or project formats. Closing an idle window normally SHALL exit 0.
 - **WHEN** a writer uses the copied executable to open a synthetic project, edit/save a scene card, save a new manual passage through the existing draft controls, and export to a chosen destination
 - **THEN** these actions work through the existing workspace without terminal prompts or external editors
 - **AND** the source CLI reads the same saved card and active passage and produces the same manuscript at an equivalent export destination
+
+### Requirement: Launch the bundled GUI by default
+Invoking the copied executable with no arguments SHALL take the same GUI
+default as the source launcher: attempt the native workspace for the current
+working directory without requiring an explicit `gui` command, Python, uv, or
+the checkout. The existing native-Wayland policy and recovery guidance SHALL
+apply unchanged.
+
+#### Scenario: Double-click or bare executable
+- **WHEN** the copied executable runs with no arguments from a file manager or shell and no Python, uv, or checkout is available
+- **THEN** it attempts the native Wayland workspace for the current directory instead of reporting a missing command
+- **AND** without a usable Wayland session it exits nonzero with the same frozen recovery advice as `gui`
+- **AND** a non-project directory is handled by the workspace Create/Open controls without writing project files
 
 ### Requirement: Preserve native Wayland policy with standalone recovery advice
 The frozen GUI SHALL preserve native-Wayland-only startup and refuse explicit

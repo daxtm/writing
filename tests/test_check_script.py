@@ -133,6 +133,7 @@ def test_check_script_missing_uv_without_tests_skips(tmp_repo, tmp_path):
 FROZEN_GUI_TESTS = (
     "test_copied_binary_runs_help_without_python_uv_or_checkout",
     "test_copied_binary_headless_cli_without_display_variables",
+    "test_copied_binary_with_no_arguments_launches_gui",
     "test_archive_contains_gui_application_modules",
     "test_archive_contains_qt_runtime_and_wayland_plugins",
     "test_frozen_gui_refuses_platforms_before_qt",

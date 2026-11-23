@@ -393,6 +393,7 @@ def test_copied_binary_runs_help_without_python_uv_or_checkout(built, tmp_path):
     assert r.returncode == 0, r.stderr
     for cmd in EXPECTED_COMMANDS:
         assert cmd in r.stdout, f"--help did not list {cmd}"
+    assert "gui [DIR]" in r.stdout, "help must show the optional GUI directory"
 
 
 def test_copied_binary_init_creates_project_files(built, tmp_path):
@@ -435,6 +436,26 @@ def test_copied_binary_headless_cli_without_display_variables(built, tmp_path):
                    env=env, cwd=work)
     assert r.returncode == 0, r.stderr
     assert out.is_file() and out.read_text(encoding="utf-8").strip()
+
+
+def test_copied_binary_with_no_arguments_launches_gui(built, tmp_path):
+    """Double-click/no-argument startup takes the GUI path, not an argparse
+    error: with no Wayland socket it emits the frozen recovery advice and
+    exits nonzero before any project or network work."""
+    runtime = tmp_path / "no-args-runtime"
+    runtime.mkdir()
+    work = tmp_path / "no-args cwd"
+    work.mkdir()
+    env = frozen_env(tmp_path, built.guard_so,
+                     extra={"XDG_RUNTIME_DIR": str(runtime),
+                            "WAYLAND_DISPLAY": "missing-socket-0"})
+    r = run_frozen(built.copied, [], env=env, cwd=work, timeout=120)
+    blob = r.stdout + r.stderr
+    assert r.returncode != 0, blob
+    assert "native Wayland is required" in blob, blob
+    assert str(built.copied) in blob, "frozen guidance must name the copied executable"
+    assert "uv run" not in blob
+    assert "the following arguments are required" not in blob
 
 
 # ---------------------------------------------------------------------------

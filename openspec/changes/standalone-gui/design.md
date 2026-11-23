@@ -144,6 +144,18 @@ scaling/theme, and outcomes in this change's `evidence.md`. If a real desktop
 is unavailable, record PENDING and leave desktop acceptance unchecked; do
 not substitute offscreen success or claim workspace completion.
 
+### 5. Default the bare invocation to the GUI
+
+A launch with no arguments SHALL dispatch to the same GUI path as `gui [DIR]`
+with the current working directory. This covers file-manager double-click and
+accidental bare launches; it is not a separate window or test-only mode. The
+`gui` subcommand accepts an optional `DIR`, and every explicit command keeps
+its existing required arguments. `--help` stays a normal argparse help exit.
+A non-project current directory is handled by the existing workspace
+Create/Open controls with no writes until the owner confirms. Both source and
+frozen modes use the same dispatch, and frozen recovery advice still names the
+copied executable.
+
 ## Risks / Trade-offs
 
 - Qt/plugin dependency differences → inspect the pinned artifact and verify it

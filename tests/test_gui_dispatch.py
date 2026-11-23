@@ -98,6 +98,31 @@ def test_gui_dispatch_blocks_until_close(monkeypatch, tmp_path):
         "window must be shown before the blocking app.exec()"
 
 
+def test_no_arguments_dispatches_gui_in_current_directory(monkeypatch, tmp_path):
+    """Double-clicking the executable (no arguments) opens the GUI in cwd
+    instead of printing an argparse error."""
+    import longform_core.gui as gui
+
+    calls = []
+    monkeypatch.setattr(gui, "run_cli", lambda d: calls.append(d) or 0)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["longform"])
+    assert cli.main() == 0
+    assert calls == [str(tmp_path)]
+
+
+def test_gui_without_directory_dispatches_in_current_directory(monkeypatch, tmp_path):
+    """`gui` without DIR also defaults to cwd."""
+    import longform_core.gui as gui
+
+    calls = []
+    monkeypatch.setattr(gui, "run_cli", lambda d: calls.append(d) or 3)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["longform.py", "gui"])
+    assert cli.main() == 3
+    assert calls == [str(tmp_path)]
+
+
 def test_gui_unsets_platform_env_selects_wayland(monkeypatch):
     """Unset QT_QPA_PLATFORM means Wayland: the env is set before Qt loads."""
     import longform_core.gui as gui

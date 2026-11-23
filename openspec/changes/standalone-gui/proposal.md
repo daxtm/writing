@@ -7,7 +7,8 @@ Implement the GUI into the stand alone binary so writers can open the same writi
 ## What Changes
 
 - Extend `scripts/build-standalone.sh` and its pinned requirements to bundle the existing GUI, PySide6/Shiboken, Qt libraries, and native Wayland plugins in the same `dist/longform`.
-- Keep existing CLI commands; add the source workspace's `gui DIR` command to the frozen executable with identical controls and project files.
+- Keep existing CLI commands; add the source workspace's `gui [DIR]` command to the frozen executable with identical controls and project files.
+- Make a bare invocation — no command, including a file-manager double-click — open the existing workspace for the current directory, without weakening native-Wayland policy.
 - Preserve native-Wayland-only startup and give frozen users recovery instructions that do not require uv or source.
 - Extend existing copied-binary tests, compatibility metadata, notices, and `docs/standalone.md`; require separate frozen-binary Wayland acceptance.
 
@@ -22,6 +23,7 @@ None.
 ### Modified Capabilities
 
 - `standalone-distribution`: include the existing GUI in the executable, preserve CLI behavior, and verify/document the frozen Qt runtime.
+- `desktop-reading`: default a bare invocation to the existing native workspace in the current directory.
 
 ## Impact
 
@@ -29,4 +31,4 @@ Build requirements/script, startup diagnostics, frozen tests, check entry point,
 
 **Out of scope:** new GUI features, changing prompts/files, installers, desktop launchers, other platforms, XWayland fallback, release/shipping, or completing unrelated workspace acceptance.
 
-**See it work after implementation:** build, copy only `dist/longform` elsewhere, then run `QT_QPA_PLATFORM=wayland /absolute/path/longform gui /path/to/project`. Expect the existing native window; saved steering and exported prose remain visible to the CLI.
+**See it work after implementation:** build, copy only `dist/longform` elsewhere, then run `QT_QPA_PLATFORM=wayland /absolute/path/longform gui /path/to/project` or launch it with no arguments from the project directory (for example by double-clicking). Expect the existing native window; saved steering and exported prose remain visible to the CLI.

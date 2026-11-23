@@ -57,6 +57,12 @@ Only the executable file is needed; the informational sidecars described below
 are not required to run it. Relative paths (project directories, `--out`,
 presets) resolve against the caller's working directory exactly as in source.
 
+The GUI is the default entry point: running the executable with **no
+arguments** — for example by double-clicking it in a file manager — opens the
+GUI in the current directory. `gui` without `DIR` does the same. If that
+directory is not a project, the window's Create/Open controls let the writer
+choose or initialize one; nothing is written until an explicit Create/Open.
+
 The GUI starts only in a native Wayland session, selected with
 `QT_QPA_PLATFORM=wayland` (the command sets this itself when unset). Every other
 value — `xcb`, `offscreen`, or fallback lists such as `wayland,xcb` — is
