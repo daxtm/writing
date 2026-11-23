@@ -1,6 +1,6 @@
 # ADR-0002: Keep the single-file CLI through the prototype
 
-- Status: Accepted
+- Status: Superseded by ADR-0003
 - Date: 2026-11-23
 - Related: add-test-suite; docs/ROADMAP.md
 
