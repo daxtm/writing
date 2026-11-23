@@ -145,6 +145,10 @@ class MainWindow(QMainWindow):
         self._bible_baseline = None   # captured pre/secs + bible.md bytes
         self._bible_preview_section = None
         self._bible_preview_is_current = True
+        self._outline_overview = None
+        self._outline_candidates = []   # candidate names generated this session
+        self._outline_notes_loaded = None
+        self._outline_body_loaded = None
         try:
             self._session = dop.session_info(self._root)
         except dop.OpError as e:
@@ -228,6 +232,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_notes_tab(), "Notes")
         self.tabs.addTab(self._build_setup_tab(), "Setup")
         self.tabs.addTab(self._build_bible_tab(), "Bible")
+        self.tabs.addTab(self._build_outline_tab(), "Outline")
         right_l.addWidget(self.tabs, 1)
 
         steer_box = QGroupBox("Steering")
@@ -893,6 +898,236 @@ class MainWindow(QMainWindow):
         notes_split.setStretchFactor(1, 2)
         return notes_split
 
+    def _build_outline_tab(self):
+        """Outline pane: multiline notes, N competing planner candidates,
+        view/reroll/choose/edit with backups — no implicit acceptance."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.outline_note = QLabel("")
+        self.outline_note.setWordWrap(True)
+        l.addWidget(self.outline_note)
+        self.outline_editor_label = QLabel(
+            "Notes for the planner (multiline; # lines are ignored when the "
+            "prompt is built)")
+        l.addWidget(self.outline_editor_label)
+        self.outline_notes_edit = QPlainTextEdit()
+        self.outline_notes_edit.setPlaceholderText(
+            "Anything you want the planner to follow; Leave empty for no "
+            "notes")
+        l.addWidget(self.outline_notes_edit, 2)
+        gbtns = QHBoxLayout()
+        gbtns.addWidget(QLabel("Candidates (N>=1)"))
+        self.outline_n_spin = QSpinBox()
+        self.outline_n_spin.setRange(1, 99)
+        self.outline_n_spin.setValue(2)
+        gbtns.addWidget(self.outline_n_spin)
+        self.outline_generate_btn = QPushButton("Generate")
+        self.outline_generate_btn.setToolTip("Save the notes and generate N "
+                                             "competing candidates on the "
+                                             "worker; needs a nonempty saved "
+                                             "bible and planner credentials")
+        self.outline_generate_btn.clicked.connect(self.outline_generate)
+        gbtns.addWidget(self.outline_generate_btn)
+        self.outline_reroll_btn = QPushButton("Reroll same notes")
+        self.outline_reroll_btn.setToolTip("Append N more candidates with "
+                                           "the current notes; earlier "
+                                           "candidates are never deleted")
+        self.outline_reroll_btn.clicked.connect(
+            lambda: self.outline_generate(reroll=True))
+        gbtns.addWidget(self.outline_reroll_btn)
+        gbtns.addStretch(1)
+        l.addLayout(gbtns)
+        self.outline_list_label = QLabel("Candidates (newest appended)")
+        l.addWidget(self.outline_list_label)
+        self.outline_list = QListWidget()
+        l.addWidget(self.outline_list, 3)
+        vbtns = QHBoxLayout()
+        self.outline_view_btn = QPushButton("View candidate")
+        self.outline_view_btn.clicked.connect(self.outline_view)
+        vbtns.addWidget(self.outline_view_btn)
+        self.outline_choose_btn = QPushButton("Choose as outline.md")
+        self.outline_choose_btn.setToolTip("Back up any previous outline and "
+                                           "save the chosen body without its "
+                                           "notes comment; no scene "
+                                           "generation follows")
+        self.outline_choose_btn.clicked.connect(self.outline_choose)
+        vbtns.addWidget(self.outline_choose_btn)
+        self.outline_edit_btn = QPushButton("Edit body")
+        self.outline_edit_btn.clicked.connect(self.outline_edit_body)
+        vbtns.addWidget(self.outline_edit_btn)
+        self.outline_save_btn = QPushButton("Save edited outline")
+        self.outline_save_btn.setToolTip("Commit the working body through the "
+                                         "same backed-up boundary; the "
+                                         "candidate file stays unchanged")
+        self.outline_save_btn.clicked.connect(self.outline_save_body)
+        vbtns.addWidget(self.outline_save_btn)
+        self.outline_cancel_btn = QPushButton("Cancel")
+        self.outline_cancel_btn.clicked.connect(self.outline_cancel)
+        vbtns.addWidget(self.outline_cancel_btn)
+        vbtns.addStretch(1)
+        l.addLayout(vbtns)
+        self.outline_body_label = QLabel(
+            "Working outline body (saved outline.md appears here when no "
+            "candidate is selected)")
+        l.addWidget(self.outline_body_label)
+        self.outline_body_edit = QPlainTextEdit()
+        self.outline_body_edit.setReadOnly(True)
+        l.addWidget(self.outline_body_edit, 4)
+        return box
+
+    # ---------------------------------------------------------------- outline
+
+    def _refresh_outline_overview(self):
+        try:
+            self._outline_overview = plan.outline_overview(self._root)
+            self._outline_overview["baseline"] = plan.outline_baseline(
+                self._root, self._outline_overview.get("candidates", []))
+        except dop.OpError as e:
+            self._outline_overview = {"notes_form": "", "notes": "",
+                                      "outline": None, "candidates": [],
+                                      "bible_present": False, "error": str(e)}
+        self._rebuild_outline_list()
+
+    def _rebuild_outline_list(self):
+        over = self._outline_overview or {}
+        self.outline_list.blockSignals(True)
+        self.outline_list.clear()
+        for name in over.get("candidates", []):
+            self.outline_list.addItem(QListWidgetItem(name))
+        self.outline_list.blockSignals(False)
+        notes = over.get("notes_form") or ""
+        if self._outline_notes_loaded is None or \
+                (self.outline_notes_edit.toPlainText() ==
+                 (self._outline_notes_loaded or "") and notes !=
+                 (self._outline_notes_loaded or "")):
+            self.outline_notes_edit.setPlainText(notes)
+            self._outline_notes_loaded = notes
+        bits = []
+        if over.get("outline") is not None:
+            bits.append("outline.md saved")
+        else:
+            bits.append("no outline.md yet")
+        if not over.get("bible_present"):
+            bits.append("outline generation needs a nonempty bible.md "
+                        "(answer and accept a bible section first)")
+        self.outline_note.setText("; ".join(bits))
+
+    def _update_outline_tab(self):
+        if self._outline_overview is None:
+            self._refresh_outline_overview()
+
+    def _outline_notes_dirty(self):
+        return self.outline_notes_edit.toPlainText() != \
+            (self._outline_notes_loaded or "")
+
+    def outline_generate(self, reroll=False):
+        """Save the current notes and generate N candidates (worker)."""
+        if self._busy:
+            return
+        over = self._outline_overview or {}
+        if not over.get("bible_present"):
+            self._status("Outline generation needs a nonempty bible.md; "
+                         "answer and accept a bible section first.",
+                         error=True)
+            return
+        notes_form = self.outline_notes_edit.toPlainText()
+        n = self.outline_n_spin.value()
+        root = plan.canonical_root(self._root)
+
+        def fn(sink, token):
+            return plan.generate_outlines(root, notes_form, n,
+                                          provider_factory=self._provider_factory,
+                                          token=token, events=sink)
+
+        self._dispatch(fn, kind="outline_generate")
+
+    def _outline_selected(self):
+        row = self.outline_list.currentRow()
+        names = (self._outline_overview or {}).get("candidates", [])
+        return names[row] if 0 <= row < len(names) else None
+
+    def outline_view(self):
+        name = self._outline_selected()
+        if name is None:
+            self._status("Select a candidate to view it.")
+            return
+        try:
+            text = plan.read_outline_candidate(self._root, name)
+        except dop.OpError as e:
+            self._status(str(e), error=True)
+            return
+        self._view_override = (f"candidate {name} (view only)", text)
+        self._update_panes()
+
+    def outline_choose(self):
+        """Explicit choice bound to the current captured inputs."""
+        if self._busy:
+            return
+        name = self._outline_selected()
+        if name is None:
+            self._status("Select a candidate to choose it.")
+            return
+        if self._outline_notes_dirty() or self._outline_body_dirty():
+            self._status("Unsaved notes or body edits; Save or Cancel them "
+                         "before choosing.", error=True)
+            return
+        root = plan.canonical_root(self._root)
+        base = self._outline_overview.get("baseline")
+        if not base:
+            self._status("Reload the outline pane (Refresh) and try again: "
+                         "the choice needs a captured baseline.", error=True)
+            return
+        history = name not in self._outline_candidates
+
+        def fn(sink, token):
+            return plan.choose_outline(root, name, dict(base), token=token,
+                                       events=sink)
+
+        self._dispatch(fn, kind="outline_choose")
+
+    def outline_edit_body(self):
+        """Edit the currently shown outline body (saved outline.md or chosen
+        candidate) in the built-in editor."""
+        self._outline_body_loaded = self.outline_body_edit.toPlainText()
+        self.outline_body_edit.setReadOnly(False)
+        self.outline_body_label.setText(
+            "Working outline body (local edits; Save commits through the "
+            "backed-up boundary)")
+
+    def _outline_body_dirty(self):
+        return self._outline_body_loaded is not None and \
+            self.outline_body_edit.toPlainText() != self._outline_body_loaded
+
+    def outline_save_body(self):
+        if self._busy or not self._outline_body_dirty():
+            if not self._outline_body_dirty():
+                self._status("No body changes to save; open Edit body first.")
+            return
+        body = self.outline_body_edit.toPlainText()
+        root = plan.canonical_root(self._root)
+        base = (self._outline_overview or {}).get("baseline")
+        if not base:
+            self._status("Reload the outline pane (Refresh) and try again.",
+                         error=True)
+            return
+
+        def fn(sink, token):
+            return plan.save_outline_body(root, body, dict(base), token=token,
+                                          events=sink)
+
+        self._dispatch(fn, kind="outline_save_body")
+
+    def outline_cancel(self):
+        """Leave: revert the working body to the saved outline.md."""
+        self._outline_body_loaded = None
+        self.outline_body_edit.setReadOnly(True)
+        over = self._outline_overview or {}
+        self.outline_body_edit.setPlainText(over.get("outline") or "")
+        self.outline_body_label.setText(
+            "Working outline body (saved outline.md appears here when no "
+            "candidate is selected)")
+
     def _build_bible_tab(self):
         """Bible pane: fixed section questions with multiline forms, saved
         answers, preview, Accept/Skip/Leave, direct section editing and
@@ -1499,11 +1734,14 @@ class MainWindow(QMainWindow):
         return True
 
     def _planning_dirty(self):
-        return self.settings_dirty() or self._bible_dirty()
+        return (self.settings_dirty() or self._bible_dirty()
+                or self._outline_notes_dirty() or self._outline_body_dirty())
 
     def _save_planning_dirty(self):
         if self._bible_dirty():
             return self.bible_save()
+        if self._outline_body_dirty():
+            return self.outline_save_body()
         return self.save_settings()
 
     def _discard_planning_dirty(self):
@@ -1512,6 +1750,9 @@ class MainWindow(QMainWindow):
             self.bible_form_edit.setPlainText(self._bible_form_loaded or "")
         else:
             self.bible_form_edit.setPlainText(self._bible_text_loaded or "")
+        self.outline_notes_edit.setPlainText(self._outline_notes_loaded or "")
+        self._outline_body_loaded = None
+        self.outline_cancel()
 
     def _run_pending_action(self):
         """Continue a Create/Open deferred behind a dirty-form Save."""
@@ -1611,6 +1852,10 @@ class MainWindow(QMainWindow):
         self._bible_preview_section = None
         self._bible_form_loaded = None
         self._bible_text_loaded = None
+        self._outline_overview = None
+        self._outline_candidates = []
+        self._outline_notes_loaded = None
+        self._outline_body_loaded = None
         self._bind_steering(None)
         self.refresh(force=True)
         self._autoselect()
@@ -1779,6 +2024,7 @@ class MainWindow(QMainWindow):
         if force:
             self._plan = plan.project_overview(self._root)
             self._refresh_bible_overview()
+            self._refresh_outline_overview()
         self._update_setup_tab()
         try:
             res = self._load(self._root, cache=self._cache, force=force)
@@ -2006,7 +2252,10 @@ class MainWindow(QMainWindow):
                   self.bible_edit_btn, self.bible_skip_btn,
                   self.bible_leave_btn, self.bible_text_edit_btn,
                   self.bible_text_save_btn, self.bible_text_cancel_btn,
-                  self.bible_history_btn):
+                  self.bible_history_btn, self.outline_generate_btn,
+                  self.outline_reroll_btn, self.outline_view_btn,
+                  self.outline_choose_btn, self.outline_edit_btn,
+                  self.outline_save_btn, self.outline_cancel_btn):
             b.setEnabled(not self._busy)
         has_batch = bool(self._batch and self._batch.get("saved"))
         for b in (self.accept_btn, self.view_btn, self.reroll_btn,
@@ -2323,6 +2572,43 @@ class MainWindow(QMainWindow):
             self._bible_mode = "form"
             self._load_bible_form()
             self._status(f"saved section text for {value['heading']}")
+        elif kind == "outline_generate" and isinstance(value, dict):
+            self._outline_candidates += value["candidates"]
+            self._refresh_outline_overview()
+            self._outline_notes_loaded = self.outline_notes_edit.toPlainText()
+            self.outline_list.blockSignals(True)
+            self.outline_list.clear()
+            for name in (self._outline_overview or {}).get("candidates", []):
+                self.outline_list.addItem(QListWidgetItem(name))
+            self.outline_list.setCurrentRow(
+                max(0, self.outline_list.count() - len(value["candidates"])))
+            self.outline_list.blockSignals(False)
+            msg = (f"{len(value['candidates'])} outline candidate(s) saved"
+                   + (f"; {len(value['warnings'])} warning(s)" if
+                      value["warnings"] else "") + "; outline.md unchanged "
+                   "until you choose one")
+            self._status(msg)
+            for w in value["warnings"]:
+                self._status("warning: " + w)
+        elif kind == "outline_choose" and isinstance(value, dict):
+            self._refresh_outline_overview()
+            self.outline_body_edit.setReadOnly(True)
+            self.outline_body_edit.setPlainText(
+                self._outline_overview.get("outline") or "")
+            self._status(f"saved {value['source']} to outline.md"
+                         + (" (from saved history; it is now bound to the "
+                            "current inputs by this explicit choice)"
+                            if value.get("from_history") else "")
+                         + "; no scene generation runs automatically")
+        elif kind == "outline_save_body" and isinstance(value, dict):
+            self._refresh_outline_overview()
+            self._outline_body_loaded = None
+            self.outline_body_edit.setReadOnly(True)
+            self.outline_body_edit.setPlainText(
+                self._outline_overview.get("outline") or "")
+            self._status("saved the edited outline to outline.md (previous "
+                         "outline backed up); the candidate file is "
+                         "unchanged")
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
@@ -2808,6 +3094,7 @@ class MainWindow(QMainWindow):
         self._lore_refresh()
         self._update_setup_tab()
         self._update_bible_tab()
+        self._update_outline_tab()
         self._update_steering_ui()
 
     def _reconcile_selection(self):

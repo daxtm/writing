@@ -425,6 +425,233 @@ def bible_history(root):
     return out
 
 
+# ---------------------------------------------------------------- outline
+
+OUTLINE_NOTES_FORM = ("# Notes for the outline: anything you want the planner "
+                      "to follow (pacing, key events, the ending, tone).\n"
+                      "# Lines starting with # are ignored. Leave empty for "
+                      "no notes.\n\n")
+
+
+def outline_overview(root):
+    """Read-only outline pane state: saved notes, saved outline, candidates."""
+    p = _project_of(root)
+    notes_file = p.f("inputs", "outline_notes.md")
+    if notes_file.is_symlink():
+        raise OpError("inputs/outline_notes.md is a symlink; refusing to read")
+    raw_notes = read_text(notes_file) if notes_file.exists() else \
+        OUTLINE_NOTES_FORM
+    candidates = []
+    d = p.f("outlines")
+    if d.is_dir() and not d.is_symlink():
+        try:
+            candidates = sorted(x.name for x in d.glob("candidate_*.md"))
+        except OSError:
+            candidates = []
+    outline = None
+    op = p.f("outline.md")
+    if op.exists():
+        if op.is_symlink():
+            outline = None
+        else:
+            outline = read_text(op)
+    bible = read_text(p.f("bible.md")).strip()
+    return {"notes_form": raw_notes, "notes": _filter_notes(raw_notes),
+            "outline": outline, "candidates": candidates,
+            "bible_present": bool(bible), "target_words":
+                int(p.cfg["target_words"])}
+
+
+def _filter_notes(raw_notes):
+    return "\n".join(ln for ln in (raw_notes or "").splitlines()
+                     if not ln.lstrip().startswith("#")).strip()
+
+
+def save_outline_notes(root, form, *, token=None, events=None):
+    """Save the notes form exactly (CLI --notes / edit-notes-and-reroll)."""
+    p = _project_of(root)
+    if not _no_symlink_below(p.root, "inputs", "outline_notes.md"):
+        raise OpError("inputs/outline_notes.md is a symlink; refusing to save")
+    if token:
+        token.check()
+    from .utils import save_input
+    save_input(p.root, "outline_notes", form)
+    _emit(events, "outline_notes_saved")
+    return {"notes": _filter_notes(form), "form_path":
+            "inputs/outline_notes.md"}
+
+
+def outline_messages(bible, notes, tw):
+    """The exact cmd_outline planner messages (pure)."""
+    from .config import PLANNER_SYSTEM
+    from .utils import tag_instr
+    lo, hi = max(1, tw // 1500), max(2, tw // 800)
+    user = (
+        f"# Story bible\n{bible}\n\n"
+        + (f"# Author's notes for this outline (follow them)\n{notes}\n\n"
+           if notes else "")
+        + f"Design a complete outline for a story of about {tw} words.\n"
+        "Format (markdown):\n"
+        "- Parts/acts, then chapters, then numbered beats per chapter.\n"
+        "- Every beat is a concrete event: who does what, what changes.\n"
+        "- Give each chapter an approximate word count; the counts must sum "
+        "to roughly the target.\n"
+        f"- A {tw}-word story has room for roughly {lo}-{hi} scenes; pace "
+        "accordingly.\n"
+        "- End with a section 'Threads & payoffs' listing each setup and the "
+        "beat where it pays off.\n"
+        + tag_instr("outline")
+    )
+    return [{"role": "system", "content": PLANNER_SYSTEM},
+            {"role": "user", "content": user}]
+
+
+def outline_baseline(root, candidates=()):
+    """Baselines carried from generation to a later choose/save."""
+    p = _project_of(root)
+    keys = ["bible.md", "outline.md", "inputs/outline_notes.md",
+            "project.json"]
+    for name in candidates:
+        keys.append(f"outlines/{name}")
+    return _capture(p, keys)
+
+
+def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
+                      events=None):
+    """N competing planner candidates via the shared chat_many: exact CLI
+    messages, tag extraction, candidate naming and the optional leading notes
+    comment. Rerolls append; nothing replaces outline.md."""
+    p = _project_of(root)
+    bible = read_text(p.f("bible.md")).strip()
+    if not bible:
+        raise OpError("bible.md is empty or missing; the outline planner "
+                      "needs the bible (answer and accept a section first)",
+                      soft=True)
+    tw = int(p.cfg["target_words"])
+    n = max(1, int(n))
+    notes = _filter_notes(notes_form)
+    if token:
+        token.check()
+    if not _no_symlink_below(p.root, "inputs", "outline_notes.md"):
+        raise OpError("inputs/outline_notes.md is a symlink; refusing to save")
+    baseline = _capture(p, ["bible.md", "outline.md", "project.json",
+                            "inputs/outline_notes.md"])
+    from .utils import save_input
+    save_input(p.root, "outline_notes", notes_form)
+    _advance(p, baseline, "inputs/outline_notes.md")
+    _emit(events, "notes_saved")
+    msgs = outline_messages(bible, notes, tw)
+    provider = _provider(p, provider_factory)
+    _emit(events, "progress", msg=f"generating {n} outline candidate(s) "
+          f"(max_parallel {p.cfg['max_parallel']})")
+    from .utils import extract_tagged
+    try:
+        res = provider.chat_many("planner", msgs, n, token=token,
+                                 on_event=None if events is None else (
+                                     lambda ev: _emit(events, ev.get("type"),
+                                                      **{k: v for k, v in
+                                                         ev.items()
+                                                         if k != "type"})))
+    except Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001 — sanitized outcome
+        raise OpError(f"outline generation failed: {e}", soft=True) from None
+    ts = stamp()
+    existing = 0
+    d = p.f("outlines")
+    if d.is_dir():
+        existing = len(list(d.glob("candidate_*.md")))
+    saved, warnings = [], []
+    for text, _finish, _u in res:
+        if token:
+            token.check()
+        body, ok = extract_tagged(text, "outline")
+        if not ok:
+            warnings.append("a candidate had no <outline> tags; check it for "
+                            "stray text")
+        name = f"candidate_{ts}_{existing + len(saved) + 1}.md"
+        if not _no_symlink_below(p.root, "outlines", name):
+            raise OpError(f"outlines/{name} is a symlink; refusing to write")
+        write_text(p.f("outlines", name),
+                   (f"<!-- notes: {notes} -->\n" if notes else "") + body + "\n")
+        saved.append(name)
+    if not saved:
+        warnings.append("no candidates came back")
+    if len(res) < n:
+        warnings.append(f"only {len(res)} of {n} requested outline "
+                        "candidates came back")
+    _emit(events, "outlines_saved", count=len(saved))
+    return {"candidates": saved, "warnings": warnings, "notes": notes,
+            "shortfall": max(0, n - len(res)), "bible_present": True,
+            "baseline": baseline}
+
+
+def read_outline_candidate(root, name):
+    """Full candidate text for viewing (safe read)."""
+    p = _project_of(root)
+    if not re.fullmatch(r"candidate_[0-9\-]+_[0-9]+\.md", name or ""):
+        raise OpError("unsafe candidate name", soft=True)
+    path = p.f("outlines", name)
+    if path.is_symlink() or not path.is_file():
+        raise OpError(f"outlines/{name} is missing or unsafe", soft=True)
+    return read_text(path)
+
+
+def choose_outline(root, name, baseline, *, token=None, events=None):
+    """Save a candidate as outline.md: strips only the leading notes comment,
+    backs up any previous outline, never touches the candidate file."""
+    p = _project_of(root)
+    text = read_outline_candidate(root, name)
+    _stale_outline(p, baseline)
+    if token:
+        token.check()
+    import re as _re
+    body = _re.sub(r"^<!-- notes:.*?-->\n", "", text, flags=_re.S)
+    _write_outline(p, body)
+    _emit(events, "outline_saved", source=name)
+    return {"saved": "outline.md", "source": name, "from_history": False}
+
+
+def save_outline_body(root, body, baseline, *, token=None, events=None):
+    """Commit the edited working body through the same backed-up boundary."""
+    p = _project_of(root)
+    _stale_outline(p, baseline)
+    if token:
+        token.check()
+    _write_outline(p, body)
+    _emit(events, "outline_saved", source="edit")
+    return {"saved": "outline.md", "source": "edit", "from_history": False}
+
+
+def _stale_outline(p, baseline):
+    if not isinstance(baseline, dict):
+        raise OpError("no captured outline baseline; reload the outline pane "
+                      "before saving")
+    _stale_check(p, baseline)
+
+
+def _write_outline(p, body):
+    if not _no_symlink_below(p.root, "outlines"):
+        raise OpError("outlines/ is a symlink; refusing to back up")
+    if not _no_symlink_below(p.root, "outline.md"):
+        raise OpError("outline.md is a symlink; refusing to write")
+    prev = p.f("outline.md")
+    if prev.exists() and not prev.is_symlink():
+        dest_name = f"outline_prev_{stamp()}.md"
+        dest = p.f("outlines", dest_name)
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = p.f("outlines", f"outline_prev_{stamp()}_{n}.md")
+        import shutil
+        try:
+            shutil.copy2(prev, dest)
+        except OSError as e:
+            raise OpError(f"the outline backup could not be written "
+                          f"({type(e).__name__})") from None
+    write_text(prev, body)
+
+
 # ------------------------------------------------------------------ open
 
 _SAFE_JSON_FILES = ("project.json", "scenes.json", "summaries.json")

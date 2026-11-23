@@ -786,3 +786,262 @@ def test_bible_unknown_heading(tmp_path):
     with pytest.raises(OpError) as e:
         plan.accept_bible_section(root, "Nope", "x", base)
     assert "no such bible section" in str(e.value)
+
+
+# --------------------------------------------------------------- outline
+
+class FakeOutlineProvider:
+    """chat_many surface matching Api for planner calls; records messages."""
+
+    script = []
+
+    def __init__(self, p):
+        self.p = p
+        self.calls = []
+
+    def chat_many(self, role, messages, n, max_tokens=None, token=None,
+                  on_event=None):
+        self.calls.append({"role": role, "messages": messages, "n": n})
+        out = []
+        for k in range(n):
+            if token:
+                token.check()
+            i = len(self.calls) - 1
+            item = FakeOutlineProvider.script[k] if \
+                len(FakeOutlineProvider.script) > k else "<outline>X</outline>"
+            if isinstance(item, Exception):
+                if on_event:
+                    on_event({"type": "candidate_failed", "k": k + 1, "n": n,
+                              "msg": "failed"})
+                continue
+            out.append((item, "stop", {}))
+            if on_event:
+                on_event({"type": "candidate_done", "k": k + 1, "n": n,
+                          "msg": "done"})
+        return out
+
+
+OUTLINES = ["<outline>OUTLINE ONE BODY</outline>",
+            "<outline>OUTLINE TWO BODY</outline>"]
+
+
+def outline_project(tmp_path):
+    root = bible_project(tmp_path / "p")
+    (root / "bible.md").write_text("# Story bible\n\nQuiet town.\n",
+                                   encoding="utf-8")
+    return root
+
+
+def test_outline_cli_parity_files_prompts_and_history(tmp_path, monkeypatch,
+                                                      capsys):
+    from longform_core.project import Project
+    a, b = outline_project(tmp_path / "cli"), outline_project(tmp_path / "gui")
+
+    FakeOutlineProvider.script = list(OUTLINES)
+    monkeypatch.setattr(commands, "Api", FakeOutlineProvider)
+    answers = iter(["r", "1"])   # reroll same notes, then choose candidate 1
+    monkeypatch.setattr(commands, "ask", lambda *a2, **k: next(answers))
+    FakeOutlineProvider.script = OUTLINES + ["<outline>REROLL BODY</outline>"]
+    args = type("A", (), {"n": 2, "notes": "Tight pacing."})()
+    commands.cmd_outline(Project(a), args)
+    capsys.readouterr()
+
+    prov = FakeOutlineProvider(b)
+    r1 = plan.generate_outlines(b, commands.OUTLINE_NOTES_FORM +
+                                "Tight pacing.\n", 2,
+                                provider_factory=lambda p: prov)
+    plan.generate_outlines(b, commands.OUTLINE_NOTES_FORM +
+                           "Tight pacing.\n", 2,
+                           provider_factory=lambda p: prov)
+    plan.choose_outline(b, r1["candidates"][0], r1["baseline"])
+
+    names = sorted(x.name for x in (a / "outlines").glob("candidate_*.md"))
+    gnames = sorted(x.name for x in (b / "outlines").glob("candidate_*.md"))
+    assert names == gnames, "candidate file names match the CLI convention"
+    for name in names:
+        assert (a / "outlines" / name).read_bytes() == \
+            (b / "outlines" / name).read_bytes(), name
+    assert (a / "outline.md").read_bytes() == (b / "outline.md").read_bytes()
+    assert (a / "inputs" / "outline_notes.md").read_bytes() == \
+        (b / "inputs" / "outline_notes.md").read_bytes()
+    assert sorted(x.name for x in (a / "inputs" / "history").glob("*.md")) == \
+        sorted(x.name for x in (b / "inputs" / "history").glob("*.md"))
+    assert "OUTLINE ONE BODY" in (b / "outline.md").read_text()
+    # exact CLI planner messages/params (bible, notes, target, tag instruction)
+    assert prov.calls[0]["role"] == "planner"
+    assert prov.calls[0]["n"] == 2
+    assert "# Story bible" in prov.calls[0]["messages"][1]["content"]
+
+
+def test_outline_messages_match_cli_exactly(tmp_path, monkeypatch):
+    """Byte-identical planner messages with the CLI make_msgs."""
+    import longform_core.commands as commands
+    from longform_core.project import Project
+    root = outline_project(tmp_path / "p")
+
+    seen = {}
+
+    def spy(self, role, messages, n, max_tokens=None, token=None, on_event=None):
+        seen["messages"] = messages
+        return []
+
+    monkeypatch.setattr(commands.Api, "chat_many", spy)
+    monkeypatch.setattr(commands, "ask", lambda *a, **k: "")
+    args = type("A", (), {"n": 1, "notes": ""})()
+    commands.cmd_outline(Project(root), args)
+    tw = 17000
+    mine = plan.outline_messages("# Story bible\n\nQuiet town.", "", tw)
+    assert seen["messages"] == mine
+
+
+def test_outline_candidates_saved_with_notes_comment(tmp_path):
+    root = outline_project(tmp_path / "p")
+    base = plan.outline_baseline(root)
+    FakeOutlineProvider.script = list(OUTLINES)
+    out = plan.generate_outlines(root, commands.OUTLINE_NOTES_FORM +
+                                 "Keep it tight.\n", 2,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p))
+    assert len(out["candidates"]) == 2
+    first = (root / "outlines" / out["candidates"][0]).read_text()
+    assert first.startswith("<!-- notes: Keep it tight. -->\n")
+    assert "OUTLINE ONE BODY" in first and first.endswith("\n")
+    assert not (root / "outline.md").exists(), \
+        "generation never chooses automatically"
+
+
+def test_outline_no_notes_no_comment(tmp_path):
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = list(OUTLINES)
+    out = plan.generate_outlines(root, commands.OUTLINE_NOTES_FORM, 1,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p))
+    text = (root / "outlines" / out["candidates"][0]).read_text()
+    assert not text.startswith("<!--")
+
+
+def test_outline_missing_or_empty_bible_blocks_generation(tmp_path):
+    root = init_p(tmp_path / "p")
+    (root / "bible.md").unlink()
+    with pytest.raises(OpError) as e:
+        plan.generate_outlines(root, "notes", 1,
+                               provider_factory=lambda p:
+                               FakeOutlineProvider(p))
+    assert "bible.md is empty or missing" in str(e.value)
+    root2 = outline_project(tmp_path / "p2")
+    (root2 / "bible.md").write_text("   \n", encoding="utf-8")
+    with pytest.raises(OpError):
+        plan.generate_outlines(root2, "notes", 1,
+                               provider_factory=lambda p:
+                               FakeOutlineProvider(p))
+
+
+def test_outline_shortfall_and_tag_warning(tmp_path):
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = ["no tags at all", Exception("boom")]
+    out = plan.generate_outlines(root, "notes", 2,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p))
+    assert out["shortfall"] == 1
+    assert any("no <outline> tags" in w for w in out["warnings"])
+    assert len(out["candidates"]) == 1, \
+        "complete candidates are saved and kept"
+    assert not (root / "outline.md").exists()
+
+
+def test_outline_reroll_appends_never_deletes(tmp_path):
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = list(OUTLINES)
+    r1 = plan.generate_outlines(root, "notes A", 2,
+                                provider_factory=lambda p:
+                                FakeOutlineProvider(p))
+    before = sorted(x.name for x in (root / "outlines").glob("*.md"))
+    r2 = plan.generate_outlines(root, "notes B", 1,
+                                provider_factory=lambda p:
+                                FakeOutlineProvider(p))
+    after = sorted(x.name for x in (root / "outlines").glob("*.md"))
+    assert len(after) == len(before) + 1, "rerolls append candidates"
+    for name in before:
+        assert (root / "outlines" / name).read_text() in \
+            [(root / "outlines" / n).read_text() for n in after], \
+            "prior candidate files are kept unchanged"
+
+
+def test_outline_choose_strips_comment_and_backs_up(tmp_path):
+    root = outline_project(tmp_path / "p")
+    (root / "outline.md").write_text("PREVIOUS OUTLINE\n", encoding="utf-8")
+    FakeOutlineProvider.script = list(OUTLINES)
+    out = plan.generate_outlines(root, "notes", 1,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p))
+    plan.choose_outline(root, out["candidates"][0], out["baseline"])
+    body = (root / "outline.md").read_text()
+    assert body == "OUTLINE ONE BODY\n", "leading notes comment stripped"
+    prevs = list((root / "outlines").glob("outline_prev_*.md"))
+    assert len(prevs) == 1 and prevs[0].read_text() == "PREVIOUS OUTLINE\n"
+    cand = (root / "outlines" / out["candidates"][0]).read_text()
+    assert "<!-- notes:" in cand, "the original candidate file is retained"
+
+
+def test_outline_choose_stale_refusal(tmp_path):
+    root = outline_project(tmp_path / "p")
+    base = plan.outline_baseline(root)
+    FakeOutlineProvider.script = list(OUTLINES)
+    out = plan.generate_outlines(root, "notes", 1,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p))
+    (root / "bible.md").write_text("changed\n", encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.choose_outline(root, out["candidates"][0], base)
+    assert getattr(e.value, "stale", False)
+    assert not (root / "outline.md").exists()
+
+
+def test_outline_choose_stale_candidate_refusal(tmp_path):
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = list(OUTLINES)
+    out = plan.generate_outlines(root, "notes", 1,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p))
+    base = plan.outline_baseline(root, out["candidates"])
+    (root / "outlines" / out["candidates"][0]).write_text("tampered\n",
+                                                          encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.choose_outline(root, out["candidates"][0], base)
+    assert getattr(e.value, "stale", False)
+
+
+def test_outline_body_edit_through_backed_up_boundary(tmp_path):
+    root = outline_project(tmp_path / "p")
+    (root / "outline.md").write_text("CURRENT\n", encoding="utf-8")
+    base = plan.outline_baseline(root)
+    plan.save_outline_body(root, "EDITED BODY\n", base)
+    assert (root / "outline.md").read_text() == "EDITED BODY\n"
+    prev = list((root / "outlines").glob("outline_prev_*.md"))
+    assert prev and prev[0].read_text() == "CURRENT\n"
+
+
+def test_outline_generation_stop_keeps_partial(tmp_path):
+    from longform_core.cancel import CancellationToken
+    root = outline_project(tmp_path / "p")
+    tok = CancellationToken()
+    tok.cancel()
+    with pytest.raises(Exception):
+        plan.generate_outlines(root, "notes", 2, token=tok,
+                               provider_factory=lambda p:
+                               FakeOutlineProvider(p))
+    assert not list((root / "outlines").glob("candidate_*.md"))
+    assert not (root / "outline.md").exists()
+
+
+def test_outline_history_view_after_reopen(tmp_path):
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = list(OUTLINES)
+    out = plan.generate_outlines(root, "notes", 1,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p))
+    over = plan.outline_overview(root)
+    assert over["candidates"] == out["candidates"], \
+        "saved candidates are listed after reopen"
+    assert plan.read_outline_candidate(root, out["candidates"][0]).strip() \
+        .endswith("OUTLINE ONE BODY")

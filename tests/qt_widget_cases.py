@@ -1950,6 +1950,105 @@ def fake_calls_empty(_win):  # pragma: no cover - helper kept for symmetry
     return True
 
 
+def case_planning_outline(root):
+    """Outline pane: notes, N=2 generate, reroll appends, choose with backup,
+    body edit, stale refusal, warnings/shortfall and no implicit acceptance."""
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    proj = root / "p"
+    (proj / "trees").mkdir(parents=True)
+    _write_json(proj / "project.json", {"api_key": "sk-test"})
+    _write_json(proj / "scenes.json", [])
+    _write_json(proj / "summaries.json", {"scenes": {}, "arcs": []})
+    _write_text(proj / "bible.md", "# Story bible\n\nQuiet town.\n")
+
+    fake = PlanningFake(responses=["<outline>OUTLINE ONE BODY</outline>",
+                                   "<outline>OUTLINE TWO BODY</outline>",
+                                   "<outline>REROLL BODY</outline>"])
+    win = gw.MainWindow(str(proj), choice=_no_dialogs("outline"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.tabs.setCurrentIndex(gw.OUTLINE)
+    assert not win.outline_generate_btn.isEnabled() is False
+    # notes editor shows the CLI form
+    assert "# Notes for the outline" in win.outline_notes_edit.toPlainText()
+
+    # missing bible: generation refused, no call
+    (proj / "bible.md").unlink()
+    win.refresh(force=True)
+    win.outline_notes_edit.setPlainText("Keep it tight.")
+    win.outline_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "bible.md" in win.status.text() and fake.calls == []
+
+    # restore bible; generate two candidates
+    _write_text(proj / "bible.md", "# Story bible\n\nQuiet town.\n")
+    win.refresh(force=True)
+    win.outline_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert ("chat_many", "planner") in fake.calls
+    assert len(win._outline_candidates) == 2
+    cands = sorted((proj / "outlines").glob("candidate_*.md"))
+    assert len(cands) == 2
+    assert cands[0].read_text().startswith("<!-- notes: Keep it tight. -->\n")
+    assert not (proj / "outline.md").exists()
+    notes_before = (proj / "inputs" / "outline_notes.md").read_text()
+
+    # reroll appends; earlier candidates kept
+    win.outline_reroll_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(win._outline_candidates) == 3
+    assert sorted((proj / "outlines").glob("candidate_*.md")) == \
+        cands + cands[-1:] if False else len(list(
+            (proj / "outlines").glob("candidate_*.md"))) == 3
+    assert (proj / "inputs" / "outline_notes.md").read_text() == notes_before
+
+    # choose the reroll: outline.md saved without the notes comment, backup none
+    win.outline_list.setCurrentRow(2)
+    win.outline_choose_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (proj / "outline.md").read_text() == "REROLL BODY\n"
+    assert (proj / "outlines" / win._outline_candidates[2]).read_text() \
+        .startswith("<!-- notes:"), "the candidate file is retained"
+
+    # body edit through the backed-up boundary
+    win.outline_edit_btn.click()
+    win.outline_body_edit.setPlainText("EDITED BODY\n")
+    win.outline_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (proj / "outline.md").read_text() == "EDITED BODY\n"
+    prevs = list((proj / "outlines").glob("outline_prev_*.md"))
+    assert prevs and prevs[0].read_text() == "REROLL BODY\n"
+
+    # stale: external bible change after capture refuses the choose
+    _write_text(proj / "bible.md", "# changed\n")
+    win.outline_list.setCurrentRow(0)
+    win.outline_choose_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "changed on disk" in win.status.text()
+    assert (proj / "outline.md").read_text() == "EDITED BODY\n"
+
+    # reopen lists saved candidates
+    win.close()
+    win2 = gw.MainWindow(str(proj), choice=_no_dialogs("reopen"),
+                         provider_factory=lambda _p: fake)
+    win2.tabs.setCurrentIndex(gw.OUTLINE)
+    assert win2.outline_list.count() == 3, "saved candidates listed on reopen"
+    assert win2.outline_body_edit.toPlainText() == ""
+    win2.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -1978,6 +2077,7 @@ CASES = {
     "case_planning_create_open": case_planning_create_open,
     "case_planning_settings_limits": case_planning_settings_limits,
     "case_planning_bible": case_planning_bible,
+    "case_planning_outline": case_planning_outline,
 }
 
 
