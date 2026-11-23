@@ -27,6 +27,8 @@ NOTES_TAB = "Notes"
 class ReaderApp:
     """Read-only desktop reader for one project directory."""
 
+    BRANCH_GROUPS = ("Active path", "Saved branches", "Unlinked/invalid links")
+
     def __init__(self, root, project_dir):
         self.root = root
         self.project_dir = project_dir
@@ -35,9 +37,9 @@ class ReaderApp:
         self.stale = False
         self._selected_scene = None
         self._selected_node = None
-        self._node_by_iid = {}
-        self._iid_by_node = {}
         self._after_id = None
+        self._after_cancels = []
+        self._content = {}  # per-pane signatures of what is currently shown
         # rebuild spies for tests: unchanged panes must not be rebuilt
         self.rebuilds = {"scene_list": 0, "manuscript": 0, "branches": 0,
                          "notes": 0, "status": 0}
@@ -163,9 +165,11 @@ class ReaderApp:
         widget.configure(state="disabled")
 
     # ---------------------------------------------------------------- refresh
+
     def refresh(self, force=False):
         result = model.load_snapshot(self.project_dir, cache=self.cache, force=force)
         if result.snapshot is None:
+            # keep the whole last valid snapshot visible and mark it stale
             self.stale = True
             self._set_status(warnings=result.warnings)
             self.last_check_var.set("last check: failed")
@@ -179,59 +183,87 @@ class ReaderApp:
         """Manual refresh always forces a fresh disk read."""
         self.refresh(force=True)
 
-    def _apply(self, snap):
+    def _apply(self, snap, preserve=True):
+        state = self._capture_state() if preserve and self.snapshot is not None \
+            else None
+        old_scene = state["scene"] if state else self._selected_scene
+        old_node = state["node"] if state else self._selected_node
+        old_content = self._content
         self.snapshot = snap
         self.root.title(f"{snap.project.title} — Longform Reader (read-only)")
-        self._populate_scene_list()
-        self._ensure_selection()
-        self._populate_manuscript()
-        self._populate_branches()
-        self._populate_notes()
+
+        scene, node = self._resolve_selection(old_scene, old_node)
+        self._selected_scene, self._selected_node = scene, node
+
+        rows = self._scene_list_rows(snap)
+        if rows != old_content.get("scene_list"):
+            self.rebuilds["scene_list"] += 1
+            self._populate_scene_list(rows)
+        self._content["scene_list"] = rows
+        self._sync_scene_tree_selection()
+
+        view = snap.trees.get(scene) if scene else None
+        head, words, m_text, label = self._manuscript_parts(view)
+        m_sig = (scene, head, words, m_text)
+        if m_sig != old_content.get("manuscript"):
+            self.rebuilds["manuscript"] += 1
+            self.manuscript_label_var.set(label)
+            self._set_text(self.manuscript, m_text)
+        self._content["manuscript"] = m_sig
+
+        branch_rows, detail = self._branch_parts(snap, scene, node)
+        b_sig = (scene, node, branch_rows, detail)
+        if b_sig != old_content.get("branches"):
+            self.rebuilds["branches"] += 1
+            self._populate_branches(branch_rows)
+            self._set_text(self.branch_detail, detail)
+        else:
+            self._sync_branch_tree_selection()
+        self._content["branches"] = b_sig
+
+        notes_text = self._notes_text(snap)
+        if notes_text != old_content.get("notes"):
+            self.rebuilds["notes"] += 1
+            self._set_text(self.notes, notes_text)
+        self._content["notes"] = notes_text
+
         self._set_status()
+        self._restore_state(state)
 
     # ------------------------------------------------------------ scene list
 
-    def _populate_scene_list(self):
-        self.rebuilds["scene_list"] += 1
+    def _scene_list_rows(self, snap):
+        """(group, id, title, status, words) in display order."""
+        rows = []
+        for r in snap.scenes:
+            view = snap.trees.get(r.id)
+            w = view.active_words if view and view.active_words is not None else 0
+            rows.append((r.group, r.id, r.title, r.status, w))
+        for sid in sorted(t for t in snap.trees if t not in
+                          {r.id for r in snap.scenes}):
+            view = snap.trees[sid]
+            w = view.active_words if view.active_words is not None else None
+            rows.append(("Retained trees", sid, "(retained)", "retained", w))
+        return rows
+
+    def _populate_scene_list(self, rows):
         tree = self.scene_tree
         tree.delete(*tree.get_children())
         self._scene_by_iid = {}
         self._iid_by_scene = {}
-        snap = self.snapshot
-        if snap is None:
-            return
         groups = []
-        for row in snap.scenes:
-            if row.group not in groups:
-                groups.append(row.group)
-            iid = SCENE + row.id
-            self._scene_by_iid[iid] = row.id
-            self._iid_by_scene[row.id] = iid
+        for row in rows:
+            if row[0] not in groups:
+                groups.append(row[0])
         for group in groups:
-            gid = GROUP + group
-            tree.insert("", "end", iid=gid, text=group, open=True,
+            tree.insert("", "end", iid=GROUP + group, text=group, open=True,
                         values=("", "", ""))
-        retained = sorted(sid for sid in snap.trees
-                          if sid not in {r.id for r in snap.scenes})
-        if retained:
-            gid = GROUP + "Retained trees"
-            tree.insert("", "end", iid=gid, text="Retained trees", open=True,
-                        values=("", "", ""))
-            groups.append("Retained trees")
-        for row in snap.scenes:
-            view = snap.trees.get(row.id)
-            words = view.active_words if view else 0
-            words = "" if words is None else words
-            tree.insert(GROUP + row.group, "end", iid=self._iid_by_scene[row.id],
-                        text=row.id, values=(row.title, row.status, words))
-        for sid in retained:
-            view = snap.trees[sid]
-            words = "" if view.active_words is None else view.active_words
+        for group, sid, title, status, w in rows:
             iid = SCENE + sid
             self._scene_by_iid[iid] = sid
             self._iid_by_scene[sid] = iid
-            tree.insert(GROUP + "Retained trees", "end", iid=iid, text=sid,
-                        values=("(retained)", "retained", words))
+            tree.insert(GROUP + group, "end", iid=iid, text=sid,
+                        values=(title, status, "" if w is None else w))
 
     def scene_rows(self):
         """(id, title, status, active words) for every listed scene row."""
@@ -255,32 +287,20 @@ class ReaderApp:
         if sid == self._selected_scene:
             return
         self._selected_scene = sid
-        self._selected_node = None
-        self._populate_manuscript()
-        self._populate_branches()
+        self._selected_node = None  # a scene switch resets its node
+        self._apply(self.snapshot)
 
     # ------------------------------------------------------------ manuscript
 
-    def _scene_view(self):
-        snap = self.snapshot
-        if snap is None or self._selected_scene is None:
-            return None
-        return snap.trees.get(self._selected_scene)
-
-    def _populate_manuscript(self):
-        view = self._scene_view()
+    def _manuscript_parts(self, view):
         if view is None:
-            self.manuscript_label_var.set("no scene selected")
-            self._set_text(self.manuscript, "")
-            return
+            return None, None, "", "no scene selected"
         text = view.active_text if view.active_text is not None else ""
-        self.rebuilds["manuscript"] += 1
         head = view.head if view.head else "(none)"
         w = view.active_words if view.active_words is not None else 0
-        self.manuscript_label_var.set(f"head {head} · {w} words")
-        if not text:
-            text = "(no saved text yet)"
-        self._set_text(self.manuscript, text)
+        label = f"head {head} · {w} words"
+        shown = text if text else "(no saved text yet)"
+        return view.head, w, shown, label
 
     def manuscript_text(self):
         return self.manuscript.get("1.0", "end-1c")
@@ -288,91 +308,54 @@ class ReaderApp:
     def manuscript_label(self):
         return self.manuscript_label_var.get()
 
-    # ------------------------------------------------------------ branches/notes
+    # ------------------------------------------------------------ branches
 
-    BRANCH_GROUPS = ("Active path", "Saved branches", "Unlinked/invalid links")
-
-    def _populate_branches(self):
-        self.rebuilds["branches"] += 1
-        tree = self.branch_tree
-        tree.delete(*tree.get_children())
-        self._node_by_iid = {}
-        self._iid_by_node = {}
-        view = self._scene_view()
+    def _branch_rows(self, snap, sid):
+        """[(kind, group, nid, parent_nid, values)] in insertion order."""
+        view = snap.trees.get(sid) if sid else None
         if view is None:
-            self._selected_node = None
-            self._populate_branch_detail()
-            return
-        sid = self._selected_scene
-        buckets = {g: [] for g in self.BRANCH_GROUPS}
-        for nid in view.order:
-            info = view.nodes.get(nid)
-            if info is None:
-                continue
-            if info.on_active_path:
-                buckets["Active path"].append(nid)
-            elif info.link_ok:
-                buckets["Saved branches"].append(nid)
-            else:
-                buckets["Unlinked/invalid links"].append(nid)
+            return []
+        rows = []
         for group in self.BRANCH_GROUPS:
-            nids = buckets[group]
+            nids = []
+            for nid in view.order:
+                info = view.nodes.get(nid)
+                if info is None:
+                    continue
+                if group == "Active path" and info.on_active_path:
+                    nids.append(nid)
+                elif group == "Saved branches" and info.link_ok \
+                        and not info.on_active_path:
+                    nids.append(nid)
+                elif group == "Unlinked/invalid links" and not info.link_ok:
+                    nids.append(nid)
             if not nids:
                 continue
-            gid = f"b:{sid}:{group}"
-            tree.insert("", "end", iid=gid, text=group, open=True,
-                        values=("", "", "", "", ""))
-            placed = set()
-            by_parent = {}
-            for nid in nids:
-                by_parent.setdefault(view.nodes[nid].parent, []).append(nid)
+            rows.append(("group", group, None, None, ()))
             nids_set = set(nids)
+            placed = set()
             roots = [n for n in nids if view.nodes[n].parent not in nids_set]
-            stack = [(None, nid) for nid in reversed(roots)]
+            stack = [nid for nid in reversed(roots)]
             while stack:
-                parent_iid, nid = stack.pop()
+                nid = stack.pop()
                 if nid in placed:
                     continue
                 placed.add(nid)
                 info = view.nodes[nid]
                 marker = ("head" if nid == view.head else
                           "active" if info.on_active_path else "")
-                iid = f"n:{sid}:{nid}"
-                self._node_by_iid[iid] = nid
-                self._iid_by_node[nid] = iid
-                tree.insert(parent_iid or gid, "end", iid=iid, text=nid,
-                            values=(info.parent or "(start)", info.word_count,
-                                    info.source or "(unavailable)",
-                                    info.created or "(unavailable)", marker))
-                stack.extend((iid, k) for k in reversed(info.children)
+                parent_nid = info.parent if info.parent in nids_set else None
+                rows.append(("node", group, nid, parent_nid,
+                             (info.parent or "(start)", info.word_count,
+                              info.source or "(unavailable)",
+                              info.created or "(unavailable)", marker)))
+                stack.extend(k for k in reversed(info.children)
                              if k in nids_set)
-        # default detail: current head, else first saved node
-        if self._selected_node not in view.nodes:
-            self._selected_node = view.head if view.head in view.nodes else \
-                (view.order[0] if view.order else None)
-        self._populate_branch_detail()
+        return rows
 
-    def _on_node_select(self, _event=None):
-        sel = self.branch_tree.selection()
-        if not sel or not sel[0].startswith("n:"):
-            return
-        self.select_node(self._node_by_iid[sel[0]])
-
-    def select_node(self, nid):
-        view = self._scene_view()
-        if view is None or nid not in view.nodes:
-            return
-        if nid == self._selected_node:
-            return
-        self._selected_node = nid
-        self._populate_branch_detail()
-
-    def _populate_branch_detail(self):
-        view = self._scene_view()
-        nid = self._selected_node
+    def _branch_detail_lines(self, view, nid):
         if view is None or nid is None or nid not in view.nodes:
-            self._set_text(self.branch_detail, "(no node selected)")
-            return
+            return ["(no node selected)"]
         info = view.nodes[nid]
         lines = [f"ID: {nid}",
                  f"parent: {info.parent if info.parent is not None else '(scene start)'}",
@@ -392,23 +375,71 @@ class ReaderApp:
         lines.append("")
         lines.append("text:")
         lines.append(info.text)
-        self._set_text(self.branch_detail, "\n".join(lines))
+        return lines
 
-    def branches_text(self):
-        return self.branch_detail.get("1.0", "end-1c")
+    def _branch_parts(self, snap, sid, nid):
+        view = snap.trees.get(sid) if sid else None
+        rows = self._branch_rows(snap, sid)
+        detail = "\n".join(self._branch_detail_lines(view, nid))
+        return tuple(rows), detail
+
+    def _populate_branches(self, rows):
+        tree = self.branch_tree
+        tree.delete(*tree.get_children())
+        self._node_by_iid = {}
+        self._iid_by_node = {}
+        sid = self._selected_scene
+        for kind, group, nid, parent_nid, values in rows:
+            if kind == "group":
+                tree.insert("", "end", iid=f"b:{sid}:{group}", text=group,
+                            open=True, values=("", "", "", "", ""))
+                continue
+            parent_iid = (self._iid_by_node.get(parent_nid)
+                          if parent_nid else f"b:{sid}:{group}")
+            iid = f"n:{sid}:{nid}"
+            self._node_by_iid[iid] = nid
+            self._iid_by_node[nid] = iid
+            tree.insert(parent_iid, "end", iid=iid, text=nid, values=values)
 
     def branch_index_ids(self):
         """Every node ID listed in the Branches index for the selected scene."""
         return sorted(self._iid_by_node)
 
-    # ---- notes
-
-    def _populate_notes(self):
-        self.rebuilds["notes"] += 1
-        snap = self.snapshot
-        if snap is None:
-            self._set_text(self.notes, "(no project data)")
+    def _on_node_select(self, _event=None):
+        sel = self.branch_tree.selection()
+        if not sel or not sel[0].startswith("n:"):
             return
+        self.select_node(self._node_by_iid[sel[0]])
+
+    def select_node(self, nid):
+        view = self._scene_view()
+        if view is None or nid not in view.nodes:
+            return
+        if nid == self._selected_node:
+            return
+        self._selected_node = nid
+        self._apply(self.snapshot)
+
+    def _sync_branch_tree_selection(self):
+        view = self._scene_view()
+        if view is None or self._selected_node not in view.nodes:
+            return
+        iid = f"n:{self._selected_scene}:{self._selected_node}"
+        if self.branch_tree.exists(iid) and iid not in self.branch_tree.selection():
+            self.branch_tree.selection_set(iid)
+
+    def branches_text(self):
+        return self.branch_detail.get("1.0", "end-1c")
+
+    def _scene_view(self):
+        snap = self.snapshot
+        if snap is None or self._selected_scene is None:
+            return None
+        return snap.trees.get(self._selected_scene)
+
+    # ------------------------------------------------------------ notes
+
+    def _notes_text(self, snap):
         notes = snap.notes
         out = []
         out.append("== bible.md ==")
@@ -423,7 +454,8 @@ class ReaderApp:
                 e = notes.summaries.scenes[sid]
                 out.append(f"-- {sid}" +
                            (f" (updated {e.updated})" if e.updated else ""))
-                out.append(f"detailed: {e.detailed if e.detailed is not None else '(unavailable)'}")
+                out.append(f"detailed: "
+                           f"{e.detailed if e.detailed is not None else '(unavailable)'}")
                 out.append(f"brief: {e.brief if e.brief is not None else '(unavailable)'}")
         else:
             out.append("(no scene summaries)")
@@ -445,26 +477,41 @@ class ReaderApp:
                     out.append(f.text)
             else:
                 out.append("(no reports)")
-        self._set_text(self.notes, "\n".join(out))
+        return "\n".join(out)
 
     def notes_text(self):
         return self.notes.get("1.0", "end-1c")
 
     # ------------------------------------------------------------ selection
 
-    def _ensure_selection(self):
+    def _resolve_selection(self, old_scene, old_node):
+        """Keep surviving selections; otherwise fall back head-first."""
         snap = self.snapshot
-        if snap is None:
-            self._selected_scene = None
-            return
         current = [r.id for r in snap.scenes]
-        if self._selected_scene in current or self._selected_scene in snap.trees:
-            self._sync_scene_tree_selection()
-            return
-        self._selected_scene = current[0] if current else \
-            (sorted(snap.trees)[0] if snap.trees else None)
-        self._selected_node = None
-        self._sync_scene_tree_selection()
+        if old_scene in current or old_scene in snap.trees:
+            scene = old_scene
+        elif current:
+            scene = current[0]
+        elif snap.trees:
+            scene = sorted(snap.trees)[0]
+        else:
+            scene = None
+        node = None
+        if scene is not None:
+            view = snap.trees.get(scene)
+            if view is not None:
+                if scene == old_scene and old_node in view.nodes:
+                    node = old_node
+                elif view.head in view.nodes:
+                    node = view.head
+                elif view.order:
+                    node = view.order[0]
+        return scene, node
+
+    def _ensure_selection(self):
+        scene, node = self._resolve_selection(self._selected_scene,
+                                              self._selected_node)
+        self._selected_scene, self._selected_node = scene, node
 
     def _sync_scene_tree_selection(self):
         iid = self._iid_by_scene.get(self._selected_scene)
@@ -496,6 +543,73 @@ class ReaderApp:
     def status_text(self):
         return self.status_var.get()
 
+    # ---------------------------------------------------- state preservation
+
+    def _capture_state(self):
+        return {
+            "scene": self._selected_scene,
+            "node": self._selected_node,
+            "tab": self.notebook.index(self.notebook.select())
+            if self.notebook.tabs() else 0,
+            "scene_open": {iid: self.scene_tree.item(iid, "open")
+                           for iid in self.scene_tree.get_children("")
+                           if iid.startswith(GROUP)},
+            "branch_open": {iid: self.branch_tree.item(iid, "open")
+                            for iid in self.branch_tree.get_children("")
+                            if iid.startswith("b:")},
+            "scene_yview": self.scene_tree.yview()[0],
+            "branch_yview": self.branch_tree.yview()[0],
+            "tops": {"manuscript": self.manuscript.index("@0,0"),
+                     "detail": self.branch_detail.index("@0,0"),
+                     "notes": self.notes.index("@0,0")},
+        }
+
+    def _restore_state(self, state):
+        if state is None:
+            return
+        tabs = self.notebook.tabs()
+        if tabs:
+            idx = min(state["tab"], len(tabs) - 1)
+            try:
+                if self.notebook.index(self.notebook.select()) != idx:
+                    self.notebook.select(idx)
+            except tk.TclError:
+                pass
+        for iid, was_open in state["scene_open"].items():
+            if self.scene_tree.exists(iid) and \
+                    bool(self.scene_tree.item(iid, "open")) != bool(was_open):
+                self.scene_tree.item(iid, open=was_open)
+        for iid, was_open in state["branch_open"].items():
+            if self.branch_tree.exists(iid) and \
+                    bool(self.branch_tree.item(iid, "open")) != bool(was_open):
+                self.branch_tree.item(iid, open=was_open)
+        self.scene_tree.yview_moveto(state["scene_yview"])
+        self.branch_tree.yview_moveto(state["branch_yview"])
+        self._restore_text_top(self.manuscript, state["tops"]["manuscript"])
+        self._restore_text_top(self.branch_detail, state["tops"]["detail"])
+        self._restore_text_top(self.notes, state["tops"]["notes"])
+
+    def _restore_text_top(self, widget, index):
+        """Put the captured first-visible index back at the top, clamped."""
+        if not index or not widget.get("1.0", "end-1c"):
+            return
+        target = index
+        if widget.compare("end-1c", "<=", target):
+            widget.yview_moveto(1.0)
+            return
+        widget.mark_set("reader_top", target)
+        widget.see("reader_top")
+        for _ in range(10000):
+            top = widget.index("@0,0")
+            if widget.compare(top, ">=", target):
+                break
+            widget.yview_scroll(1, "displaylines")
+        while True:
+            top = widget.index("@0,0")
+            if widget.compare(top, "<=", target) or top == "1.0":
+                break
+            widget.yview_scroll(-1, "displaylines")
+
     # ------------------------------------------------------------ timer
 
     def _on_timer(self):
@@ -510,6 +624,7 @@ class ReaderApp:
 
     def _cancel_timer(self):
         if self._after_id is not None:
+            self._after_cancels.append(self._after_id)
             try:
                 self.root.after_cancel(self._after_id)
             except Exception:

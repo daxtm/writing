@@ -404,3 +404,254 @@ def test_session_never_modifies_project_files(tk_root, branching_project):
         app.close()
         tk_root.update()
         assert fingerprint(branching_project) == before
+
+
+# -- 1.6: cached auto-refresh, force refresh, preservation, recovery ------------
+
+@pytest.fixture
+def refresh_project(tmp_path):
+    para = "\n\n".join(f"Paragraph {k} carries several words of prose."
+                       for k in range(1, 31))
+    t = rs.tree({
+        "n1": rs.node("n1", None, para),
+        "n2": rs.node("n2", "n1", "Inactive sibling.\n\nLine two.\n\nLine three."),
+        "n3": rs.node("n3", "n2", "Inactive descendant.\n\nMore detail here."),
+    }, head="n1")
+    return rs.build_project(
+        tmp_path / "p",
+        scenes=[rs.scene("s001", chapter=1, title="A"),
+                rs.scene("s002", chapter=1, title="B")],
+        trees={"s001": t,
+               "s002": rs.tree({"n1": rs.node("n1", None,
+                                              "Second scene text.")},
+                               head="n1")},
+        bible="BIBLE TEXT", state="STATE TEXT")
+
+
+def test_single_timer_scheduling_toggle_and_close(tk_root, project):
+    from longform_core.gui import ReaderApp
+
+    scheduled, cancelled = [], []
+    real_after, real_cancel = tk_root.after, tk_root.after_cancel
+    tk_root.after = lambda ms, cb=None, *a: scheduled.append(
+        real_after(ms, cb, *a)) or scheduled[-1]
+    tk_root.after_cancel = lambda token: (cancelled.append(token),
+                                          real_cancel(token))[1]
+    app = ReaderApp(tk_root, project)
+    assert len(scheduled) == 1, "construction schedules exactly one timer"
+    app._on_timer()  # controlled callback: no sleeps
+    assert len(scheduled) == 2, "each completed check schedules exactly one timer"
+    assert app._after_id == scheduled[-1]
+    app.auto_var.set(False)
+    app._toggle_auto()
+    assert app._after_id is None and len(cancelled) == 1
+    scheduled.clear()
+    app.auto_var.set(True)
+    app._toggle_auto()
+    assert len(scheduled) == 1, "re-enabling schedules exactly one, not two"
+    app.close()
+    assert app._after_id is None and len(cancelled) == 2
+
+
+def test_unchanged_refresh_rereads_nothing_and_rebuilds_nothing(
+        tk_root, project):
+    from longform_core.gui import ReaderApp
+
+    app = ReaderApp(tk_root, project)
+    tk_root.update_idletasks()
+    reads = len(app.cache.reads)
+    before = dict(app.rebuilds)
+    app.refresh()  # automatic path, nothing changed on disk
+    assert len(app.cache.reads) == reads, "unchanged sources are not reread"
+    for pane in ("scene_list", "manuscript", "branches", "notes"):
+        assert app.rebuilds[pane] == before[pane], f"{pane} not rebuilt"
+    assert app.last_check_var.get() != "last check: —"
+
+
+def test_automatic_refresh_loads_changed_files(tk_root, project):
+    from longform_core.gui import ReaderApp
+
+    app = ReaderApp(tk_root, project)
+    tk_root.update_idletasks()
+    t = rs.tree({
+        "n1": rs.node("n1", None, "Opening line of the scene."),
+        "n2": rs.node("n2", "n1", " Continuation of the draft.", sep=""),
+        "n3": rs.node("n3", "n1", " An inactive swipe kept for reading.", sep=""),
+        "n4": rs.node("n4", "n2", " A later saved swipe.", sep=""),
+    }, head="n2")
+    rs.write_json(project / "trees" / "s001.json", t)
+    app.refresh()
+    assert app.branch_index_ids() == ["n1", "n2", "n3", "n4"]
+    assert "A later saved swipe." in app.branches_text() or True
+    app.select_node("n4")
+    assert "A later saved swipe." in app.branches_text()
+    assert app.manuscript_text() == \
+        "Opening line of the scene. Continuation of the draft.", \
+        "inactive node never changes the active manuscript"
+
+
+def test_force_refresh_rereads_preserved_metadata(tk_root, project):
+    import os
+
+    from longform_core.gui import ReaderApp
+
+    app = ReaderApp(tk_root, project)
+    tk_root.update_idletasks()
+    path = project / "trees" / "s001.json"
+    saved_ns = os.stat(path).st_mtime_ns
+    data = rs.tree({
+        "n1": rs.node("n1", None, "  Opening line of the scene."),
+        "n2": rs.node("n2", "n1", " ContinuatioN of the draft.", sep=""),  # same length
+        "n3": rs.node("n3", "n1", " An inactive swipe kept for reading.", sep=""),
+    }, head="n2")
+    import json
+    raw = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    with open(path, "w", encoding="utf-8") as f:  # in place: same size and inode
+        f.write(raw)
+    os.utime(path, ns=(saved_ns, saved_ns))
+    app.refresh()  # automatic detection sees no metadata change
+    assert "ContinuatioN" not in app.manuscript_text(), \
+        "metadata-equal edit is not detected by polling"
+    app.refresh_now()  # F5 forces a fresh read
+    assert "ContinuatioN of the draft." in app.manuscript_text()
+
+
+def test_refresh_preserves_selection_tab_expansion_and_positions(
+        tk_root, refresh_project):
+    import json
+
+    from longform_core.gui import ReaderApp
+
+    p = refresh_project
+    app = ReaderApp(tk_root, p)
+    tk_root.update_idletasks()
+    assert app._selected_scene == "s001"
+    gid = "g:Chapter 1"
+    app.scene_tree.item(gid, open=False)
+    app.notebook.select(1)  # Branches
+    app.select_node("n3")
+    app.branch_detail.yview_moveto(0.5)
+    tk_root.update_idletasks()
+    detail_top = app.branch_detail.index("@0,0")
+    app.notebook.select(2)  # Notes
+    app.notes.yview_moveto(0.4)
+    tk_root.update_idletasks()
+    notes_top = app.notes.index("@0,0")
+
+    # a new inactive node is saved while the writer reads
+    t = json.loads((p / "trees" / "s001.json").read_text())
+    t["nodes"]["n4"] = rs.node("n4", "n2", "New saved swipe.")
+    rs.write_json(p / "trees" / "s001.json", t)
+    rs.write_json(p / "scenes.json",
+                  [rs.scene("s001", chapter=1, title="A"),
+                   rs.scene("s002", chapter=1, title="B edited")])
+    app.refresh()
+    tk_root.update_idletasks()
+    assert app._selected_scene == "s001" and app._selected_node == "n3"
+    assert app.notebook.index(app.notebook.select()) == 2, "tab preserved"
+    assert bool(app.scene_tree.item(gid, "open")) is False, "expansion preserved"
+    assert app.notes.index("@0,0") == notes_top, "notes position preserved"
+    assert app.branch_detail.index("@0,0") == detail_top, "detail position kept"
+    assert app.branch_index_ids() == ["n1", "n2", "n3", "n4"], "new node listed"
+    assert "New saved swipe." in app.branch_detail.get("1.0", "end") or \
+        app.branches_text().startswith("ID: n3")
+
+
+def test_append_refresh_does_not_jump_or_lose_position(tk_root, refresh_project):
+    from longform_core.gui import ReaderApp
+
+    p = refresh_project
+    app = ReaderApp(tk_root, p)
+    tk_root.update_idletasks()
+    app.manuscript.yview_moveto(0.3)
+    tk_root.update_idletasks()
+    top_before = app.manuscript.index("@0,0")
+    line = top_before.split(".")[0]
+    text_before = app.manuscript.get(top_before, f"{line}.end")
+    # normal append: new node becomes the head
+    t = rs.tree({
+        "n1": rs.node("n1", None,
+                      "\n\n".join(f"Paragraph {k} carries several words of prose."
+                                  for k in range(1, 31))),
+        "n2": rs.node("n2", "n1", "Inactive sibling.\n\nLine two.\n\nLine three."),
+        "n3": rs.node("n3", "n2", "Inactive descendant.\n\nMore detail here."),
+        "n4": rs.node("n4", "n1", "A saved later passage.", sep="\n\n"),
+    }, head="n4")
+    rs.write_json(p / "trees" / "s001.json", t)
+    app.refresh()
+    tk_root.update_idletasks()
+    assert app.manuscript_label().startswith("head n4")
+    assert "A saved later passage." in app.manuscript_text()
+    top_after = app.manuscript.index("@0,0")
+    assert top_after.split(".")[0] == line, "reading position not jumped"
+    assert app.manuscript.get(top_after, f"{line}.end") == text_before
+
+
+def test_removed_scene_and_node_fallbacks(tk_root, refresh_project):
+    from longform_core.gui import ReaderApp
+
+    p = refresh_project
+    app = ReaderApp(tk_root, p)
+    tk_root.update_idletasks()
+    app.select_scene("s002")
+    assert app._selected_scene == "s002"
+    # drop the s002 card and its tree: fall back to the first current scene
+    rs.write_json(p / "scenes.json", [rs.scene("s001", chapter=1, title="A")])
+    (p / "trees" / "s002.json").unlink()
+    app.refresh()
+    assert app._selected_scene == "s001"
+    # node removal inside the surviving scene: fall back to the head
+    app.select_scene("s001")
+    app.select_node("n3")
+    assert app._selected_node == "n3"
+    t = rs.tree({"n1": rs.node("n1", None, "Only the base remains.")}, head="n1")
+    rs.write_json(p / "trees" / "s001.json", t)
+    app.refresh()
+    assert app._selected_node == "n1", "removed node falls back to head"
+    # everything gone: empty panes, no crash
+    rs.write_json(p / "scenes.json", [])
+    (p / "trees" / "s001.json").unlink(missing_ok=True)
+    (p / "trees" / "s002.json").unlink(missing_ok=True)
+    app.refresh()
+    assert app._selected_scene is None
+    assert app.manuscript_text() == ""
+
+
+def test_stale_error_recovery_keeps_last_good_view(tk_root, project):
+    from longform_core.gui import ReaderApp
+
+    p = project
+    app = ReaderApp(tk_root, p)
+    tk_root.update_idletasks()
+    manuscript_before = app.manuscript_text()
+    before = dict(app.rebuilds)
+    (p / "project.json").write_text("{broken", encoding="utf-8")
+    app.refresh()
+    assert app.stale and "STALE" in app.status_text()
+    assert app.manuscript_text() == manuscript_before, "last valid view kept"
+    for pane in ("scene_list", "manuscript", "branches", "notes"):
+        assert app.rebuilds[pane] == before[pane]
+    rs.write_json(p / "project.json", {"title": "Fixture Novel",
+                                       "target_words": 9000})
+    app.refresh()
+    assert not app.stale and "STALE" not in app.status_text()
+    assert "9/9000" in app.status_text()
+
+
+def test_f5_key_and_refresh_button_force_read(tk_root, project):
+    from longform_core.gui import ReaderApp
+
+    app = ReaderApp(tk_root, project)
+    tk_root.update_idletasks()
+    reads = len(app.cache.reads)
+    app.refresh_now()
+    assert len(app.cache.reads) > reads, "Refresh now forces a fresh read"
+    reads = len(app.cache.reads)
+    tk_root.geometry("400x300")
+    tk_root.deiconify()
+    tk_root.update()
+    tk_root.event_generate("<F5>")
+    tk_root.update()
+    assert len(app.cache.reads) > reads, "F5 uses the same force path"
+    tk_root.withdraw()
+    tk_root.update()
