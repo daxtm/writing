@@ -8,7 +8,10 @@ Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27`; argparse CLI, JSON
 
 ## Checks
 `./scripts/check.sh`: py_compile; CLI `--help` if uv exists; pytest if `tests/` exists (fails without uv).
-Suite: `uv run --with pytest --with httpx pytest -q tests`; no lint/build step.
+Suite: `uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests`; no lint/build step.
+The launcher declares `pyside6>=6.12.0,<6.13` beside `httpx`: `uv run --script longform.py …` downloads
+PySide6 (~hundreds of MB of wheel downloads plus installed size, and the matching `uv` cache) on first
+use even for CLI-only users, as accepted in ADR-0006; GUI imports stay lazy, so `--help` needs no display.
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
 Current main has no `gui` command. The separate `feat/reader-gui` branch contains

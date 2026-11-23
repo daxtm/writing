@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx>=0.27"]
+# dependencies = ["httpx>=0.27", "pyside6>=6.12.0,<6.13"]
 # ///
 """longform.py - plan-then-collaborate longform fiction pipeline for Featherless.
 
@@ -25,6 +25,7 @@ Every command is its own step. No command runs another one for you.
   revise DIR --scene ID        passage-by-passage line edit using critiques/ID.md and/or checks/ID.md
   status DIR                   project overview
   export DIR [--out FILE]      write manuscript.md
+  gui DIR                      native Wayland window: saved branches, notes, per-scene steering
 
 API key: "api_key" in project.json, or else the environment variable named by "api_key_env"
 (default: export FEATHERLESS_API_KEY=...).
@@ -76,10 +77,14 @@ def main():
     add("status")
     sp = add("export")
     sp.add_argument("--out")
+    add("gui")
     args = ap.parse_args()
 
     if args.cmd == "init":
         return cmd_init(args)
+    if args.cmd == "gui":
+        from . import gui
+        return gui.run_cli(args.dir)
     p = Project(args.dir)
     {
         "limits": cmd_limits, "bible": cmd_bible, "outline": cmd_outline, "scenes": cmd_scenes, "draft": cmd_draft,
