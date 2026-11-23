@@ -2449,34 +2449,30 @@ STOP = set("the a an and or but of to in on at for with as by from that this it 
            "his her their i you we my your our him them its not no so then than there".split())
 
 
-def cmd_check(p, args):
-    scenes = p.scenes()
-    targets = [scenes[p.scene_index(scenes, args.scene)]] if args.scene else scenes
-    banned = [b for b in p.cfg["banned_phrases"] if b.strip()]
-    ng = p.cfg["ngram"]
-    n, min_count, top = int(ng["n"]), int(ng["min_count"]), int(ng["top"])
-    lines = [f"# Check {'scene ' + args.scene if args.scene else 'all scenes'} ({now()})", "", "## Banned phrases", ""]
+def check_report(scene_texts, banned_phrases, n, min_count, top, title):
+    """Pure report calculation for cmd_check. scene_texts is an ordered list of
+    (scene_id, [(node_id, node_text), ...], joined_active_text) tuples; only nodes on the
+    active chain are supplied and joined_active_text is Tree.text() so separator behavior is
+    unchanged. title is the full first line including the timestamp. Returns the complete
+    report with its final newline."""
+    lines = [title, "", "## Banned phrases", ""]
     counts, where = {}, {}
     hits = 0
-    for s in targets:
-        tree = Tree(p, s["id"])
-        if not tree.head:
-            continue
-        for nid in tree.chain():
-            t = tree.node(nid)["text"]
-            for b in banned:
+    for sid, nodes, joined in scene_texts:
+        for nid, t in nodes:
+            for b in banned_phrases:
                 for m in re.finditer(re.escape(b), t, re.I):
                     hits += 1
                     a, z = max(0, m.start() - 50), min(len(t), m.end() + 50)
                     snippet = re.sub(r"\s+", " ", t[a:z])
-                    lines.append(f'- {s["id"]}/{nid}: "{b}" ... {snippet} ...')
-        toks = re.findall(r"[a-z']+", tree.text().lower())
+                    lines.append(f'- {sid}/{nid}: "{b}" ... {snippet} ...')
+        toks = re.findall(r"[a-z']+", joined.lower())
         for k in range(len(toks) - n + 1):
             g = tuple(toks[k: k + n])
             if sum(1 for w in g if w in STOP) >= n - 1:
                 continue
             counts[g] = counts.get(g, 0) + 1
-            where.setdefault(g, set()).add(s["id"])
+            where.setdefault(g, set()).add(sid)
     if not hits:
         lines.append("(none)")
     lines += ["", f"## Repeated {n}-grams (count >= {min_count})", ""]
@@ -2486,7 +2482,23 @@ def cmd_check(p, args):
             lines.append(f'- {c}x "{" ".join(g)}" in {", ".join(sorted(where[g]))}')
     else:
         lines.append("(none)")
-    report = "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n"
+
+
+def cmd_check(p, args):
+    scenes = p.scenes()
+    targets = [scenes[p.scene_index(scenes, args.scene)]] if args.scene else scenes
+    banned = [b for b in p.cfg["banned_phrases"] if b.strip()]
+    ng = p.cfg["ngram"]
+    n, min_count, top = int(ng["n"]), int(ng["min_count"]), int(ng["top"])
+    scene_texts = []
+    for s in targets:
+        tree = Tree(p, s["id"])
+        if not tree.head:
+            continue
+        scene_texts.append((s["id"], [(nid, tree.node(nid)["text"]) for nid in tree.chain()], tree.text()))
+    title = f"# Check {'scene ' + args.scene if args.scene else 'all scenes'} ({now()})"
+    report = check_report(scene_texts, banned, n, min_count, top, title)
     out = p.f("checks", f"{args.scene or 'all'}.md")
     write_text(out, report)
     print(report)

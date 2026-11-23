@@ -129,6 +129,11 @@ def report(scene_texts, banned=(), n=5, min_count=3, top=40, title="# T"):
     return longform.check_report(list(scene_texts), list(banned), n, min_count, top, title)
 
 
+def sc(sid, text):
+    """One-scene input shape: (scene_id, [(node_id, node_text)], joined_active_text)."""
+    return (sid, [("n1", text)], text)
+
+
 def gram_lines(r):
     return [ln for ln in r.splitlines() if ln.startswith("- ") and "x \"" in ln]
 
@@ -141,72 +146,68 @@ def test_check_report_empty_scenes_and_no_hits():
 
 
 def test_check_report_banned_case_insensitive_and_snippet():
-    r = report([("s1", [("n1", "She felt SHIVERS DOWN her spine.")])], banned=("shivers down",))
+    r = report([sc("s1", "She felt SHIVERS DOWN her spine.")], banned=("shivers down",))
     assert '- s1/n1: "shivers down" ... She felt SHIVERS DOWN her spine. ...' in r
 
 
 def test_check_report_snippet_collapses_whitespace_and_bounds():
     text = "x" * 60 + "shivers down\n\tmore" + "y" * 60
-    r = report([("s1", [("n1", text)])], banned=("shivers down",))
+    r = report([sc("s1", text)], banned=("shivers down",))
     snippet = re.search(r"\.\.\. (.+) \.\.\.", r).group(1)
     assert "\n" not in snippet and "\t" not in snippet and "  " not in snippet
     assert "xxxx" in snippet and "yyyy" in snippet
 
 
 def test_check_report_multiple_banned_matches_per_node():
-    r = report([("s1", [("n1", "shivers down and shivers down again")])], banned=("shivers down",))
+    r = report([sc("s1", "shivers down and shivers down again")], banned=("shivers down",))
     assert r.count('- s1/n1: "shivers down" ...') == 2
 
 
 def test_check_report_whitespace_only_banned_ignored():
-    r = report([("s1", [("n1", "plain text")])], banned=("  ", "\t", ""))
+    r = report([sc("s1", "plain text")], banned=("  ", "\t", ""))
     assert "(none)" in r
 
 
 def test_check_report_stopword_grams_skipped():
     text = "the of and to in red dragon the of and to in red dragon"
-    r = report([("s1", [("n1", text)])], n=5, min_count=3)
+    r = report([sc("s1", text)], n=5, min_count=3)
     assert "(none)" in r, "grams with >= n-1 stopwords must be filtered"
 
 
 def test_check_report_threshold_boundary():
     text = "red dragon red dragon"  # (red, dragon) x2, (dragon, red) x1 at n=2
-    r = report([("s1", [("n1", text)])], n=2, min_count=2)
+    r = report([sc("s1", text)], n=2, min_count=2)
     assert '2x "red dragon"' in r
-    r = report([("s1", [("n1", text)])], n=2, min_count=3)
+    r = report([sc("s1", text)], n=2, min_count=3)
     assert "2x" not in r and "(none)" in r
 
 
 def test_check_report_ties_sorted_by_gram_reverse():
     text = "red dragon blue dragon red dragon blue dragon"
-    r = report([("s1", [("n1", text)])], n=2, min_count=2)
+    r = report([sc("s1", text)], n=2, min_count=2)
     grams = [ln.split('"')[1] for ln in gram_lines(r)]
     assert grams == ["red dragon", "dragon blue", "blue dragon"]
 
 
 def test_check_report_top_limit():
     text = "aa bb aa bb aa bb aa bb aa bb"  # (aa,bb) x5, (bb,aa) x4
-    r = report([("s1", [("n1", text)])], n=2, min_count=2, top=1)
+    r = report([sc("s1", text)], n=2, min_count=2, top=1)
     lines = gram_lines(r)
     assert len(lines) == 1 and '5x "aa bb"' in lines[0]
 
 
 def test_check_report_locations_sorted_and_scoped():
-    r = report([
-        ("s2", [("n1", "red dragon")]),
-        ("s1", [("n1", "red dragon")]),
-    ], n=2, min_count=1)
-    assert '1x "red dragon" in s1, s2' in r
+    r = report([sc("s2", "red dragon green"), sc("s1", "red dragon blue")], n=2, min_count=1)
+    assert '2x "red dragon" in s1, s2' in r
+    assert '1x "dragon green" in s2' in r
+    assert '1x "dragon blue" in s1' in r
 
 
 def test_check_report_no_cross_scene_ngrams():
-    r = report([
-        ("s1", [("n1", "red dragon")]),
-        ("s2", [("n1", "red dragon")]),
-    ], n=2, min_count=2)
+    r = report([sc("s1", "red dragon"), sc("s2", "red dragon")], n=2, min_count=2)
     assert "(none)" in r
 
 
 def test_check_report_grams_span_joined_nodes_within_scene():
-    r = report([("s1", [("n1", "red"), ("n2", "dragon")])], n=2, min_count=1)
+    r = report([("s1", [("n1", "red"), ("n2", "dragon")], "red dragon")], n=2, min_count=1)
     assert '1x "red dragon" in s1' in r
