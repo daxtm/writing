@@ -33,9 +33,9 @@ shell's pre-drafting smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0) predates genera
 
 ## Planned desktop workspace
 `docs/ROADMAP.md` requires every CLI/TUI feature in the GUI, start to finish;
-no individual change completes the workspace. Three changes remain in order:
-`gui-drafting-workspace`, `gui-project-planning`, then
-`gui-continuity-review-export`. M1's first change, `openspec/changes/gui-wayland-shell/`,
+no individual change completes the workspace. The sequence is
+`gui-drafting-workspace` (implemented), `gui-project-planning` (selected/proposed),
+then `gui-continuity-review-export` (future). M1's first change, `openspec/changes/gui-wayland-shell/`,
 is implemented on `feat/gui-wayland-shell`: the `gui` command opens the Qt
 Widgets reading/steering shell over `longform_core.reader_model` snapshots with
 per-scene steering via `longform_core.scene_steering`; the implemented shell is
@@ -44,9 +44,11 @@ unshipped. `openspec/changes/gui-drafting-workspace/` is now implemented on
 (`longform_core.draft_operations`), one worker (`longform_core.draft_worker`),
 cooperative Stop, stale-write refusal, and CLI adapters with byte-identical
 transcripts; real Wayland acceptance for drafting remains pending
-(`evidence.md`). Planning (`gui-project-planning`) and
-continuity/review/export (`gui-continuity-review-export`) remain future
-changes — do not create or implement them yet.
+(`evidence.md`). Planning (`openspec/changes/gui-project-planning/`) is now
+selected and proposed for milestone 2: Create/Open through scene-ready setup,
+settings/limits, bible, outline and scene cards; no planning code is implemented
+by the proposal. Continuity/review/export (`gui-continuity-review-export`)
+remains future — do not create or implement that change yet.
 Full completion requires setup through export, all draft actions, offline
 CLI/GUI parity and separate real Wayland acceptance; this plan does not authorize shipping.
 ADR-0004/0005 (integrated from the reader baseline; 0005 superseded by ADR-0006)

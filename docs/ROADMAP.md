@@ -32,8 +32,10 @@ The Qt reading/steering shell is implemented but unshipped on
 `feat/gui-wayland-shell`; it integrates the reader snapshots and ADR-0004/0005.
 Do not confuse that branch with `origin/main`. Its existing
 `openspec/changes/gui-wayland-shell/` records the shell, not working generation.
-Only the next change, `openspec/changes/gui-drafting-workspace/`, is now selected
-for proposal; do not create setup/planning or review change directories yet.
+The complete draft loop is implemented on this branch (real drafting Wayland
+acceptance remains pending). The owner has now selected milestone 2:
+`openspec/changes/gui-project-planning/` is proposed, not implemented.
+Do not create the continuity/review/export change directory yet.
 
 The existing `cmd_*` commands already implement the rules. Fix/extract those
 boundaries, keeping CLI adapters and reusing `Project`, `Tree`, `Lore`, prompt/
@@ -83,7 +85,7 @@ This demonstrates drafting only, not setup-to-export GUI completion.
 
 ## GUI milestone 2 — Setup and planning
 
-- [ ] gui-project-planning — Create/Open and init, preset import, models/roles/settings, limits, bible sections/answers/history, outline notes/N candidates/reroll/choice/edit and scene generation/view/edit/replace confirmation.
+- [ ] gui-project-planning — Selected/proposed, not implemented: Create/Open and init, preset import, models/roles/settings, limits, bible sections/answers/history, outline notes/N candidates/reroll/choice/edit and scene generation/view/edit/replace confirmation.
 
 Depends on drafting workspace; this is remaining change 2, not a draft-controls
 follow-up. Use existing initialization and validation/non-overwrite behavior,
