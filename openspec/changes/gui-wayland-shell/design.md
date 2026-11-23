@@ -239,6 +239,47 @@ Real desktop acceptance, separate from `./scripts/check.sh`:
 Rollback removes the new command/dependency and Qt modules; existing tree
 steering stays CLI-compatible. No project files need reverting.
 
+## Acceptance Record
+
+Recorded on 2026-11-23 on the implementation branch (`feat/gui-wayland-shell`),
+session: KDE Plasma 6.8.3 on KWin 6.8.3, `XDG_SESSION_TYPE=wayland`,
+`WAYLAND_DISPLAY=wayland-1`, three screens, primary 1920×1080 at DPR 1.0
+(physical 531×299 mm). Resolved runtime: **PySide6 6.12.0 / Qt 6.12.0** via the
+declared `pyside6>=6.12.0,<6.13` range. Synthetic project built with
+`tests/reader_support.py` (two current scenes with active + inactive nodes, a
+retained tree, bible/state/checks/critiques including a backup).
+
+Verified programmatically on the real Wayland display (no XWayland):
+
+- The actual entry point `QT_QPA_PLATFORM=wayland uv run --script longform.py
+  gui DIR` printed the flushed pre-start guidance on stderr before
+  QApplication, then reported `Qt platform 'wayland', PySide6 6.12.0,
+  Qt 6.12.0` and blocked until the process was signalled (window lifetime).
+- One `MainWindow` instance only; `windowHandle().isVisible()` under a native
+  Wayland window; clean programmatic close → `app.exec()` returned 0 (exit 0).
+- Reading: inactive saved node, retained tree, notes (bible, critique backup)
+  selectable and literal; programmatic clipboard copy from the read-only pane
+  returned the pane text (`QClipboard.text()`).
+- Steering: multiline Save persisted exactly (`Wayland acceptance direction.\n
+  Second line.`) with head/nodes/counter unchanged; a second window (reopen)
+  showed the same steering.
+- Refresh: an external `bible.md` edit appeared after explicit `Refresh` with
+  selection/tab preserved.
+- Failure launches: with `WAYLAND_DISPLAY`/`DISPLAY` removed the command
+  exited 134 after printing the flushed recovery guidance and the native Qt
+  plugin error (`Could not load the Qt platform plugin "wayland"`); with
+  `QT_QPA_PLATFORM=xcb` it exited 1 with the explicit no-fallback diagnostic
+  and opened no window.
+
+Not verified here — left for the owner's interactive desktop acceptance:
+mouse-driven resize/splitter dragging, real keyboard traversal (Tab focus
+walk, Enter typing), system light/dark theme switching, 100%/200% and any
+fractional or mixed-monitor scaling (only DPR 1.0 was observed), clipboard
+paste into another application, and closing via the compositor's window
+button (close was programmatic). Offscreen CI/widget tests do not count as
+compositor integration. File dialogs are **not applicable** in this shell,
+which opens DIR only.
+
 ## Open Questions
 
 No implementation-blocking decisions. The acceptance record must identify the

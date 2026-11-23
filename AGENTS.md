@@ -4,7 +4,7 @@
 CLI for writers planning and collaboratively drafting long-form fiction with Featherless.ai: a thin `longform.py` launcher over the `longform_core/` package (ADR-0003).
 
 ## Stack
-Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27`; argparse CLI, JSON/Markdown files, no database.
+Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
 
 ## Checks
 `./scripts/check.sh`: py_compile; CLI `--help` if uv exists; pytest if `tests/` exists (fails without uv).
@@ -14,40 +14,35 @@ PySide6 (~hundreds of MB of wheel downloads plus installed size, and the matchin
 use even for CLI-only users, as accepted in ADR-0006; GUI imports stay lazy, so `--help` needs no display.
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
-Current main has no `gui` command. The separate `feat/reader-gui` branch contains
-a read-only Tkinter/ttk GUI and `reader_model` snapshots; do not assume that
-branch is already integrated.
+GUI demo: `QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR` opens one native Wayland window
+(reading all saved branches/notes, per-scene steering Save/Clear; no generation yet). `gui` refuses any
+explicit platform except `wayland`, never falls back to XWayland, and prints recovery guidance when
+Wayland is unavailable. Model/CLI tests run headless; Qt widget tests run offscreen in a subprocess
+(`tests/qt_widget_cases.py`, never skipped); real Wayland acceptance is a separate desktop step and was
+recorded for `gui-wayland-shell` (KWin 6.8.3, PySide6 6.12.0, DPR 1.0; interactive scaling/theme checks
+still pending with the owner).
 
 ## Planned desktop workspace
 `docs/ROADMAP.md` extends the completed CLI foundation with three GUI milestones:
 Wayland steer/generate/accept, setup/planning and draft controls, then continuity/
-review/revision/export. These are plans, not implemented commands.
-`openspec/changes/gui-wayland-shell/` is the selected M1 first-change proposal:
-Qt shell/reading and persistent steering only. Generation, acceptance, and the
-background worker remain for `gui-steered-drafting`; do not create it yet.
-ADR-0006 selects PySide6/Qt Widgets for the expanded native Wayland workspace;
+review/revision/export. M1's first change, `openspec/changes/gui-wayland-shell/`,
+is implemented on `feat/gui-wayland-shell`: the `gui` command opens the Qt
+Widgets reading/steering shell over `longform_core.reader_model` snapshots with
+per-scene steering via `longform_core.scene_steering`; generation, acceptance,
+and the background worker remain for `gui-steered-drafting` (do not create it yet).
+ADR-0004/0005 (integrated from the reader baseline; 0005 superseded by ADR-0006)
+select PySide6/Qt Widgets for the expanded native Wayland workspace;
 ADR-0007 selects incremental shared operations and one background GUI worker.
-Reuse existing commands/core behavior and the pending reader's safe snapshots,
-not terminal automation or a second writing engine. Keep CLI prompts/files
-compatible. The owner verified a minimal uv PySide6 6.12.0 app with explicit
-`QT_QPA_PLATFORM=wayland` reporting `wayland`, 1920x1080, DPR 1.0, not XWayland.
-This is runtime feasibility, not acceptance of the planned workspace.
-The shell plans `pyside6>=6.12.0,<6.13` in the launcher and existing check
-environment: increased clean-checkout downloads/disk use includes CLI-only uv
-users. GUI imports stay lazy, so `--help` still needs no display.
-The implementation must add offline operation/button-flow tests to
-`scripts/check.sh`; model tests stay headless, Qt widget tests use offscreen
-execution, and real Wayland desktop acceptance is separate. Do not weaken the
-existing network guard or claim headless tests establish compositor support.
-After implementation, demo with
-`QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR`.
-Until then the Checks and Layout sections above/below describe current code;
-the build must update them when Qt modules and coverage actually land.
+Keep existing commands/core behavior and the reader's safe snapshots; keep CLI
+prompts/files compatible. The shell's real Wayland acceptance was recorded in
+the change's design.md (KWin 6.8.3, `wayland`, PySide6 6.12.0, 1920×1080, DPR
+1.0, one window, steering persisted, close exit 0); interactive scaling, theme
+switching, and mouse/keyboard work remain an owner acceptance step.
 
 ## Layout
 - `longform.py`: thin PEP 723 launcher; re-exports the package's public names so `import longform` keeps working.
-- `longform_core/`: the implementation — `config` (constants, default config, templates), `utils` (logging, file/JSON/text, diff/parse helpers), `project`, `api`, `tree`, `lore` (cards/books/matching), `prompt`, `checks`, `commands` (cmd_* and interactive helpers), `cli` (argparse/main).
-- `scripts/`: check entry point; `tests/`: offline pytest suite.
+- `longform_core/`: the implementation — `config` (constants, default config, templates), `utils` (logging, file/JSON/text, diff/parse helpers), `project`, `api`, `tree`, `lore` (cards/books/matching), `prompt`, `checks`, `commands` (cmd_* and interactive helpers), `cli` (argparse/main); `reader_model` (UI-independent sanitized snapshots), `scene_steering` (Qt-independent per-scene steering write adapter), `gui` (Qt-free Wayland startup policy/dispatch), `gui_window` (PySide6 Qt Widgets shell).
+- `scripts/`: check entry point; `tests/`: offline pytest suite (headless model/CLI tests plus `tests/qt_widget_cases.py`, the offscreen Qt widget subprocess cases launched by `tests/test_qt_cases.py`).
 - `openspec/`: behavior specs and changes; `docs/`: roadmap and ADRs.
 - `.github/`: PR template; `myfic/`: private generated sample, never a test fixture.
 

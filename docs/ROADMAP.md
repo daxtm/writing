@@ -41,7 +41,17 @@ read-only reader supplies editable, asynchronous workflow interactions.
 
 ## GUI milestone 1 — Walking skeleton: steer, generate, accept on Wayland
 
-- [ ] gui-wayland-shell — Replace the pending Tk presentation with a native Wayland Qt Widgets reading shell: safe snapshots, all-branch/notes navigation, state-preserving refresh, and persistent steering Save/Clear; no generation/acceptance/worker yet.
+- [x] gui-wayland-shell — Replace the pending Tk presentation with a native Wayland Qt Widgets reading shell: safe snapshots, all-branch/notes navigation, state-preserving refresh, and persistent steering Save/Clear; no generation/acceptance/worker yet.
+
+Implemented on `feat/gui-wayland-shell`: `gui DIR` opens the PySide6 shell over
+`reader_model` snapshots with steering persisted by `scene_steering`; PySide6
+6.12.0 in the launcher/check environment; headless model/CLI tests plus
+offscreen widget cases in `scripts/check.sh`. Real Wayland acceptance recorded
+in the change's design.md (KWin 6.8.3/Plasma 6.8.3, platform `wayland`,
+1920×1080 DPR 1.0, one window, steering persisted, clean close exit 0);
+interactive scaling, theme switching, and mouse/keyboard work remain owner
+acceptance. M1 stays open: `gui-steered-drafting` (generation, preview,
+acceptance, Stop, background worker) is still unchecked.
 - [ ] gui-steered-drafting — Extract shared draft operations and connect scene selection, saved steering, one-candidate generation, preview, acceptance, and cooperative stop to a responsive background worker.
 
 Depend on the reader baseline above; `gui-steered-drafting` depends on
