@@ -235,3 +235,185 @@ def test_malformed_project_json_prevents_snapshot(tmp_path, load):
     res = load(p)
     assert res.snapshot is None
     assert "not json" not in " ".join(res.warnings)
+
+
+# -- notes ---------------------------------------------------------------------
+
+def test_all_note_sources_read_with_backups_sorted(tmp_path, load):
+    p = rs.build_project(
+        tmp_path / "p",
+        scenes=[rs.scene("s001")],
+        trees={"s001": rs.tree({"n1": rs.node("n1", None, "One.")}, head="n1")},
+        bible="# Story bible\n\n**markup stays literal**\n",
+        state="# Continuity state\n\n- Mira: tower\n",
+        summaries={"scenes": {"s001": {"detailed": "DETAIL FULL", "brief": "brief B",
+                                       "updated": "2026-01-05T00:00:00+00:00",
+                                       "text_hash": "n0t4hash",
+                                       "secret_field": "SUMSECRET"}},
+                   "arcs": [{"from": "s001", "to": "s002", "text": "ARC BODY",
+                             "updated": "2026-01-06T00:00:00+00:00"}]},
+        checks={"s001.md": "CHECK BODY"},
+        critiques={"s001.md": "CRITIQUE BODY", "s001_prev_20260101.md": "OLD CRITIQUE"},
+    )
+    res = load(p)
+    notes = res.snapshot.notes
+    assert "**markup stays literal**" in notes.bible
+    assert "Mira: tower" in notes.state
+    s = notes.summaries.scenes["s001"]
+    assert (s.detailed, s.brief) == ("DETAIL FULL", "brief B")
+    assert s.updated.startswith("2026-01-05")
+    assert s.detailed and "n0t4hash" not in repr(res.snapshot), \
+        "internal fields are not exposed"
+    assert "SUMSECRET" not in repr(res.snapshot)
+    a = notes.summaries.arcs[0]
+    assert (a.from_id, a.to_id, a.text) == ("s001", "s002", "ARC BODY")
+    assert [f.name for f in notes.checks] == ["s001.md"]
+    assert [f.name for f in notes.critiques] == ["s001.md", "s001_prev_20260101.md"], \
+        "backups are listed in sorted order"
+    assert "OLD CRITIQUE" in notes.critiques[1].text
+
+
+def test_missing_note_sources_are_empty_without_warnings(tmp_path, load):
+    p = rs.build_project(tmp_path / "p")
+    (p / "summaries.json").unlink()
+    res = load(p)
+    notes = res.snapshot.notes
+    assert notes.bible is None and notes.state is None
+    assert notes.summaries is None
+    assert notes.checks == [] and notes.critiques == []
+    assert not res.warnings
+
+
+def test_malformed_summaries_warn_and_recover(tmp_path, load):
+    p = rs.build_project(tmp_path / "p", bible="BIBLE TEXT")
+    (p / "summaries.json").write_text("{broken", encoding="utf-8")
+    res = load(p)
+    assert res.snapshot.notes.summaries is None
+    assert "BIBLE TEXT" in res.snapshot.notes.bible, "unrelated sources still load"
+    assert "summaries.json" in " ".join(res.warnings)
+    rs.write_json(p / "summaries.json",
+                  {"scenes": {"s001": {"detailed": "BACK", "brief": None,
+                                       "updated": None}}, "arcs": []})
+    res2 = load(p, cache=rm.SourceCache())
+    assert res2.snapshot.notes.summaries.scenes["s001"].detailed == "BACK"
+    assert not res2.warnings
+
+
+def test_unknown_summary_shapes_skipped_with_warning(tmp_path, load):
+    p = rs.build_project(tmp_path / "p", summaries={
+        "scenes": {"s001": "not-a-dict"},
+        "arcs": [{"from": 1, "to": "s002", "text": "x"}]})
+    res = load(p)
+    notes = res.snapshot.notes
+    assert notes.summaries is not None and notes.summaries.scenes == {}
+    assert notes.summaries.arcs == []
+    assert any("invalid scene summary" in w for w in res.warnings)
+    assert any("invalid arc summary" in w for w in res.warnings)
+
+
+# -- broken trees, cycles, dangling links --------------------------------------
+
+def test_parent_cycle_keeps_node_text_and_warns(tmp_path, load):
+    p = rs.build_project(tmp_path / "p", scenes=[rs.scene("s001")], trees={
+        "s001": rs.tree({
+            "n1": rs.node("n1", "n2", "first text."),
+            "n2": rs.node("n2", "n1", "second text."),
+        }, head="n1")})
+    res = load(p)
+    tv = res.snapshot.trees["s001"]
+    assert tv.active_text is None and tv.active_words is None
+    assert any("active chain is broken" in w for w in res.warnings)
+    assert tv.nodes["n1"].text == "first text."
+    assert not res.snapshot.words_complete
+
+
+def test_dangling_head_and_parent_warn_nodes_readable(tmp_path, load):
+    p = rs.build_project(tmp_path / "p", trees={"s001": rs.tree({
+        "n1": rs.node("n1", None, "root text."),
+        "n2": rs.node("n2", "missing", "orphan text."),
+    }, head="nope")})
+    res = load(p)
+    tv = res.snapshot.trees["s001"]
+    assert tv.active_text is None
+    assert any("head references a missing node" in w for w in res.warnings)
+    assert tv.nodes["n2"].link_ok is False
+    assert tv.nodes["n2"].text == "orphan text."
+    assert tv.nodes["n1"].link_ok is True
+
+
+# -- read failures, unsafe ids, symlinks ----------------------------------------
+
+def test_unreadable_current_tree_is_partial_with_warning(tmp_path, load):
+    p = rs.build_project(tmp_path / "p", scenes=[rs.scene("s001")])
+    (p / "trees" / "s001.json").mkdir(parents=True)  # a directory where JSON is expected
+    res = load(p)
+    tv = res.snapshot.trees["s001"]
+    assert tv.broken and tv.active_words is None
+    assert any("trees/s001.json" in w for w in res.warnings)
+    assert not res.snapshot.words_complete
+
+
+def test_unsafe_tree_stem_skipped_with_warning(tmp_path, load):
+    p = rs.build_project(tmp_path / "p")
+    rs.write_text(p / "trees" / "bad id.json", '{"nodes": {}}')
+    res = load(p)
+    assert res.snapshot.trees == {}
+    assert any("unsafe id" in w for w in res.warnings)
+    assert "bad id.json" in " ".join(res.warnings)  # relative name, sanitized
+
+
+def test_symlinked_sources_refused_and_contents_hidden(tmp_path, load):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    rs.write_text(outside / "secret.md", "OUTSIDE SECRET PROSE")
+    p = rs.build_project(tmp_path / "p", scenes=[rs.scene("s001")])
+    rs.write_json(p / "trees" / "s001.json",
+                  {"nodes": {"n1": rs.node("n1", None, "real text.")}, "head": "n1"})
+    (p / "scenes.json").rename(p / "scenes_real.json")
+    (p / "scenes.json").symlink_to(outside / "secret.md")
+    (p / "trees" / "linked.json").symlink_to(outside / "secret.md")
+    (p / "checks" / "leak.md").symlink_to(outside / "secret.md")
+    res = load(p)
+    blob = repr(res.snapshot) + " ".join(res.warnings)
+    assert "OUTSIDE SECRET PROSE" not in blob, "linked contents are never read"
+    assert "linked.json" in blob and "scenes.json" in blob
+    assert res.snapshot.trees.get("linked") is None
+    # real scene data survives the refused symlink
+    assert res.snapshot.trees["s001"].active_text == "real text."
+
+
+def test_optional_sources_recover_after_read_failure(tmp_path, load):
+    p = rs.build_project(tmp_path / "p")
+    (p / "bible.md").mkdir()  # unreadable as text
+    res = load(p)
+    assert res.snapshot.notes.bible is None
+    assert any("bible.md" in w for w in res.warnings)
+    (p / "bible.md").rmdir()
+    rs.write_text(p / "bible.md", "RECOVERED BIBLE")
+    res2 = load(p, cache=rm.SourceCache())
+    assert res2.snapshot.notes.bible == "RECOVERED BIBLE"
+    assert not res2.warnings
+
+
+def test_secrets_and_unread_sources_never_surface(tmp_path, load, monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "ENVSECRET-123")
+    p = rs.build_project(
+        tmp_path / "p",
+        scenes=[rs.scene("s001")],
+        trees={"s001": rs.tree({"n1": rs.node("n1", None, "One.",
+                                              lorebooks="LORESECRET")}, head="n1")},
+        project_extra={"api_key": "KEYSECRET", "api_key_env": "ENVSECRET-123",
+                       "roles": {"writer": {"model": "secret-model"}}},
+        state=None)
+    rs.write_text(p / ".env", "FEATHERLESS_API_KEY=DOTENVSECRET")
+    rs.write_text(p / "writer_preset.json", '{"instruct": "PRESETSECRET"}')
+    rs.write_text(p / "calls.jsonl", '{"prompt": "LOGSECRET"}')
+    rs.write_text(p / "outline.md", "OUTLINESECRET")
+    res = load(p)
+    blob = repr(res.snapshot) + " ".join(res.warnings)
+    for secret in ("KEYSECRET", "ENVSECRET-123", "DOTENVSECRET", "PRESETSECRET",
+                   "LOGSECRET", "OUTLINESECRET", "secret-model"):
+        assert secret not in blob, f"{secret} must never surface"
+    snap = res.snapshot
+    assert snap.project.title == "Test Title" and snap.project.target_words == 17000
+    assert snap.trees["s001"].nodes["n1"].text == "One."

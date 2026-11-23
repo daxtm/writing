@@ -75,10 +75,48 @@ class SceneRow:
 
 
 @dataclass
+class NoteFile:
+    name: str
+    text: str
+
+
+@dataclass
+class SummaryEntry:
+    scene_id: str
+    detailed: str | None
+    brief: str | None
+    updated: str | None
+
+
+@dataclass
+class ArcEntry:
+    from_id: str
+    to_id: str
+    text: str
+    updated: str | None
+
+
+@dataclass
+class SummariesView:
+    scenes: dict[str, SummaryEntry] = field(default_factory=dict)
+    arcs: list[ArcEntry] = field(default_factory=list)
+
+
+@dataclass
+class NotesView:
+    bible: str | None = None      # None = missing or unreadable source
+    state: str | None = None
+    summaries: SummariesView | None = None
+    checks: list[NoteFile] = field(default_factory=list)
+    critiques: list[NoteFile] = field(default_factory=list)
+
+
+@dataclass
 class Snapshot:
     project: ProjectInfo
     scenes: list[SceneRow]
     trees: dict[str, TreeView]
+    notes: NotesView
     actual_words: int
     words_complete: bool
     warnings: list[str] = field(default_factory=list)
@@ -444,6 +482,10 @@ def _load_trees(root, warnings, cache, force):
         if not _ID_RE.match(stem):
             _warn(warnings, f"trees/{name} has an unsafe id and was skipped")
             continue
+        _ok, safe = _safe_source(root, "trees", name)
+        if not safe:
+            _warn(warnings, f"trees/{name} is a symlink and was skipped")
+            continue
         trees[stem] = _load_tree(root, stem, warnings, cache, force)
     return trees
 
@@ -458,6 +500,7 @@ def load_snapshot(root, cache=None, force=False):
         return LoadResult(None, warnings)
     scenes = _load_scenes(canon, cache, force, warnings)
     trees = _load_trees(canon, warnings, cache, force)
+    notes = _load_notes(canon, cache, force, warnings)
     actual, complete = 0, True
     for row in scenes:
         view = trees.get(row.id)
@@ -468,7 +511,67 @@ def load_snapshot(root, cache=None, force=False):
             complete = False
             continue
         actual += view.active_words
-    snap = Snapshot(project=project, scenes=scenes, trees=trees,
+    snap = Snapshot(project=project, scenes=scenes, trees=trees, notes=notes,
                     actual_words=actual, words_complete=complete,
                     warnings=list(warnings))
     return LoadResult(snap, warnings)
+
+
+# ------------------------------------------------------------------------ notes
+
+
+def _load_notes(root, cache, force, warnings):
+    notes = NotesView()
+    notes.bible = _read_text(root, cache, ("bible.md",), warnings, force)
+    notes.state = _read_text(root, cache, ("state.md",), warnings, force)
+    notes.summaries = _load_summaries(root, cache, force, warnings)
+    notes.checks = _load_report_dir(root, "checks", cache, force, warnings)
+    notes.critiques = _load_report_dir(root, "critiques", cache, force, warnings)
+    return notes
+
+
+def _load_summaries(root, cache, force, warnings):
+    raw = _read_json(root, cache, ("summaries.json",), warnings, force)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        _warn(warnings, "summaries.json has an unexpected structure")
+        return None
+    scenes_raw = raw.get("scenes", {})
+    arcs_raw = raw.get("arcs", [])
+    if not isinstance(scenes_raw, dict) or not isinstance(arcs_raw, list):
+        _warn(warnings, "summaries.json has an unexpected structure")
+        return None
+    view = SummariesView()
+    for sid, rec in scenes_raw.items():
+        if not isinstance(sid, str) or not isinstance(rec, dict):
+            _warn(warnings, "summaries.json: skipped an invalid scene summary")
+            continue
+        view.scenes[sid] = SummaryEntry(
+            scene_id=sid,
+            detailed=rec.get("detailed") if isinstance(rec.get("detailed"), str) else None,
+            brief=rec.get("brief") if isinstance(rec.get("brief"), str) else None,
+            updated=rec.get("updated") if isinstance(rec.get("updated"), str) else None)
+    for rec in arcs_raw:
+        if not isinstance(rec, dict) or not isinstance(rec.get("from"), str) \
+                or not isinstance(rec.get("to"), str) or not isinstance(rec.get("text"), str):
+            _warn(warnings, "summaries.json: skipped an invalid arc summary")
+            continue
+        view.arcs.append(ArcEntry(
+            from_id=rec["from"], to_id=rec["to"], text=rec["text"],
+            updated=rec.get("updated") if isinstance(rec.get("updated"), str) else None))
+    return view
+
+
+def _load_report_dir(root, sub, cache, force, warnings):
+    """All direct safe *.md reports (including backups), sorted by filename."""
+    out = []
+    for name in _list_dir(root, sub, warnings):
+        if not name.endswith(".md"):
+            continue
+        text = _read_text(root, cache, (sub, name), warnings, force,
+                          label=f"{sub}/{name}")
+        if text is None:
+            continue
+        out.append(NoteFile(name, text))
+    return out
