@@ -38,8 +38,11 @@ acceptance remains pending). Milestone 2 is now implemented on this branch:
 (Create/Open through saved scene cards, offline parity and offscreen journey
 coverage; real Wayland Create-to-scene acceptance recorded as PENDING in
 `openspec/changes/gui-project-planning/evidence.md`). Milestone 3
-(continuity/review/export) is not selected for build yet; do not create that
-change directory.
+(`gui-continuity-review-export`) is now selected/proposed in
+`openspec/changes/gui-continuity-review-export/`, with eight unchecked test-first
+tasks. It is not implemented; this proposal does not authorize shipping.
+Stop planning after this final change: after implementation, audit the full
+parity matrix below before any whole-workspace completion claim.
 
 The existing `cmd_*` commands already implement the rules. Fix/extract those
 boundaries, keeping CLI adapters and reusing `Project`, `Tree`, `Lore`, prompt/
@@ -120,7 +123,7 @@ CLI shape modulo `fetched`. Real Wayland Create-to-scene acceptance
 
 ## GUI milestone 3 — Continuity, review, revision, status and export
 
-- [ ] gui-continuity-review-export — Update-state/summary-only with previews/edit/regenerate/accept/quit and warnings; compress ranges/replace/edit/accept; critique/check/review-note editing; revise diff/accept/skip/edit/regenerate/quit; status and destination-selected export.
+- [ ] gui-continuity-review-export — Selected/proposed, not implemented: update-state/summary-only previews/edit/regenerate/accept/quit and warnings; compress ranges/replace/edit/accept; critique/check/review-note editing; revise diff/accept/skip/edit/regenerate/quit; status and destination-selected export.
 
 Depends on setup/planning; this is remaining change 3 and consolidates the
 former `gui-continuity-review` and `gui-check-revise-export` roadmap items.
@@ -129,6 +132,13 @@ state_history, summaries, stale/earlier-scene warnings, arc overlap checks,
 revision history and existing report/export formats. Status and notes remain
 visible; saves refresh affected views without losing position or dirty input.
 Replacement/destructive choices name their target and retain confirmation.
+The selected proposal/design/spec/eight tasks are in
+`openspec/changes/gui-continuity-review-export/`; ADR-0007 already governs this
+work, so no new ADR/dependency/schema is required. Full-state and arc previews
+never implicitly commit; report saves and passage acceptance remain explicit.
+Arc history retains existing edited-input versions, not a new automatic arc
+snapshot store. Status must not trigger lore-discovery writes. Real Wayland
+M3 acceptance is PENDING, separate from future offscreen test results.
 
 Observe after implementation: from completed drafting, preview/edit/accept a
 continuity diff, exercise summary-only and stale-summary recovery, compress a
@@ -137,6 +147,13 @@ another, view status, then choose an export destination. Reopen: saved state and
 manuscript match CLI export for the same active paths. Offline end-to-end tests
 cover acceptance, rejection, cancellation and errors without live credentials,
 network, terminal interaction or external editors.
+
+After implementing this final change, **audit every row of the full-parity
+matrix across milestones 1–3**, mapping its actual GUI controls, offline parity/
+button tests and separate desktop evidence. Explicitly report any gaps,
+including pending real Wayland acceptance from earlier changes; do not mark
+the workspace complete merely because M3 tasks pass. No more speculative
+changes, implementation in this proposal, or shipping is authorized.
 
 ## Full-parity coverage map — no CLI command or draft action left behind
 

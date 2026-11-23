@@ -34,8 +34,8 @@ shell's pre-drafting smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0) predates genera
 ## Planned desktop workspace
 `docs/ROADMAP.md` requires every CLI/TUI feature in the GUI, start to finish;
 no individual change completes the workspace. The sequence is
-`gui-drafting-workspace` (implemented), `gui-project-planning` (selected/proposed),
-then `gui-continuity-review-export` (future). M1's first change, `openspec/changes/gui-wayland-shell/`,
+`gui-drafting-workspace` (implemented), `gui-project-planning` (implemented),
+then `gui-continuity-review-export` (selected/proposed, not implemented). M1's first change, `openspec/changes/gui-wayland-shell/`,
 is implemented on `feat/gui-wayland-shell`: the `gui` command opens the Qt
 Widgets reading/steering shell over `longform_core.reader_model` snapshots with
 per-scene steering via `longform_core.scene_steering`; the implemented shell is
@@ -56,8 +56,15 @@ Create-to-scene journey (`case_planning_journey`) is green and CLI/GUI
 parity is frozen in `tests/test_planning_ops.py`; real Wayland
 Create-to-scene acceptance is recorded as PENDING in the change's
 `evidence.md`. Planning is unshipped. Continuity/review/export
-(`gui-continuity-review-export`) remains future — do not create or
-implement that change yet.
+(`openspec/changes/gui-continuity-review-export/`) is now the final selected/
+proposed change, with eight unchecked test-first tasks; it is not implemented.
+It covers update-state/summary-only, compression, critique/check reports and
+editing, passage revision, read-only full status and destination-picked export
+through ADR-0007 shared operations/the existing worker. Real Wayland M3
+acceptance is PENDING, not inferred from offscreen tests. Stop planning after
+this proposal; after implementation audit every row of the roadmap parity
+matrix across M1–M3, with controls/tests/evidence and explicit gaps, before
+claiming the full workspace is complete. Do not ship.
 Full completion requires setup through export, all draft actions, offline
 CLI/GUI parity and separate real Wayland acceptance; this plan does not authorize shipping.
 ADR-0004/0005 (integrated from the reader baseline; 0005 superseded by ADR-0006)
