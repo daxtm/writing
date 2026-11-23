@@ -14,17 +14,17 @@ use network; test execution must not.
 
 ## Phase 0 — Walking skeleton: source, checks, and project facts
 
-- [ ] testing-foundation — Track the CLI, replace scaffold checks with real syntax/help/test discovery, and record project facts and this plan on `chore/testing-foundation`.
+- [x] testing-foundation — Track the CLI, replace scaffold checks with real syntax/help/test discovery, and record project facts and this plan on `chore/testing-foundation`.
 
-Source and checks landed as `09bb632` and `2609c34`; this phase finishes with
-the documentation commit. Observe with `./scripts/check.sh`: expect `== syntax`,
-`== cli smoke` when uv exists, and the explicit `no tests/ yet` message until
-Phase 1. Without uv, syntax still runs and help is explicitly skipped.
+Source, checks, and documentation landed in `09bb632`, `2609c34`, and PR #1. At
+the time, `./scripts/check.sh` showed `== syntax`, `== cli smoke` when uv exists,
+and an explicit `no tests/ yet` message until Phase 1. Without uv, syntax still
+runs and help is explicitly skipped.
 `uv run --script longform.py --help` prints the available commands without an API key.
 
 ## Phase 1 — Offline regression suite
 
-- [ ] add-test-suite — Run deterministic pytest coverage of helpers, branch trees, reports, and mocked API behavior.
+- [x] add-test-suite — Run deterministic pytest coverage of helpers, branch trees, reports, and mocked API behavior.
 
 Cover `clean_continuation`; `key_match`, `entry_triggered`, `name_variants`;
 `split_bible`, `join_bible`; `extract_json_array`, `extract_tagged`;
@@ -36,8 +36,8 @@ using synthetic streams, fake projects/clocks/sleep, and no real credentials.
 
 Observe with `uv run --with pytest --with httpx pytest -q tests`: tests are
 collected and report `N passed`, exit 0. `./scripts/check.sh` adds `== tests` and
-the same passing summary. Test failures must fail the script. CI's uv gap remains
-visible until Phase 4; local success is not a claim of CI success.
+the same passing summary. Test failures must fail the script. Checks run
+locally; no CI workflow is involved.
 
 ## Phase 2 — Extract pure core pieces behind tests
 
@@ -65,24 +65,10 @@ Observe with `uv run --script longform.py --help`, then
 the same commands and regression outputs continue to work. A package sacrifices
 standalone one-file portability even though the launcher command stays the same.
 
-## Phase 4 — CI parity
-
-- [ ] install-ci-uv — Install uv and a supported Python 3.11+ runtime before CI invokes the existing project checks.
-
-CI currently does not install uv. Once `tests/` exists, the script intentionally
-fails rather than silently skipping tests on a runner without uv. This phase
-depends on Phase 1, not on the optional Phase 3 trigger, and must not wait for a
-package split. It changes CI setup, not the existing test-discovery contract.
-
-Observe locally with `./scripts/check.sh` and
-`uv run --with pytest --with httpx pytest -q tests`; then observe the CI `check`
-job show `== syntax`, `== cli smoke`, `== tests`, a nonzero passing test count,
-and success. Provisioning dependencies is not a live API test.
-
 ## Decisions
 
 - [ADR-0001: Record architecture decisions](adr/0001-record-architecture-decisions.md).
 - [ADR-0002: Keep the single-file CLI through the prototype](adr/0002-single-file-cli.md)
   accepts the prototype trade-off and defines extraction/package triggers.
-- No additional durable decision is forced by the testing runner or CI setup;
-  implementation details stay in the relevant change design.
+- No additional durable decision is forced by the testing runner or local check
+  setup; implementation details stay in the relevant change design.
