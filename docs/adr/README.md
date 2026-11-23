@@ -8,4 +8,5 @@ except to mark it superseded by a newer ADR.
 | ADR | Title | Status | Date |
 |---|---|---|---|
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted | 2026-11-23 |
-| [0002](0002-single-file-cli.md) | Keep the single-file CLI through the prototype | Accepted | 2026-11-23 |
+| [0002](0002-single-file-cli.md) | Keep the single-file CLI through the prototype | Superseded by ADR-0003 | 2026-11-23 |
+| [0003](0003-split-into-package.md) | Split the CLI into a package now | Accepted | 2026-11-23 |

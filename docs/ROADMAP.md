@@ -59,25 +59,28 @@ wrapper (`tests/test_summary.py`), and `compose_writer_prompt` /
 with a stored `tests/data/writer_prompt_fixture.json` parity fixture covering
 scene start, continuation, and steer).
 
-## Phase 3 — Package only when triggered
+## Phase 3 — Package split
 
-- [ ] split-cli-package — At an ADR-0002 trigger, move tested boundaries into a package while retaining the thin uv launcher.
+- [x] split-cli-package — Move the tested implementation into a package while retaining the thin uv launcher.
 
-This phase is gated, not automatic. Trigger when tests need a stable reusable
-core that in-script helpers cannot reasonably provide, a second consumer needs
-the core, or the script reaches approximately 3,000 lines. Tests merely existing
-does not trigger a split. Use `api.py`, `project.py`, `lore.py`, `prompt.py`,
-`checks.py`, and `cli.py`; keep `longform.py` as a thin PEP 723 launcher.
+The owner asked to split now despite the gate check below coming back "not
+triggered"; ADR-0003 supersedes ADR-0002 to record that deliberate override.
+`longform.py` stays at the repo root as a thin PEP 723 launcher re-exporting
+the public names; the implementation moved to `longform_core/` (`config`,
+`utils`, `project`, `api`, `tree`, `lore`, `prompt`, `checks`, `commands`,
+`cli`) as a move-only refactor.
 
-Observe with `uv run --script longform.py --help`, then
-`uv run --with pytest --with httpx pytest -q tests` and `./scripts/check.sh`:
-the same commands and regression outputs continue to work. A package sacrifices
-standalone one-file portability even though the launcher command stays the same.
+Result: `uv run --script longform.py --help`, the full offline suite, and
+`./scripts/check.sh` all stay green with byte-identical CLI help and
+fixed-fixture reports/prompts; 154 tests pass. One-file portability is
+sacrificed even though the launcher command stays the same.
 
 ## Decisions
 
 - [ADR-0001: Record architecture decisions](adr/0001-record-architecture-decisions.md).
 - [ADR-0002: Keep the single-file CLI through the prototype](adr/0002-single-file-cli.md)
-  accepts the prototype trade-off and defines extraction/package triggers.
-- No additional durable decision is forced by the testing runner or local check
-  setup; implementation details stay in the relevant change design.
+  accepted the prototype trade-off and defined extraction/package triggers;
+  superseded by ADR-0003.
+- [ADR-0003: Split the CLI into a package now](adr/0003-split-into-package.md)
+  records the owner's deliberate override of the ADR-0002 gate and the package
+  layout.

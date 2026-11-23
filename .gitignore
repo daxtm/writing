@@ -8,6 +8,7 @@
 # --- python ---
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # --- generated fiction projects ---
 # Run artifacts: bibles, drafts, call logs. Keep source/projects out of git.
