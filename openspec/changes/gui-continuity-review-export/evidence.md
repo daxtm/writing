@@ -114,6 +114,102 @@ Full suite (`./scripts/check.sh`): **381 passed**; offscreen runner:
 Real Wayland Stop/close acceptance for review remains PENDING (offscreen is
 not compositor evidence).
 
+## Task 1.8 — coverage enforcement, failure injection and M1–M3 parity audit (observed)
+
+### Coverage chain (no second runner)
+
+`./scripts/check.sh` → `uv run --with pytest --with httpx --with
+'pyside6>=6.12.0,<6.13' pytest -q tests` → `tests/test_qt_cases.py`
+(subprocess, offscreen, `net_guard_env`) → `tests/qt_widget_cases.py` running
+every entry of `CASES`. That is the only runner; running
+`python tests/qt_widget_cases.py <case>` by hand is a development convenience.
+The script itself needed no change. One genuine gap was fixed (commit
+`fix(tests): fail the check on unregistered Qt widget cases`): a `case_*`
+function missing from `CASES` used to run silently never; the runner now
+exits 2 listing any unregistered `case_*` callable. Red proof (injected stub
+`case_zz_unregistered`): the child printed
+`unregistered Qt widget case(s): case_zz_unregistered` and exited 2, so
+`tests/test_qt_cases.py::test_qt_widget_cases_run_offscreen` failed —
+`1 failed, 380 passed`. (During this injection the guard first over-reported
+`case_owner_flow_reading`/`case_owner_flow_steering`; those are registered
+under their unprefixed keys `owner_flow_reading`/`owner_flow_steering` —
+the guard now accepts both key styles, and both cases run green.)
+
+### Failure injections (each through the real `./scripts/check.sh`, then restored)
+
+- Missing Qt: `import PySide6` temporarily replaced by
+  `import PySide6_noqt` → child exits 2 with "Qt widget cases require
+  PySide6; provision it with: uv run --with pytest --with httpx --with
+  'pyside6>=6.12.0,<6.13' pytest -q tests (ModuleNotFoundError: No module
+  named 'PySide6_noqt')"; wrapper asserts `returncode == 0` and fails;
+  **`check.sh` exit 1**. Coverage is never skipped.
+- Failing journey: `case_review_journey` parity assert temporarily inverted
+  → `FAIL case_review_journey` in the wrapper output; **`check.sh` exit 1**.
+- Restored baseline: `./scripts/check.sh` → **exit 0, `381 passed in ~4.9s`**;
+  offscreen child reports **38/38 cases ok**. No skips, no xfails anywhere in
+  the suite (`grep skip/xfail` finds only docstrings/comments). Network
+  guards intact: `conftest.py` autouse offline guards (credentials stripped,
+  `socket.connect`/`create_connection` and `httpx.HTTPTransport.handle_request`
+  refuse) and the subprocess `sitecustomize` net guard; no test performs a
+  live call.
+
+### Full-parity audit — every row of `docs/ROADMAP.md`, verified against code and tests
+
+Verified by grepping `longform_core/gui_window.py` and the test files; each
+row names the controls that exist and the tests that execute them offline.
+
+Milestone 1 — draft loop (`gui-drafting-workspace`, implemented; unshipped):
+
+| CLI surface | GUI control(s) | Headless tests | Offscreen cases | Gap |
+|---|---|---|---|---|
+| `gui DIR` | One window; reading/metadata/notes panes; refresh preserving selection/scroll; sidebar navigation; prose size 8–28 pt spinbox (`_apply_prose_size`) | `test_reader_model.py` (31), `test_gui_dispatch.py` (7) | `owner_flow_reading`, `case_navigation_no_writes`, `case_reading_states`, `case_refresh_preserves_state`, `case_palette_and_prose_size`, `case_readonly_panes`, `case_focus_and_tab_order`, `case_enter_inserts_newline`, `case_invalid_config_and_recovery` | none offline; font choice beyond size is owner detail |
+| `draft [--scene]`, resume/next | Scene sidebar select, "Next unfinished", reopen done scenes, prerequisite/status warnings | `test_draft_parity.py::test_cli_routes_generate_through_shared_operation` | `case_draft_generate_acceptance` (reopen), `case_draft_scene_context` (Mark done/Next unfinished) | none |
+| `g [N]`/`gN`, swipes | Generate + count spin, streaming/completion preview in the tray, Stop | `test_draft_parity.py` (generation/batch/budget/partial-failure) | `case_draft_generate_acceptance`, `case_draft_stop_and_close`, `case_draft_midstream_failure` | streaming is completion-based (nonstreaming `Api.chat`), documented |
+| candidate `K`/`r`/`+`/`v`/`d`/Enter | Tray: Accept, Reroll selected/all, Add N, View, Delete leaf, Keep branches/Discard | `test_draft_parity.py` (reroll/delete-leaf/accept), `test_draft.py` | `case_draft_candidate_tray` | concurrent CLI/GUI writers unsupported (by design) |
+| `s`/`se`/`l N`/`who`/`pov` | Multiline steering Save/Clear (Save captures before prompt), length token cap, cast/POV forms | `test_scene_steering.py` (20), `test_draft_parity.py::test_scene_controls_parity` | `owner_flow_steering`, `case_draft_scene_context`, `case_dirty_scene_choices` | none |
+| `w`/`e`/`r`/`t`/`j`/`x` | New passage, Edit head with diff/history, Rewind, branch tree/metadata, Jump/Use as head, Delete leaf | `test_draft_parity.py::test_manual_edit_branch_parity`, `test_edit_noop_and_keep_lead_rules` | `case_draft_edit_and_branches`, `case_removed_node_and_scene` | no external editor/terminal helpers (by design) |
+| `v`/`v ID`/`tail`/`card`/`c`/`cp` | Marked manuscript, node metadata viewer, Tail N, scene card, Context tab (budget/samplers/injected lore/exact prompt), Save last_prompt.txt | `test_draft_parity.py::test_prompt_dump_parity` | `case_draft_scene_context`, `case_draft_edit_and_branches` | none |
+| lore files/commands | Lore tab: list, individual/multi/all toggles, character/aliases/world, JSON/PNG import picker with replace/cancel | `test_lore_ops.py` (4), `test_lore.py` | `case_draft_lore`, `case_stale_conflict` | none |
+| `d`, end confirm, `q`, `?`/help | Mark done (+decline end suggestion), Leave draft, Draft help in the reading pane (`DRAFT_HELP`), dirty Save/Discard/Cancel | `test_draft_parity.py::test_accept_matches_shared_operation` | `case_draft_help_and_leave`, `case_close_choices`, `case_dirty_scene_choices` | none |
+
+Milestone 2 — setup/planning (`gui-project-planning`, implemented; unshipped):
+
+| CLI surface | GUI control(s) | Headless tests | Offscreen cases | Gap |
+|---|---|---|---|---|
+| `init [--preset]`, config | Create/Open dir pickers with create-missing-only init, preset picker + master-export validation, models/roles/settings form | `test_planning_ops.py` (78: init/preset/settings parity) | `case_planning_journey`, `case_planning_create_open` | credentials show name/availability only (by design, never the key) |
+| `limits`, `bible` | Explicit limits fetch (credential-name only), bible section forms/answers/edit/accept/history, direct edits | `test_planning_ops.py` (bible/limits parity) | `case_planning_settings_limits`, `case_planning_bible` | `limits.json` matches CLI shape modulo `fetched` (recorded) |
+| `outline` | Count/notes editor, Generate/Reroll, candidate viewer/selection, body edit, Cancel | `test_planning_ops.py` (outline parity) | `case_planning_outline` | none |
+| `scenes [--force]` | Scene cards list/editor/validation, Generate/Regenerate, Accept/Replace confirmation with backups, Cancel | `test_planning_ops.py` (scenes parity) | `case_planning_scenes`, `case_planning_card_edit` | none |
+
+Milestone 3 — continuity/review/export (this change; unshipped):
+
+| CLI surface | GUI control(s) | Headless tests | Offscreen cases | Gap |
+|---|---|---|---|---|
+| `update-state [--scene] [--summary-only]`, raw edit/retry, warnings | Continuity tab: scene selection, summary-only flag, diff/raw/section editors, Accept/Edit/Regenerate/Quit, warning confirmation, state/input history | `test_review_ops.py` (57: parity, stale, history, edit semantics) | `case_review_update_state`, `case_review_settlement`, `case_review_dirty_sources`, `case_review_journey` | none |
+| `compress --from --to [--replace]` | From/To saved-order combos, overlap Replace confirmation naming whole arcs, preview/Edit/Accept/Regenerate/Quit | `test_review_ops.py` (compress prepare/collision/accept/stale/edit) | `case_review_compress`, `case_review_journey` | no new arc-snapshot format (by design; edited-input versions retained) |
+| `critique --scene`, `check [--scene]` | Critique scene / Check scene / Check all, report viewer, built-in report editor with Save/Cancel and backups | `test_review_ops.py` (critique/check parity, no-provider, stale) | `case_review_reports` | all-scenes check is a per-scene loop over saved cards (same CLI scope) |
+| `revise --scene` | Revision pane: per-passage diff, Accept/Skip/Edit/Regenerate/Quit, node history "by: revise" | `test_review_ops.py` (revise parity, cap, tail, quit) | `case_review_revise`, `case_review_settlement`, `case_review_journey` | none |
+| `status`, `export [--out]` | Status tab (read-only facts, no lore-discovery writes), Export with destination picker/overwrite confirm/alias/symlink/unwritable guards | `test_review_ops.py` (status facts, export bytes/guards) | `case_review_status_export`, `case_review_journey` | none |
+
+Audit outcome: every roadmap row maps to real, executed controls and offline
+tests; no row is uncovered at the offscreen/headless level. Explicit
+deviations, all documented rather than silent: (1) candidate streaming shows
+completion progress because `Api.chat` is nonstreaming; (2) concurrent
+CLI/GUI writers remain unsupported; (3) no terminal/external-editor helpers
+anywhere; (4) credential forms expose name/availability only; (5) all-scenes
+check iterates saved scene cards like the CLI default scope. Explicit gaps:
+real Wayland acceptance is PENDING for drafting (generation loop),
+Create-to-scene (M2) and review/export (M3) — recorded separately below.
+The workspace is therefore **not** claimed complete and nothing is shipped.
+
+### Full-suite results (exact commands)
+
+- `./scripts/check.sh` → `== syntax` ok, `== cli smoke` ok, `== tests`
+  `381 passed in ~4.9s`, exit 0.
+- `QT_QPA_PLATFORM=offscreen python tests/qt_widget_cases.py` → 38 ok.
+- `ock check HEAD` → "Local checks passed" for the 1.7 commit `646aecf` and
+  re-run on the 1.8 commits.
+
 ## Real Wayland acceptance (M3) — PENDING
 
 Real compositor acceptance for the review surface (update-state → export

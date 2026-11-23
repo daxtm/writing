@@ -123,16 +123,17 @@ CLI shape modulo `fetched`. Real Wayland Create-to-scene acceptance
 
 ## GUI milestone 3 — Continuity, review, revision, status and export
 
-- [ ] gui-continuity-review-export — Selected/proposed, not implemented: update-state/summary-only previews/edit/regenerate/accept/quit and warnings; compress ranges/replace/edit/accept; critique/check/review-note editing; revise diff/accept/skip/edit/regenerate/quit; status and destination-selected export.
+- [x] gui-continuity-review-export — Implemented on `feat/gui-wayland-shell` (unshipped; real Wayland acceptance PENDING): update-state/summary-only previews/edit/regenerate/accept/quit and warnings; compress ranges/replace/edit/accept; critique/check/review-note editing; revise diff/accept/skip/edit/regenerate/quit; status and destination-selected export.
 
-Depends on setup/planning; this is remaining change 3 and consolidates the
-former `gui-continuity-review` and `gui-check-revise-export` roadmap items.
-Reuse the worker and shared-operation boundary, not a new job system. Preserve
+Implemented (all eight tasks on `feat/gui-wayland-shell`, unshipped). Depends
+on setup/planning; this change consolidated the former `gui-continuity-review`
+and `gui-check-revise-export` roadmap items. Reuse the worker and
+shared-operation boundary, not a new job system. Preserve
 state_history, summaries, stale/earlier-scene warnings, arc overlap checks,
 revision history and existing report/export formats. Status and notes remain
 visible; saves refresh affected views without losing position or dirty input.
 Replacement/destructive choices name their target and retain confirmation.
-The selected proposal/design/spec/eight tasks are in
+The selected proposal/design/spec/eight (all completed) tasks are in
 `openspec/changes/gui-continuity-review-export/`; ADR-0007 already governs this
 work, so no new ADR/dependency/schema is required. Full-state and arc previews
 never implicitly commit; report saves and passage acceptance remain explicit.
@@ -140,24 +141,34 @@ Arc history retains existing edited-input versions, not a new automatic arc
 snapshot store. Status must not trigger lore-discovery writes. Real Wayland
 M3 acceptance is PENDING, separate from future offscreen test results.
 
-Observe after implementation: from completed drafting, preview/edit/accept a
-continuity diff, exercise summary-only and stale-summary recovery, compress a
-valid range, run critique and scene/all checks, accept one revision and skip
-another, view status, then choose an export destination. Reopen: saved state and
-manuscript match CLI export for the same active paths. Offline end-to-end tests
-cover acceptance, rejection, cancellation and errors without live credentials,
-network, terminal interaction or external editors.
+Observed implementation (tasks 1.1–1.8 on `feat/gui-wayland-shell`): the
+offscreen journey `case_review_journey` runs completed scenes → continuity
+preview/Accept → summary-only recovery → compress → critique/check/reports →
+revise Accept/Skip → status → picked export → reopen, with file parity against
+fixed-clock CLI fixtures (`tests/test_review_ops.py`, 57 tests). One-worker
+settlement, dirty-source Save/Discard/Cancel before Revise/Export and
+Stop/commit-group behavior are covered by `case_review_settlement` and
+`case_review_dirty_sources`. `./scripts/check.sh` runs every headless and
+offscreen case (unregistered-case guard), 381 tests + 38 offscreen cases green;
+failure injection (missing Qt, failing journey) fails the check instead of
+skipping. Real Wayland review/export acceptance (pickers, keyboard, scaling,
+themes, Stop/close during review) is recorded as PENDING in
+`openspec/changes/gui-continuity-review-export/evidence.md`.
 
-After implementing this final change, **audit every row of the full-parity
-matrix across milestones 1–3**, mapping its actual GUI controls, offline parity/
-button tests and separate desktop evidence. Explicitly report any gaps,
-including pending real Wayland acceptance from earlier changes; do not mark
-the workspace complete merely because M3 tasks pass. No more speculative
-changes, implementation in this proposal, or shipping is authorized.
+After implementing this final change, the full-parity matrix across
+milestones 1–3 was audited row by row against actual controls, headless/
+offscreen tests and evidence (see
+`openspec/changes/gui-continuity-review-export/evidence.md`): every row maps
+to real executed controls and tests; documented deviations are completion-based
+progress (nonstreaming `Api.chat`), unsupported concurrent CLI/GUI writers, no
+terminal/editor helpers, credential-name-only forms, and per-scene all-check
+scope. Explicit remaining gap: separate real Wayland acceptance for all three
+milestones. This audit does **not** mark the workspace complete and no
+shipping is authorized; no more speculative changes.
 
 ## Full-parity coverage map — no CLI command or draft action left behind
 
-| Existing CLI surface | Required GUI control(s) | Remaining change |
+| Existing CLI surface | Required GUI control(s) | Implementing change |
 |---|---|---|
 | `gui DIR` | Native Wayland project window, reading/notes, refresh/navigation, font size | Existing shell; retained throughout |
 | `draft [--scene ID]`, resume/default next unfinished | Select scene / Next unfinished / reopen done scene, resume head, status/prerequisite warnings | `gui-drafting-workspace` |
@@ -179,10 +190,11 @@ changes, implementation in this proposal, or shipping is authorized.
 | `status`, `export [--out FILE]` | Project status, Export with destination picker | `gui-continuity-review-export` |
 
 The sequence is drafting workspace -> setup/planning -> continuity/review/export.
-Do not tick future work based on its proposal. Finish only when every row works
-through GUI controls from Create through exported manuscript and all draft-loop
-actions are verified, with offline parity coverage and separate native Wayland
-acceptance. No individual row/change or shell smoke establishes that finish line.
+Do not tick future work based on its proposal. Every row of the map is now
+implemented through GUI controls with offline parity coverage (audited row by
+row in `openspec/changes/gui-continuity-review-export/evidence.md`), but the
+finish line still requires separate native Wayland acceptance for all three
+milestones; no offscreen result or shell smoke establishes it.
 
 ## Delivery rules for every GUI change
 

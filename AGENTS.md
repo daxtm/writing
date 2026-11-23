@@ -26,7 +26,8 @@ operations with frozen prompts/transcripts (`tests/test_draft_parity.py`). Stop 
 request/chunk/save boundaries, close offers Stop-and-wait/Keep open, stale sources refuse writes.
 `gui` refuses any explicit platform except `wayland`, never falls back to XWayland, and prints recovery
 guidance when Wayland is unavailable. Model/CLI tests run headless; Qt widget tests run offscreen in a
-subprocess (`tests/qt_widget_cases.py`, never skipped; 23 cases). Real Wayland acceptance for the
+subprocess (`tests/qt_widget_cases.py`, never skipped; 38 cases, all enforced
+by an unregistered-case guard). Real Wayland acceptance for the
 drafting loop (generation/Stop/close, picker, keyboard, scaling/theme) is recorded as PENDING in
 `openspec/changes/gui-drafting-workspace/evidence.md` and remains a separate owner desktop step; the
 shell's pre-drafting smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0) predates generation.
@@ -35,7 +36,7 @@ shell's pre-drafting smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0) predates genera
 `docs/ROADMAP.md` requires every CLI/TUI feature in the GUI, start to finish;
 no individual change completes the workspace. The sequence is
 `gui-drafting-workspace` (implemented), `gui-project-planning` (implemented),
-then `gui-continuity-review-export` (selected/proposed, not implemented). M1's first change, `openspec/changes/gui-wayland-shell/`,
+then `gui-continuity-review-export` (implemented). M1's first change, `openspec/changes/gui-wayland-shell/`,
 is implemented on `feat/gui-wayland-shell`: the `gui` command opens the Qt
 Widgets reading/steering shell over `longform_core.reader_model` snapshots with
 per-scene steering via `longform_core.scene_steering`; the implemented shell is
@@ -56,15 +57,19 @@ Create-to-scene journey (`case_planning_journey`) is green and CLI/GUI
 parity is frozen in `tests/test_planning_ops.py`; real Wayland
 Create-to-scene acceptance is recorded as PENDING in the change's
 `evidence.md`. Planning is unshipped. Continuity/review/export
-(`openspec/changes/gui-continuity-review-export/`) is now the final selected/
-proposed change, with eight unchecked test-first tasks; it is not implemented.
-It covers update-state/summary-only, compression, critique/check reports and
+(`openspec/changes/gui-continuity-review-export/`) is implemented on
+`feat/gui-wayland-shell` (all eight tasks), unshipped. It covers
+update-state/summary-only, compression, critique/check reports and
 editing, passage revision, read-only full status and destination-picked export
-through ADR-0007 shared operations/the existing worker. Real Wayland M3
+through ADR-0007 shared operations/the existing worker, with one-worker
+settlement and dirty-source Save/Discard/Cancel before Revise/Export; the
+offscreen review journey (`case_review_journey`) and CLI/GUI parity
+(`tests/test_review_ops.py`) are green, and the M1–M3 parity audit is
+recorded in its `evidence.md`. Real Wayland M3
 acceptance is PENDING, not inferred from offscreen tests. Stop planning after
-this proposal; after implementation audit every row of the roadmap parity
-matrix across M1–M3, with controls/tests/evidence and explicit gaps, before
-claiming the full workspace is complete. Do not ship.
+this proposal; the roadmap parity matrix across M1–M3 has been audited row by
+row (controls/tests/evidence, explicit gaps in the change's `evidence.md`),
+but the full workspace is still not claimed complete. Do not ship.
 Full completion requires setup through export, all draft actions, offline
 CLI/GUI parity and separate real Wayland acceptance; this plan does not authorize shipping.
 ADR-0004/0005 (integrated from the reader baseline; 0005 superseded by ADR-0006)
