@@ -10,4 +10,5 @@ except to mark it superseded by a newer ADR.
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted | 2026-11-23 |
 | [0002](0002-single-file-cli.md) | Keep the single-file CLI through the prototype | Superseded by ADR-0003 | 2026-11-23 |
 | [0003](0003-split-into-package.md) | Split the CLI into a package now | Accepted | 2026-11-23 |
-| [0004](0004-local-web-reader.md) | Use a read-only standard-library local web reader | Accepted | 2026-11-23 |
+| [0004](0004-local-web-reader.md) | Use a read-only standard-library local web reader | Superseded by ADR-0005 | 2026-11-23 |
+| [0005](0005-desktop-gui.md) | Use Tkinter and ttk for the native read-only desktop reader | Accepted | 2026-11-23 |

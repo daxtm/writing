@@ -1,6 +1,6 @@
 # ADR-0004: Use a read-only standard-library local web reader
 
-- Status: Accepted
+- Status: Superseded by ADR-0005
 - Date: 2026-11-23
 - Related: add-reader-gui; ADR-0003; docs/ROADMAP.md
 

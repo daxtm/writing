@@ -5,11 +5,11 @@
 Make `longform.py` safe to change through observable offline regression tests,
 then extract only the boundaries the prototype actually needs. Preserve
 `uv run --script longform.py …` and existing project files and reports. Add a
-local read-only browser window for all saved draft branches alongside the CLI.
+native read-only desktop window for all saved draft branches alongside the CLI.
 
 ## Out of scope
 
-New generation features, browser editing/generation, remote hosting,
+New generation features, GUI editing/generation, browser/HTML interfaces, remote hosting,
 authentication/multi-user access, rich text, model/provider changes, live API
 tests, private sample/preset fixtures, new dependencies, and speculative
 packaging. Dependency provisioning may use network; test execution must not
@@ -78,26 +78,37 @@ Result: `uv run --script longform.py --help`, the full offline suite, and
 fixed-fixture reports/prompts; 154 tests pass. One-file portability is
 sacrificed even though the launcher command stays the same.
 
-## Phase 4 — Local read-only reader
+## Phase 4 — Native read-only desktop reader
 
-- [ ] add-reader-gui — Keep active manuscript, every saved branch, and supporting writing readable in an automatically refreshed local browser.
+- [ ] add-desktop-reader — Read active manuscript, every saved branch, and supporting notes in a native Tkinter/ttk window with position-preserving refresh.
 
-Observe with `uv run --script longform.py view /path/to/project --no-browser --port 0`:
-stdout prints `Reader: http://127.0.0.1:<assigned-port>/`. Open that URL to see
-title/progress and scene links; select a scene to read the active manuscript,
-full branch tree, inactive swipes, and metadata. Retained trees without current
-scene cards remain linked. `/notes` shows the bible, continuity state, scene/arc
-summaries, checks, and critiques as escaped plain text. Saving another draft
-branch makes it appear on the next two-second refresh cycle without a terminal
-reading command or export. Ctrl-C stops the reader.
+After implementation, observe with
+`uv run --script longform.py gui /path/to/project`: a native project-titled
+read-only window opens and the command blocks until it closes. The left scene
+list includes ID, title, status, words, and a separate retained-tree group.
+Selecting a scene drives Manuscript (full active chain), Branches (every saved
+node, including inactive descendants, full detail/history, parent/child
+navigation), and Notes (project-wide bible, state, summaries, checks, critiques).
+All writing is plain, selectable, scrollable text, not HTML or rich text.
 
-ADR-0004 fixes the architecture: standard-library HTTP, literal loopback bind,
-read-only content allowlist, trusted inline assets, and no build step. No
-configuration secrets or arbitrary files are served. Tests use temporary
-synthetic projects, `http.client`, and an ephemeral in-process listener under a
-port-specific exception to the existing offline guard. `./scripts/check.sh`
-discovers the reader tests and passes alongside the existing suite; no hosted
-CI phase is introduced.
+Save another branch in the CLI: it appears on the next approximately two-second
+auto-refresh, preserving selected scene/node, tab, and reading position. Toolbar
+Refresh now/F5 forces a reload; Auto-refresh can be disabled. Status shows last
+refresh time and current-project actual/target words. Ctrl+Q or window close
+cancels the timer and returns to the terminal. No server, browser, provider
+calls, editing controls, or configuration/credential viewer is introduced.
+
+[ADR-0005](adr/0005-desktop-gui.md) fixes Tkinter/ttk and display-independent
+allowlisted snapshots, with no new dependencies. The owner verified Tk 9.0.4
+under uv-managed Python 3.13 and a working desktop display; system Python lacks
+Tk libraries, so use the same uv runtime as the CLI. Snapshot/CLI tests always
+run offline; withdrawn-window smoke tests run only with available Tk/display
+and skip cleanly headless. `./scripts/check.sh` discovers both and must pass in
+both environments without weakening the existing network guard.
+
+The owner rejected the unimplemented HTML plan. Its `add-reader-gui` change was
+deleted, not archived as shipped; ADR-0004 remains historical, superseded by
+ADR-0005. This phase is a proposal only, not an implemented GUI.
 
 ## Decisions
 
@@ -109,5 +120,8 @@ CI phase is introduced.
   records the owner's deliberate override of the ADR-0002 gate and the package
   layout.
 - [ADR-0004: Use a read-only standard-library local web reader](adr/0004-local-web-reader.md)
-  records the local browser architecture and keeps browser mutation and remote
-  access outside this feature.
+  records the rejected, unimplemented browser architecture; superseded by
+  ADR-0005.
+- [ADR-0005: Use Tkinter and ttk for the native read-only desktop reader](adr/0005-desktop-gui.md)
+  records the native toolkit, uv runtime requirement, read-only model/widget
+  boundary, and headless/display testing trade-offs.
