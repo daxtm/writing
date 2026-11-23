@@ -865,20 +865,16 @@ def card_fields(d):
     return None
 
 
-def parse_book(path):
-    """Read a SillyTavern World Info export, a character card (.png or .json), or a bare entry list."""
-    path = Path(path)
-    if path.suffix.lower() == ".png":
-        d = read_card_png(path)
-        if d is None:
-            warn(f"{path.name}: no character card data found in this PNG")
-            return None, []
-    else:
-        d = read_json(path, {})
+def parse_book_data(d, stem):
+    """Pure parse of card/World Info data (as read from a file) into (card_name, entries).
+
+    Accepts a V2/V3 character card (under 'data'), a V1 card (top level), a World
+    Info export with an 'entries' mapping, or a bare list/dict of entries.
+    """
     card = card_fields(d)
     card_name, raw, synth = None, [], []
     if card is not None:
-        card_name = (card.get("name") or path.stem).strip()
+        card_name = (card.get("name") or stem).strip()
         raw = (card.get("character_book") or {}).get("entries", [])
         desc = (card.get("description") or "").strip()
         pers = (card.get("personality") or "").strip()
@@ -920,6 +916,19 @@ def parse_book(path):
             "whole": e.get("matchWholeWords"),
         })
     return card_name, synth + out
+
+
+def parse_book(path):
+    """Read a SillyTavern World Info export, a character card (.png or .json), or a bare entry list."""
+    path = Path(path)
+    if path.suffix.lower() == ".png":
+        d = read_card_png(path)
+        if d is None:
+            warn(f"{path.name}: no character card data found in this PNG")
+            return None, []
+    else:
+        d = read_json(path, {})
+    return parse_book_data(d, path.stem)
 
 
 def key_match(key, hay, case, whole):
