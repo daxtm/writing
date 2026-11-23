@@ -4,3 +4,11 @@
 !.env.example
 *.log
 .DS_Store
+
+# --- python ---
+__pycache__/
+*.pyc
+
+# --- generated fiction projects ---
+# Run artifacts: bibles, drafts, call logs. Keep source/projects out of git.
+/myfic/
