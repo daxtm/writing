@@ -1,12 +1,11 @@
 schema: spec-driven
 
-# Project context: what an agent can't infer from the code. Fill in the <placeholders>
-# (or ask OpenCode: "fill in the placeholders in openspec/config.yaml").
+# Project context: facts not obvious from an individual code section.
 context: |
-  Project: <one sentence: what it does and who uses it>
-  Stack: <language/runtime + version, framework, database, package manager>
-  Runs on: <local CLI, container, AKS, browser, ...>
-  Constraints: <hard limits: platforms, offline, budget, things not to touch>
+  Project: longform.py helps writers plan and collaboratively draft long-form fiction using Featherless.ai.
+  Stack: Python 3.11+, argparse, uv with PEP 723 inline httpx>=0.27; JSON/Markdown project files, no database.
+  Runs on: Local CLI via uv run --script longform.py; shell checks and GitHub Actions CI.
+  Constraints: Offline deterministic tests with MockTransport/fakes, never live API calls; dependency provisioning may use network. Never commit API keys or .env. Keep private generated myfic/ and the third-party preset JSON untracked and out of fixtures. Keep the single-file CLI until an ADR-0002 trigger. scripts/check.sh already discovers tests/; CI still needs uv installation.
   The owner reviews behavior and output rather than code: plain language, observable results.
 
 rules:

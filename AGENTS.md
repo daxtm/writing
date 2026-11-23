@@ -1,22 +1,26 @@
 # writing
 
-<!-- Project facts for OpenCode. Sent with every request: keep it short (under ~30 lines).
-     Ask OpenCode: "fill in the placeholders in AGENTS.md". -->
-
 ## What this is
-<one or two sentences: what it does and who uses it>
+Single-file CLI for writers planning and collaboratively drafting long-form fiction with Featherless.ai.
 
 ## Stack
-<language/runtime + version, framework, package manager, database>
+Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27`; argparse CLI, JSON/Markdown files, no database.
 
 ## Checks
-`scripts/check.sh` runs everything (install deps, tests, lint, build); CI runs it on every PR.
-`ock check` runs it on a commit in a clean checkout.
-Run / demo: `<command that shows it working>`
+`./scripts/check.sh`: py_compile; CLI `--help` if uv exists; pytest if `tests/` exists (fails without uv).
+Suite: `uv run --with pytest --with httpx pytest -q tests` (once implemented); no lint/build step.
+`ock check` runs committed checks in a clean checkout. CI invokes the script but does not yet install uv.
+Run / demo: `uv run --script longform.py --help` prints commands without API calls.
 
 ## Layout
-<the 3-6 directories that matter and what lives in each>
+- `longform.py`: CLI, API, project state, branching trees, lore, prompts, deterministic checks.
+- `scripts/`: check entry point; `tests/`: planned offline pytest suite.
+- `openspec/`: behavior specs and changes; `docs/`: roadmap and ADRs.
+- `.github/`: PR checks; `myfic/`: private generated sample, never a test fixture.
 
 ## Rules
 - Specs: `openspec/`. Decisions: `docs/adr/`. Plan: `docs/ROADMAP.md`.
-- <project-specific rules: files not to touch, naming, error handling>
+- Keep `myfic/` and the third-party `56295265-LLam_ception-1.3.json` preset untracked.
+- Never commit API keys or `.env`; synthetic test credentials only.
+- Tests are offline/deterministic: no live API calls; use MockTransport/fakes and temporary projects.
+- Keep the single-file CLI until an ADR-0002 trigger; extract only what tests need, preserving `uv run`.
