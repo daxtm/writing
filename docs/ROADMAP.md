@@ -41,7 +41,7 @@ locally; no CI workflow is involved.
 
 ## Phase 2 — Extract pure core pieces behind tests
 
-- [ ] extract-pure-core — Separate remaining calculation from I/O in place, prioritizing deterministic checks, card/lore parsing, and prompt assembly.
+- [x] extract-pure-core — Separate remaining calculation from I/O in place, prioritizing deterministic checks, card/lore parsing, and prompt assembly.
 
 Reuse existing pure helpers and the Phase 1 checker; do not extract them twice.
 Keep the script and CLI shape unchanged. Add focused tests before each necessary
@@ -49,6 +49,15 @@ extraction; move filesystem/network orchestration outside those helpers.
 Observe with `uv run --with pytest --with httpx pytest -q tests` and
 `./scripts/check.sh`: both stay green, with identical fixed-fixture reports and
 prompt strings before and after extraction.
+
+Extracted boundaries (each behind a test-first commit): `card_png_json(data)`
+plus a thin `read_card_png` wrapper (`tests/test_card.py`), `parse_book_data(d,
+stem)` plus a thin `parse_book` wrapper (`tests/test_book.py`),
+`layered_summary_core(sums, cfg, …, est, root)` plus a thin `layered_summary`
+wrapper (`tests/test_summary.py`), and `compose_writer_prompt` /
+`tail_trim_chars` split out of `build_writer_prompt` (`tests/test_writer_prompt.py`
+with a stored `tests/data/writer_prompt_fixture.json` parity fixture covering
+scene start, continuation, and steer).
 
 ## Phase 3 — Package only when triggered
 
