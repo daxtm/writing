@@ -6,7 +6,6 @@ coverage actually executes instead of being skipped. Every case is a function
 that raises on failure; any failing case (or missing PySide6) exits nonzero.
 """
 
-import json
 import os
 import sys
 import tempfile
@@ -41,53 +40,12 @@ def app():
 
 
 # ---------------------------------------------------------------- builders
-# (moved to tests/reader_support.py when the reader baseline is integrated)
 
-NOW = "2026-01-01T00:00:00+00:00"
-
-
-def _node(nid, parent, text, sep="\n\n", created=NOW, history=None, **meta):
-    d = {"id": nid, "parent": parent, "text": text, "created": created,
-         "history": history or []}
-    if sep is not None:
-        d["sep"] = sep
-    d.update(meta)
-    return d
+import reader_support as rs  # noqa: E402  (shared synthetic project builders)
 
 
-def _tree(nodes, head=None):
-    counter = max([int(n["id"][1:]) for n in nodes.values()
-                   if n["id"][1:].isdigit()] or [0])
-    return {"nodes": nodes, "head": head, "counter": counter}
-
-
-def _scene(sid, chapter=1, title="", status="planned", target=1000, **extra):
-    d = {"id": sid, "chapter": chapter, "title": title, "target_words": target,
-         "status": status}
-    d.update(extra)
-    return d
-
-
-def _write_json(path, data):
-    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                          encoding="utf-8")
-
-
-def _build_project(root, *, title="Test Title", target=17000, scenes=None,
-                   trees=None, bible=None, state=None):
-    root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "trees").mkdir(exist_ok=True)
-    _write_json(root / "project.json", {"title": title, "target_words": target})
-    _write_json(root / "scenes.json", scenes if scenes is not None else [])
-    _write_json(root / "summaries.json", {"scenes": {}, "arcs": []})
-    for sid, t in (trees or {}).items():
-        _write_json(root / "trees" / f"{sid}.json", t)
-    if bible is not None:
-        (root / "bible.md").write_text(bible, encoding="utf-8")
-    if state is not None:
-        (root / "state.md").write_text(state, encoding="utf-8")
-    return root
+def _build_project(root, **kw):
+    return rs.build_project(root, **kw)
 
 
 # ------------------------------------------------------------------- cases
