@@ -92,3 +92,22 @@ def test_v_by_id_and_tail_command(tmp_path, net_guard_env):
     assert "ENDS HERE." in r.stdout
     # v n2 shows only that node, not the active n1 passage
     assert OPENING not in r.stdout
+
+
+def test_steering_note_can_be_edited_in_editor(tmp_path, net_guard_env):
+    root = make_project(tmp_path / "proj")
+    editor = tmp_path / "editor.sh"
+    editor.write_text('#!/bin/sh\nprintf %s "$STEER_NEW" > "$1"\n', encoding="utf-8")
+    editor.chmod(0o755)
+    env = dict(net_guard_env)
+    env["EDITOR"] = str(editor)
+    env["VISUAL"] = str(editor)
+    env["STEER_NEW"] = "edited in the editor\nsecond line"
+
+    r = draft(root, "s\nq\n", env)
+    assert r.returncode == 0, r.stderr
+    assert "steer set: edited in the editor" in r.stdout
+    saved = json.loads((root / "trees" / "s001.json").read_text(encoding="utf-8"))
+    assert saved["steer"] == "edited in the editor\nsecond line"
+    # every version typed into the editor is kept under inputs/
+    assert (root / "inputs" / "steer_s001.md").read_text(encoding="utf-8") == "edited in the editor\nsecond line"
