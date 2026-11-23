@@ -1,0 +1,98 @@
+{
+  "continue": {
+    "extra": {},
+    "ignored": [],
+    "params": {
+      "max_tokens": 300,
+      "temperature": 1.0
+    },
+    "prompt": "You narrate Mara. Author steers the story.\n\n\n\n# Story bible\n\nThe ledger hides the town's debts.\n\nContinuity state:\nMara knows the ledger exists. Tomas suspects her.\n\n---\n### Author:\nScene s001 (Chapter 1): Arrival\nPOV: Mara\nSetting: the harbour\nCharacters present: Mara, Tomas\nGoal: find the ledger\nConflict: Tomas is watching\nTarget length: ~120 words\n\nCharacters present in this scene: Mara, Tomas. Only they appear, speak or act on the page. Anyone else may only be mentioned or remembered.\n\nProgress: this scene has ~12 words so far of a ~120-word target.\n\nWrite this scene as prose from Mara's point of view, following the POV, tense and style rules in the scenario. Continue from exactly where the text leaves off, about 220 words. Never repeat what is already written. Stay inside this scene. When the scene's outcome has been reached, finish at a natural stopping point and write [SCENE END] on its own line.\n### Mara:\nThe harbour smells of tar and rain.\n\nMara kept to the shadows.",
+    "report": {
+      "available_for_prompt": 30829,
+      "ceiling": 32768,
+      "ceiling_source": "max_context_fallback (no limits.json; run: limits)",
+      "char": "Mara",
+      "continuing": true,
+      "lore": [],
+      "max_tokens": 300,
+      "notes": [],
+      "over": false,
+      "parts": {
+        "author_turn": 210,
+        "bible": 15,
+        "lore": 1,
+        "prefill": 18,
+        "state": 15,
+        "summary": 1,
+        "sysprompt": 13
+      },
+      "ratio": 3.5,
+      "total": 283,
+      "user": "Author"
+    }
+  },
+  "start": {
+    "extra": {},
+    "ignored": [],
+    "params": {
+      "max_tokens": 300,
+      "temperature": 1.0
+    },
+    "prompt": "You narrate Mara. Author steers the story.\n\n\n\n# Story bible\n\nThe ledger hides the town's debts.\n\nContinuity state:\nMara knows the ledger exists. Tomas suspects her.\n\n---\n### Author:\nScene s001 (Chapter 1): Arrival\nPOV: Mara\nSetting: the harbour\nCharacters present: Mara, Tomas\nGoal: find the ledger\nConflict: Tomas is watching\nTarget length: ~120 words\n\nCharacters present in this scene: Mara, Tomas. Only they appear, speak or act on the page. Anyone else may only be mentioned or remembered.\n\nProgress: this scene has ~12 words so far of a ~120-word target.\n\nWrite this scene as prose from Mara's point of view, following the POV, tense and style rules in the scenario. Continue from exactly where the text leaves off, about 220 words. Never repeat what is already written. Stay inside this scene. When the scene's outcome has been reached, finish at a natural stopping point and write [SCENE END] on its own line.\n### Mara:\nThe harbour smells of tar and rain.\n\nMara kept to the shadows.",
+    "report": {
+      "available_for_prompt": 30829,
+      "ceiling": 32768,
+      "ceiling_source": "max_context_fallback (no limits.json; run: limits)",
+      "char": "Mara",
+      "continuing": true,
+      "lore": [],
+      "max_tokens": 300,
+      "notes": [],
+      "over": false,
+      "parts": {
+        "author_turn": 210,
+        "bible": 15,
+        "lore": 1,
+        "prefill": 18,
+        "state": 15,
+        "summary": 1,
+        "sysprompt": 13
+      },
+      "ratio": 3.5,
+      "total": 283,
+      "user": "Author"
+    }
+  },
+  "steer": {
+    "extra": {},
+    "ignored": [],
+    "params": {
+      "max_tokens": 300,
+      "temperature": 1.0
+    },
+    "prompt": "You narrate Mara. Author steers the story.\n\n\n\n# Story bible\n\nThe ledger hides the town's debts.\n\nStory so far:\n### s001 - Ch 1: Arrival\nMara searches the harbour office.\n\nContinuity state:\nMara knows the ledger exists. Tomas suspects her.\n\n---\n### Author:\nScene s002 (Chapter 1): Ledger\nPOV: Mara\nCharacters present: Mara\nGoal: hide the ledger\nTarget length: ~100 words\n\nCharacters present in this scene: Mara. Only they appear, speak or act on the page. Anyone else may only be mentioned or remembered.\n\nProgress: this scene has ~0 words so far of a ~100-word target.\n\nEnd of the previous scene (context only; this scene begins now):\nThe harbour smells of tar and rain.\n\nMara kept to the shadows.\n\nDirection for this passage: Add rain.\n\nWrite this scene as prose from Mara's point of view, following the POV, tense and style rules in the scenario. Begin the scene, about 180 words. Never repeat what is already written. Stay inside this scene. When the scene's outcome has been reached, finish at a natural stopping point and write [SCENE END] on its own line.\n### Mara:\n",
+    "report": {
+      "available_for_prompt": 30829,
+      "ceiling": 32768,
+      "ceiling_source": "max_context_fallback (no limits.json; run: limits)",
+      "char": "Mara",
+      "continuing": false,
+      "lore": [],
+      "max_tokens": 300,
+      "notes": [],
+      "over": false,
+      "parts": {
+        "author_turn": 231,
+        "bible": 15,
+        "lore": 1,
+        "prefill": 1,
+        "state": 15,
+        "summary": 17,
+        "sysprompt": 13
+      },
+      "ratio": 3.5,
+      "total": 307,
+      "user": "Author"
+    }
+  }
+}
