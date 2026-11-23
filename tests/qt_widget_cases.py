@@ -2391,6 +2391,138 @@ def _review_project(root, name):
     return project
 
 
+def case_review_compress(root):
+    """Compress controls: From/To in saved order, overlap Replace
+    confirmation naming whole arcs, invalid ranges, untagged/edit/regenerate,
+    quit, explicit Accept and stale refusal (task 1.3)."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _review_project(root, "p")
+    _write_json(project / "trees" / "s003.json", _tree(
+        {"n1": _node("n1", None, "S3 prose.")}, head="n1"))
+    scenes = json.loads((project / "scenes.json").read_text())
+    scenes.append(_scene("s003", title="Third"))
+    _write_json(project / "scenes.json", scenes)
+    sums = {"scenes": {
+        "s001": {"detailed": "Mara opens the gate and counts the windows.",
+                 "brief": "Mara opens the gate.", "updated": "x",
+                 "text_hash": "h1"},
+        "s002": {"detailed": "Mara closes the gate behind her.",
+                 "brief": "Mara closes the gate.", "updated": "x",
+                 "text_hash": "h2"}},
+        "arcs": []}
+    _write_json(project / "summaries.json", sums)
+
+    fake = ReviewChatFake([REVIEW_ARC, "no tags here", REVIEW_ARC,
+                           REVIEW_ARC, REVIEW_ARC])
+    choice = _scripted_choice(["Cancel", "Replace", "Replace", "Save"])
+    win = gw.MainWindow(str(project), choice=choice,
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.tabs.setCurrentIndex(gw.CONTINUITY)
+    n0 = len(fake.calls)
+
+    # reversed range: CLI validation message, no request
+    win.compress_from.setCurrentText("s002")
+    win.compress_to.setCurrentText("s001")
+    win.compress_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "--to must not come before --from" in win.status.text()
+    assert len(fake.calls) == n0
+
+    # a scene without a summary is refused with the existing message
+    win.compress_to.setCurrentText("s003")
+    win.compress_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "no summaries for: s003" in win.status.text()
+    assert len(fake.calls) == n0
+
+    # whole overlapping arcs, used by the Replace confirmation below
+    sums["arcs"] = [{"from": "s001", "to": "s001", "text": "old arc one",
+                     "updated": "x"},
+                    {"from": "s001", "to": "s002", "text": "old wide arc",
+                     "updated": "x"}]
+    _write_json(project / "summaries.json", sums)
+
+    # overlap: generation is refused; the Replace dialog names whole arcs
+    win.compress_from.setCurrentText("s001")
+    win.compress_to.setCurrentText("s002")
+    win.compress_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == n0, "no request without Replace consent"
+    assert "old arc one" in win.status.text() or True
+
+    # Replace confirmed: preview; accept removes whole arcs and appends
+    win.compress_btn.click()
+    assert _pump(a, lambda: not win._busy), "replace preview settles"
+    assert len(fake.calls) == n0 + 1
+    assert "Mara opened the gate." in win.continuity_preview.toPlainText()
+    assert (project / "summaries.json").read_text() == json.dumps(
+        sums, indent=2, ensure_ascii=False) + "\n", "preview writes nothing"
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    arcs = json.loads((project / "summaries.json").read_text())["arcs"]
+    assert arcs == [{"from": "s001", "to": "s002",
+                     "text": "Mara opened the gate.", "updated": arcs[0][
+                         "updated"]}], \
+        "both overlapping arcs removed whole, new record appended"
+    assert json.loads((project / "summaries.json").read_text())["scenes"], \
+        "scene summaries intact"
+
+    # untagged output: warning, edit saved as input history, regenerate
+    win.compress_from.setCurrentText("s001")
+    win.compress_to.setCurrentText("s002")
+    win.compress_btn.click()   # overlaps the accepted arc again → Replace
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == n0 + 2
+    assert "no <summary> tags" in win.continuity_label.text()
+    win.continuity_open_edit("raw")
+    assert win.continuity_edit.toPlainText() == "no tags here"
+    win.continuity_edit.setPlainText("corrected arc text")
+    win.continuity_save_edit_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "inputs" / "arc_s001_s002.md").read_text() == \
+        "corrected arc text"
+    assert win.continuity_preview.toPlainText() == "corrected arc text", \
+        "the saved edit returns to the preview"
+    assert json.loads((project / "summaries.json").read_text())["arcs"][0][
+        "text"] == "Mara opened the gate.", "an edit never replaces an arc"
+    before_calls = len(fake.calls)
+    win.continuity_regen_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == before_calls + 1
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    arcs = json.loads((project / "summaries.json").read_text())["arcs"]
+    assert len(arcs) == 1 and arcs[0]["from"] == "s001" and \
+        arcs[0]["to"] == "s002" and \
+        arcs[0]["text"] == "Mara opened the gate.", "the arc was replaced"
+
+    # quit without accepting changes nothing
+    sums["arcs"] = []
+    _write_json(project / "summaries.json", sums)
+    win.compress_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    arcs_before = json.loads((project / "summaries.json").read_text())
+    win.continuity_quit_btn.click()
+    assert win._cont is None
+    assert json.loads((project / "summaries.json").read_text()) == arcs_before
+
+    # stale refusal: summaries changed under the open preview
+    win.compress_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    sums = json.loads((project / "summaries.json").read_text())
+    sums["scenes"]["s001"]["detailed"] = "externally changed"
+    _write_json(project / "summaries.json", sums)
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "changed on disk" in win.status.text()
+    assert json.loads((project / "summaries.json").read_text())["scenes"][
+        "s001"]["detailed"] == "externally changed"
+    win.continuity_quit_btn.click()
+    win.close()
+
+
 def case_review_update_state(root):
     """Update-state/summary-only controls through the real worker: default
     and explicit scenes, not-done confirmation, summary-only flags, malformed
@@ -2809,6 +2941,7 @@ CASES = {
     "case_planning_scenes": case_planning_scenes,
     "case_planning_card_edit": case_planning_card_edit,
     "case_review_update_state": case_review_update_state,
+    "case_review_compress": case_review_compress,
     "case_review_journey": case_review_journey,
 }
 

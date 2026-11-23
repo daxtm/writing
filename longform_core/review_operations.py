@@ -49,7 +49,151 @@ def _find_idx(scenes, scene_id):
     return next((i for i, s in enumerate(scenes) if s.get("id") == scene_id), None)
 
 
-# ============================================================= update state
+# ================================================================= compress
+
+@dataclass
+class CompressPrep:
+    from_id: str
+    to_id: str
+    lo: int
+    hi: int
+    user: str
+    msgs: list
+    overlaps: list          # whole existing arcs intersecting the range
+    baseline: dict
+
+
+def compress_overlaps(scenes, sums, lo, hi):
+    """Inclusive overlap: shared endpoints count; arcs with endpoints absent
+    from the current scene list are ignored, exactly like the CLI."""
+    pos = {s["id"]: i for i, s in enumerate(scenes)}
+    return [a for a in sums.get("arcs", [])
+            if a["from"] in pos and a["to"] in pos
+            and not (pos[a["to"]] < lo or pos[a["from"]] > hi)]
+
+
+def compress_prepare(root, from_id, to_id, *, replace=False, token=None):
+    """Validate the inclusive range and replacement set; no call, no write.
+
+    Raises OpError(collision=True) naming the first overlapping arc when
+    Replace consent is missing, like the CLI's die()."""
+    p = _project_of(root)
+    scenes = _scenes(p)
+    lo = _find_idx(scenes, from_id)
+    if lo is None:
+        raise OpError(f"no scene with id {from_id}")
+    hi = _find_idx(scenes, to_id)
+    if hi is None:
+        raise OpError(f"no scene with id {to_id}")
+    if hi < lo:
+        raise OpError("--to must not come before --from")
+    sums = _sums(p)
+    overlaps = compress_overlaps(scenes, sums, lo, hi)
+    if overlaps and not replace:
+        first = overlaps[0]
+        raise OpError(f"overlaps existing arc {first['from']}-{first['to']} "
+                      "(use --replace)", collision=True)
+    rng = scenes[lo: hi + 1]
+    missing = [s["id"] for s in rng if s["id"] not in sums["scenes"]]
+    if missing:
+        raise OpError("no summaries for: " + ", ".join(missing))
+    body = "\n\n".join(
+        f"### {s['id']}: {s.get('title', '')}\n{sums['scenes'][s['id']]['detailed']}"
+        for s in rng)
+    aw = p.cfg["summary"]["arc_words"]
+    user = (f"# Scene summaries {rng[0]['id']}-{rng[-1]['id']}\n{body}\n\n"
+            f"Condense these into one continuous summary of about {aw} words. "
+            "Keep every fact later scenes may depend on: "
+            "who knows what, promises and setups, injuries, objects, "
+            "relationship changes, unresolved threads. " + tag_instr("summary"))
+    msgs = [{"role": "system", "content": SUMMARIZER_SYSTEM},
+            {"role": "user", "content": user}]
+    baseline = _capture(p, ["project.json", "summaries.json"])
+    if token:
+        token.check()
+    return CompressPrep(from_id=from_id, to_id=to_id, lo=lo, hi=hi, user=user,
+                        msgs=msgs, overlaps=overlaps, baseline=baseline)
+
+
+def compress_overlap_set(root, from_id, to_id):
+    """Read-only whole-arc deletion set for the desktop Replace dialog."""
+    p = _project_of(root)
+    scenes = _scenes(p)
+    lo = _find_idx(scenes, from_id)
+    hi = _find_idx(scenes, to_id)
+    if lo is None or hi is None or hi < lo:
+        return []
+    return compress_overlaps(scenes, _sums(p), lo, hi)
+
+
+def compress_generate(root, prep, *, provider=None, provider_factory=None,
+                      token=None, events=None):
+    """One summarizer chat call for the arc summary; nothing written."""
+    p = _project_of(root)
+    if token:
+        token.check()
+    _emit(events, "progress",
+          msg=f"compressing {prep.from_id}-{prep.to_id}...")
+    provider = provider or _provider(p, provider_factory)
+    try:
+        raw, finish, _ = provider.chat("summarizer", prep.msgs, token=token,
+                                       on_retry_event=(lambda why, delay:
+                                                       _emit(events, "retry"))
+                                                      if events else None)
+    except Cancelled:
+        raise
+    except (HttpErr, NoAnswerErr) as e:
+        raise OpError(f"summarizer failed: {e}", soft=True) from None
+    _advance(p, prep.baseline, "calib.json")
+    text, ok = extract_tagged(raw, "summary")
+    return {"text": text, "ok": ok, "raw": raw,
+            "from": prep.from_id, "to": prep.to_id}
+
+
+def compress_save_edit_input(root, prep, text, *, token=None):
+    """Keep the edited arc text as inputs/arc_<from>_<to>.md plus history;
+    this never replaces an arc."""
+    p = _project_of(root)
+    if token:
+        token.check()
+    save_input(p.root, f"arc_{prep.from_id}_{prep.to_id}", text)
+    return {"saved": f"inputs/arc_{prep.from_id}_{prep.to_id}.md"}
+
+
+def compress_accept(root, prep, text, *, baseline=None, token=None,
+                    events=None):
+    """Explicit acceptance: remove whole overlapping arcs, append the new
+    record; per-scene summaries and nonoverlapping arcs stay intact."""
+    p = _project_of(root)
+    baseline = dict(prep.baseline if baseline is None else baseline)
+    if token:
+        token.check()
+    _stale_check(p, baseline)
+    scenes = _scenes(p)
+    sums = _sums(p)
+    if prep.overlaps:
+        pos = {s["id"]: i for i, s in enumerate(scenes)}
+        arcs = [a for a in sums.get("arcs", [])
+                if not (a["from"] in pos and a["to"] in pos
+                        and not (pos[a["to"]] < prep.lo
+                                 or pos[a["from"]] > prep.hi))]
+    else:
+        arcs = list(sums.get("arcs", []))
+    arcs.append({"from": prep.from_id, "to": prep.to_id, "text": text,
+                 "updated": _utils.now()})
+    sums["arcs"] = arcs
+    try:
+        p.save_summaries(sums)
+    except OSError as e:
+        raise OpError(f"summaries.json could not be saved "
+                      f"({type(e).__name__})", soft=True) from None
+    _advance(p, baseline, "summaries.json")
+    _emit(events, "accepted", arc=f"{prep.from_id}-{prep.to_id}")
+    return {"message": f"saved arc {prep.from_id}-{prep.to_id}",
+            "from": prep.from_id, "to": prep.to_id}
+
+
+# ============================================================ update state
 
 LATER_WARNING = ("state.md already includes later scenes ({later}); "
                  "updating state from this scene would treat that as 'before'. "

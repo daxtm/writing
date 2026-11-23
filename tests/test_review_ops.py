@@ -259,7 +259,212 @@ def test_update_state_ceiling_warning_before_the_call(project):
     assert "saved summaries and state.md" in t
 
 
-# ------------------------------------------------- shared-operation parity
+# ---------------------------------------------------------------- compress
+
+def _prime_summaries(project):
+    sums = {"scenes": {
+        "s001": {"detailed": "Mara opens the gate and counts the windows.",
+                 "brief": "Mara opens the gate.", "updated": "x",
+                 "text_hash": "h1"},
+        "s002": {"detailed": "Mara closes the gate behind her.",
+                 "brief": "Mara closes the gate.", "updated": "x",
+                 "text_hash": "h2"}},
+        "arcs": []}
+    (project / "summaries.json").write_text(
+        json.dumps(sums, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+
+
+def test_compress_accept_transcript_and_prompt(project):
+    _prime_summaries(project)
+    t, snap, calls = rf.run_cli(project, "compress", [ARC_TEXT],
+                                args={"from_id": "s001", "to_id": "s001"})
+    assert t == "Mara opened the gate.\nsaved arc s001-s001\n"
+    arcs = json.loads(snap["summaries.json"])["arcs"]
+    assert arcs == [{"from": "s001", "to": "s001",
+                     "text": "Mara opened the gate.", "updated": "(TS)"}]
+    assert json.loads(snap["summaries.json"])["scenes"]["s001"], \
+        "scene summaries stay intact"
+    user = calls[0][2][1]["content"]
+    assert user.startswith("# Scene summaries s001-s001\n### s001: Yard\n"
+                           "Mara opens the gate and counts the windows.\n\n"
+                           "Condense these into one continuous summary of "
+                           "about 350 words.")
+    assert user.endswith("Anything outside the tags is discarded.")
+
+
+def test_compress_invalid_ranges_and_missing_summaries(project):
+    t, _, _ = rf.run_cli(project, "compress", [],
+                         args={"from_id": "s009", "to_id": "s001"})
+    assert t == "error: no scene with id s009\n"
+    t, _, _ = rf.run_cli(project, "compress", [],
+                         args={"from_id": "s001", "to_id": "s009"})
+    assert t == "error: no scene with id s009\n"
+    t, _, _ = rf.run_cli(project, "compress", [],
+                         args={"from_id": "s002", "to_id": "s001"})
+    assert t == "error: --to must not come before --from\n"
+    t, _, _ = rf.run_cli(project, "compress", [],
+                         args={"from_id": "s001", "to_id": "s002"})
+    assert t == "error: no summaries for: s001, s002\n"
+
+
+def test_compress_overlap_replace_and_boundaries(project):
+    _prime_summaries(project)
+    sums = json.loads((project / "summaries.json").read_text())
+    sums["arcs"].append({"from": "s001", "to": "s001", "text": "old arc",
+                         "updated": "x"})
+    (project / "summaries.json").write_text(
+        json.dumps(sums, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, _, _ = rf.run_cli(project, "compress", [],
+                         args={"from_id": "s001", "to_id": "s002"})
+    assert t == "error: overlaps existing arc s001-s001 (use --replace)\n"
+    t, snap, _ = rf.run_cli(project, "compress", [ARC_TEXT],
+                            args={"from_id": "s001", "to_id": "s002",
+                                  "replace": True})
+    assert t == "Mara opened the gate.\nsaved arc s001-s002\n"
+    arcs = json.loads(snap["summaries.json"])["arcs"]
+    assert arcs == [{"from": "s001", "to": "s002",
+                     "text": "Mara opened the gate.", "updated": "(TS)"}], \
+        "the whole overlapping arc is removed, then the new one appended"
+
+
+def test_compress_absent_endpoints_ignored_whole_arc_outside_range(project):
+    _prime_summaries(project)
+    sums = json.loads((project / "summaries.json").read_text())
+    sums["arcs"] = [{"from": "s001", "to": "zzz", "text": "absent",
+                     "updated": "x"},
+                    {"from": "s001", "to": "s002", "text": "wide arc",
+                     "updated": "x"}]
+    (project / "summaries.json").write_text(
+        json.dumps(sums, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, snap, _ = rf.run_cli(project, "compress", [ARC_TEXT],
+                            args={"from_id": "s001", "to_id": "s001",
+                                  "replace": True})
+    arcs = json.loads(snap["summaries.json"])["arcs"]
+    assert arcs == [{"from": "s001", "to": "zzz", "text": "absent",
+                     "updated": "x"},
+                    {"from": "s001", "to": "s001",
+                     "text": "Mara opened the gate.", "updated": "(TS)"}], \
+        "absent-endpoint arcs are ignored for overlap; the wide arc is " \
+        "removed whole"
+
+
+def test_compress_untagged_edit_regenerate_quit(project):
+    _prime_summaries(project)
+    t, snap, calls = rf.run_cli(project, "compress",
+                                ["no tags here", ARC_TEXT],
+                                answers=["r", "a"],
+                                args={"from_id": "s001", "to_id": "s001"})
+    assert t == ("warning: no <summary> tags in the output; check it for "
+                 "stray text\nno tags here\nMara opened the gate.\n"
+                 "saved arc s001-s001\n")
+    t, snap, _ = rf.run_cli(project, "compress", [ARC_TEXT], answers=["e"],
+                            args={"from_id": "s001", "to_id": "s001",
+                                  "replace": True},
+                            edits={"arc_s001_s001": "Edited arc."})
+    assert t == "Mara opened the gate.\nsaved arc s001-s001\n", \
+        "the CLI edit implies accept (the edit itself is not reprinted)"
+    assert json.loads(snap["summaries.json"])["arcs"][0]["text"] == \
+        "Edited arc."
+    assert snap["inputs/arc_s001_s001.md"] == "Edited arc."
+    assert snap["inputs/history/arc_s001_s001_(STAMP).md"] == "Edited arc."
+    t, snap, calls = rf.run_cli(project, "compress", ["junk", ARC_TEXT],
+                                answers=["r", "a"],
+                                args={"from_id": "s001", "to_id": "s001",
+                                      "replace": True})
+    assert t.count("no <summary> tags") == 1 and "junk\n" in t
+    users = [c[2][1]["content"] for c in calls]
+    assert users[0] == users[1], "regeneration repeats the same prompt"
+    t, snap, _ = rf.run_cli(project, "compress", [ARC_TEXT], answers=["q"],
+                            args={"from_id": "s001", "to_id": "s001",
+                                  "replace": True})
+    assert t == "Mara opened the gate.\n"
+    assert json.loads(snap["summaries.json"])["arcs"], "arcs unchanged"
+
+
+# ------------------------------------------------------- compress ops
+
+def test_ops_compress_prepare_parity_and_validation(project, tmp_path):
+    _prime_summaries(project)
+    ops_root = _copy(project, tmp_path)
+    _, _, calls = rf.run_cli(project, "compress", [ARC_TEXT],
+                             args={"from_id": "s001", "to_id": "s001"})
+    prep = ro.compress_prepare(str(ops_root), "s001", "s001")
+    assert calls[0][2] == prep.msgs
+    with pytest.raises(ro.OpError) as e:
+        ro.compress_prepare(str(ops_root), "s002", "s001")
+    assert str(e.value) == "--to must not come before --from"
+    with pytest.raises(ro.OpError) as e:
+        ro.compress_prepare(str(ops_root), "s001", "s009")
+    assert str(e.value) == "no scene with id s009"
+
+
+def test_ops_compress_collision_and_whole_arc_replace(project, tmp_path):
+    _prime_summaries(project)
+    sums = json.loads((project / "summaries.json").read_text())
+    sums["arcs"].append({"from": "s001", "to": "s002", "text": "wide arc",
+                         "updated": "x"})
+    (project / "summaries.json").write_text(
+        json.dumps(sums, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    ops_root = _copy(project, tmp_path)
+    with pytest.raises(ro.OpError) as e:
+        ro.compress_prepare(str(ops_root), "s001", "s001")
+    assert e.value.collision
+    assert str(e.value) == "overlaps existing arc s001-s002 (use --replace)"
+    assert ro.compress_overlap_set(str(ops_root), "s001", "s001") == \
+        [{"from": "s001", "to": "s002", "text": "wide arc", "updated": "x"}]
+    prep = ro.compress_prepare(str(ops_root), "s001", "s001", replace=True)
+    ro.compress_accept(str(ops_root), prep, "Mara opened the gate.")
+    arcs = json.loads((ops_root / "summaries.json").read_text())["arcs"]
+    assert arcs == [{"from": "s001", "to": "s001",
+                     "text": "Mara opened the gate.", "updated": ro._utils.now()}] \
+        or len(arcs) == 1 and arcs[0]["text"] == "Mara opened the gate."
+    assert json.loads((ops_root / "summaries.json").read_text())["scenes"], \
+        "scene summaries intact"
+
+
+def test_ops_compress_accept_parity(project, tmp_path):
+    _prime_summaries(project)
+    ops_root = _copy(project, tmp_path)
+    t, cli_snap, _ = rf.run_cli(project, "compress", [ARC_TEXT],
+                                args={"from_id": "s001", "to_id": "s001"})
+    prep = ro.compress_prepare(str(ops_root), "s001", "s001")
+    res = ro.compress_generate(str(ops_root), prep,
+                               provider_factory=lambda p: FakeProvider([ARC_TEXT]))
+    assert res["ok"] and res["text"] == "Mara opened the gate."
+    ro.compress_accept(str(ops_root), prep, res["text"])
+    assert rf.snapshot(ops_root) == cli_snap
+
+
+def test_ops_compress_accept_refuses_stale_summaries(project, tmp_path):
+    _prime_summaries(project)
+    ops_root = _copy(project, tmp_path)
+    prep = ro.compress_prepare(str(ops_root), "s001", "s001")
+    sums = json.loads((ops_root / "summaries.json").read_text())
+    sums["scenes"]["s002"]["detailed"] = "externally changed"
+    (ops_root / "summaries.json").write_text(
+        json.dumps(sums, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    with pytest.raises(ro.OpError) as e:
+        ro.compress_accept(str(ops_root), prep, "Mara opened the gate.")
+    assert e.value.stale
+    assert json.loads((ops_root / "summaries.json").read_text())["arcs"] == []
+    ro.update_state_save_raw_input(str(ops_root), "s001", "x")  # unrelated
+
+
+def test_ops_compress_edit_input_history(project, tmp_path):
+    _prime_summaries(project)
+    ops_root = _copy(project, tmp_path)
+    prep = ro.compress_prepare(str(ops_root), "s001", "s001")
+    ro.compress_save_edit_input(str(ops_root), prep, "Edited arc.")
+    assert (ops_root / "inputs" / "arc_s001_s001.md").read_text() == \
+        "Edited arc."
+    assert list((ops_root / "inputs" / "history").glob("arc_s001_s001_*.md"))
+    assert json.loads((ops_root / "summaries.json").read_text())["arcs"] == [], \
+        "saving an edit never replaces an arc"
 
 def _copy(project, tmp_path, name="ops"):
     dst = tmp_path / name

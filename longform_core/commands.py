@@ -1045,47 +1045,39 @@ def cmd_update_state(p, args):
 
 
 def cmd_compress(p, args):
-    scenes = p.scenes()
-    lo, hi = p.scene_index(scenes, args.from_id), p.scene_index(scenes, args.to_id)
-    if hi < lo:
-        die("--to must not come before --from")
-    sums = p.summaries()
-    pos = {s["id"]: i for i, s in enumerate(scenes)}
-    for a in sums.get("arcs", []):
-        if a["from"] in pos and a["to"] in pos and not (pos[a["to"]] < lo or pos[a["from"]] > hi):
-            if not args.replace:
-                die(f"overlaps existing arc {a['from']}-{a['to']} (use --replace)")
-    rng = scenes[lo: hi + 1]
-    missing = [s["id"] for s in rng if s["id"] not in sums["scenes"]]
-    if missing:
-        die("no summaries for: " + ", ".join(missing))
-    body = "\n\n".join(f"### {s['id']}: {s.get('title', '')}\n{sums['scenes'][s['id']]['detailed']}" for s in rng)
-    aw = p.cfg["summary"]["arc_words"]
-    user = (f"# Scene summaries {rng[0]['id']}-{rng[-1]['id']}\n{body}\n\n"
-            f"Condense these into one continuous summary of about {aw} words. Keep every fact later scenes may depend on: "
-            "who knows what, promises and setups, injuries, objects, relationship changes, unresolved threads. " + tag_instr("summary"))
-    msgs = [{"role": "system", "content": SUMMARIZER_SYSTEM}, {"role": "user", "content": user}]
-    api = Api(p)
+    """CLI adapter over the shared compress operations: identical validation
+    order, prompt, warnings, ask points and save; the CLI's e means
+    edit-then-accept, which the GUI's separate Save/Acknowledge replaces."""
+    import longform_core.review_operations as ro
+
+    try:
+        prep = ro.compress_prepare(p.root, args.from_id, args.to_id,
+                                   replace=args.replace)
+    except ro.OpError as e:
+        _op_fail(e)
+    api = ro.provider_for(p.root, api_cls=Api)
     while True:
-        raw, _, _ = api.chat("summarizer", msgs)
-        text, ok = extract_tagged(raw, "summary")
-        if not ok:
+        res = ro.compress_generate(p.root, prep, provider=api)
+        text = res["text"]
+        if not res["ok"]:
             warn("no <summary> tags in the output; check it for stray text")
         print(text)
-        c = ask(f"\n({words(text)} words) [a]ccept / [e]dit / [r]egenerate / [q]uit: ").strip().lower()
+        c = ask(f"\n({words(text)} words) [a]ccept / [e]dit / [r]egenerate / "
+                "[q]uit: ").strip().lower()
         if c.startswith("e"):
-            text = edit_saved(p, f"arc_{rng[0]['id']}_{rng[-1]['id']}", text).strip()
+            text = edit_saved(p, f"arc_{prep.from_id}_{prep.to_id}",
+                              text).strip()
             c = "a"
         if c.startswith("r"):
             continue
         if not c.startswith("a"):
             return
-        arcs = [a for a in sums.get("arcs", [])
-                if not (a["from"] in pos and a["to"] in pos and not (pos[a["to"]] < lo or pos[a["from"]] > hi))]
-        arcs.append({"from": rng[0]["id"], "to": rng[-1]["id"], "text": text, "updated": now()})
-        sums["arcs"] = arcs
-        p.save_summaries(sums)
-        print(f"saved arc {rng[0]['id']}-{rng[-1]['id']}")
+        try:
+            ro.compress_accept(p.root, prep, text, baseline=prep.baseline)
+        except ro.OpError as e:
+            _op_fail(e, soft_ok=True)
+            return
+        print(f"saved arc {prep.from_id}-{prep.to_id}")
         return
 
 

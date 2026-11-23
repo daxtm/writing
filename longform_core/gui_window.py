@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
         self._cont = None            # continuity preview session (never a file)
         self._cont_editing = None    # None | "raw" | "sections"
         self._cont_history = False   # history view currently shown
+        self._compress_ids = []      # last From/To choice population
         self._plan = plan.project_overview(self._root)
 
         self.snap = None              # last valid Snapshot
@@ -1040,6 +1041,23 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.continuity_history_btn)
         btns.addStretch(1)
         l.addLayout(btns)
+        l.addWidget(QLabel("Compress scene summaries into one arc"))
+        crange = QHBoxLayout()
+        crange.addWidget(QLabel("From"))
+        self.compress_from = self._combo()
+        crange.addWidget(self.compress_from)
+        crange.addWidget(QLabel("To"))
+        self.compress_to = self._combo()
+        crange.addWidget(self.compress_to)
+        self.compress_btn = QPushButton("Compress")
+        self.compress_btn.setToolTip(
+            "Condense the inclusive From–To range using every scene summary "
+            "in saved order; overlapping arcs require the explicit Replace "
+            "confirmation and nothing is written until Accept")
+        self.compress_btn.clicked.connect(self.compress)
+        crange.addWidget(self.compress_btn)
+        crange.addStretch(1)
+        l.addLayout(crange)
         l.addWidget(QLabel("Preview (nothing is written until you press "
                            "Accept)"))
         self.continuity_preview = QPlainTextEdit()
@@ -1104,6 +1122,15 @@ class MainWindow(QMainWindow):
         if self._cont is not None and self._cont_editing is not None:
             self._cont["dirty"] = True
 
+    def _cont_input_kind(self):
+        """The saved-input name for the open preview's editor content."""
+        if self._cont["kind"] == "compress":
+            prep = self._cont["prep"]
+            return f"arc_{prep.from_id}_{prep.to_id}"
+        scene = self._cont["prep"].scene_id
+        return (f"state_raw_{scene}" if self._cont_editing == "raw"
+                else f"state_edit_{scene}")
+
     def update_state(self, summary_only=False, default_scene=False):
         """Continuity preview for the selected (or CLI-default) scene. The
         later-scenes override is explicit; Accept is always separate; nothing
@@ -1147,7 +1174,8 @@ class MainWindow(QMainWindow):
             res = ro.update_state_generate(
                 self._root, prep, provider_factory=self._provider_factory,
                 token=token, events=sink)
-            return {"prep": prep, "raw": res["raw"], "finish": res["finish"]}
+            return {"prep": prep, "raw": res["raw"], "finish": res["finish"],
+                    "kind": "summary-only" if prep.summary_only else "update"}
 
         self._dispatch(fn, kind="continuity_generate")
 
@@ -1160,6 +1188,16 @@ class MainWindow(QMainWindow):
         if not self._resolve_review_dirty("switching the editor"):
             return
         prep = self._cont["prep"]
+        if self._cont["kind"] == "compress":
+            self.continuity_edit.setPlainText(self._cont["raw"])
+            self.continuity_edit_label.setText(
+                f"Editing arc text for {prep.from_id}-{prep.to_id} — Save "
+                "edit keeps it in inputs/arc_*.md (with history); Accept is "
+                "still separate.")
+            self._cont_editing = "raw"
+            self._cont["dirty"] = False
+            self._update_continuity_ui()
+            return
         if mode == "raw":
             self.continuity_edit.setPlainText(self._cont["raw"])
             self.continuity_edit_label.setText(
@@ -1185,28 +1223,34 @@ class MainWindow(QMainWindow):
         """Save the edited text as input history; never accepts."""
         if self._busy or self._cont is None or self._cont_editing is None:
             return
-        kind, text, scene = self._cont_editing, \
-            self.continuity_edit.toPlainText(), self._cont["prep"].scene_id
+        kind_name = self._cont_input_kind()
+        text = self.continuity_edit.toPlainText()
 
         def fn(sink, token):
-            if kind == "raw":
-                return ro.update_state_save_raw_input(self._root, scene, text,
-                                                      token=token)
-            return ro.update_state_save_edit_input(self._root, scene, text,
-                                                   token=token)
+            if self._cont["kind"] == "compress":
+                return ro.compress_save_edit_input(self._root, self._cont["prep"],
+                                                   text, token=token)
+            if self._cont_editing == "raw":
+                return ro.update_state_save_raw_input(
+                    self._root, self._cont["prep"].scene_id, text, token=token)
+            return ro.update_state_save_edit_input(
+                self._root, self._cont["prep"].scene_id, text, token=token)
 
         self._dispatch(fn, kind="continuity_input")
 
     def _cont_save_input_now(self):
         """Synchronous input-history save for dirty transitions (no provider,
         no acceptance)."""
-        kind = self._cont_editing
         text = self.continuity_edit.toPlainText()
-        scene = self._cont["prep"].scene_id
         try:
-            if kind == "raw":
-                return ro.update_state_save_raw_input(self._root, scene, text)
-            return ro.update_state_save_edit_input(self._root, scene, text)
+            if self._cont["kind"] == "compress":
+                return ro.compress_save_edit_input(self._root,
+                                                   self._cont["prep"], text)
+            if self._cont_editing == "raw":
+                return ro.update_state_save_raw_input(
+                    self._root, self._cont["prep"].scene_id, text)
+            return ro.update_state_save_edit_input(
+                self._root, self._cont["prep"].scene_id, text)
         except ro.OpError as e:
             self._status(str(e), error=True)
             return None
@@ -1237,10 +1281,15 @@ class MainWindow(QMainWindow):
         """Re-parse a saved edit and return to the preview (CLI edit flow,
         minus the CLI's edit-implies-accept)."""
         prep = self._cont["prep"]
-        if self._cont_editing == "raw":
+        if self._cont["kind"] == "compress":
+            self._cont["text"] = text
+        elif self._cont_editing == "raw":
             self._cont["raw"] = text
-        parsed = ro.update_state_parse_text(text, prep)
-        self._cont["secs"] = parsed["secs"]
+            parsed = ro.update_state_parse_text(text, prep)
+            self._cont["secs"] = parsed["secs"]
+        else:
+            parsed = ro.update_state_parse_text(text, prep)
+            self._cont["secs"] = parsed["secs"]
         self._cont_editing = None
         self._cont["dirty"] = False
         self._update_continuity_view()
@@ -1251,17 +1300,34 @@ class MainWindow(QMainWindow):
         if not self._resolve_review_dirty("regenerating"):
             return
         prep = self._cont["prep"]
+        if self._cont["kind"] == "compress":
+
+            def fn(sink, token):
+                res = ro.compress_generate(
+                    self._root, prep,
+                    provider_factory=self._provider_factory, token=token,
+                    events=sink)
+                return {"prep": prep, "text": res["text"], "ok": res["ok"]}
+
+            self._dispatch(fn, kind="compress_generate")
+            return
 
         def fn(sink, token):
             res = ro.update_state_generate(
                 self._root, prep, provider_factory=self._provider_factory,
                 token=token, events=sink)
-            return {"prep": prep, "raw": res["raw"], "finish": res["finish"]}
+            return {"prep": prep, "raw": res["raw"], "finish": res["finish"],
+                    "kind": self._cont["kind"]}
 
         self._dispatch(fn, kind="continuity_generate")
 
     def continuity_accept(self):
-        if self._busy or self._cont is None or not self._cont.get("secs"):
+        if self._busy or self._cont is None:
+            return
+        if self._cont["kind"] == "compress":
+            self.compress_accept()
+            return
+        if not self._cont.get("secs"):
             return
         if not self._resolve_review_dirty("accepting"):
             return
@@ -1275,6 +1341,22 @@ class MainWindow(QMainWindow):
 
         self._dispatch(fn, kind="continuity_accept")
 
+    def compress_accept(self):
+        """Accept the arc preview: removes whole overlapping arcs and appends
+        the new record; per-scene summaries stay intact."""
+        if self._busy or self._cont is None or \
+                self._cont["kind"] != "compress":
+            return
+        prep, text = self._cont["prep"], self._cont["text"]
+        baseline = dict(prep.baseline)
+
+        def fn(sink, token):
+            return ro.compress_accept(self._root, prep, text,
+                                      baseline=baseline, token=token,
+                                      events=sink)
+
+        self._dispatch(fn, kind="compress_accept")
+
     def continuity_quit(self):
         if self._busy or self._cont is None:
             return
@@ -1284,6 +1366,61 @@ class MainWindow(QMainWindow):
         self._cont_editing = None
         self._update_continuity_view()
         self._status("Quit; no summaries, state or scene flags changed.")
+
+    def compress(self, replace=False):
+        """Arc preview for the inclusive From–To range. An overlap collision
+        offers the explicit whole-arc Replace confirmation; declining makes
+        no request and no write."""
+        if self._busy:
+            self._status("An operation is running; continuity actions are "
+                         "paused until it settles.", error=True)
+            return
+        if not self._resolve_review_dirty("opening a compress preview"):
+            return
+        lo, hi = self.compress_from.currentText(), self.compress_to.currentText()
+        if not lo or not hi:
+            self._status("Select the From and To scenes to compress.")
+            return
+
+        def fn(sink, token):
+            prep = ro.compress_prepare(self._root, lo, hi, replace=replace,
+                                       token=token)
+            res = ro.compress_generate(self._root, prep,
+                                       provider_factory=self._provider_factory,
+                                       token=token, events=sink)
+            return {"prep": prep, "text": res["text"], "ok": res["ok"]}
+
+        self._dispatch(fn, kind="compress_generate")
+
+    def _on_compress_collision(self, err):
+        """Name every whole arc that Replace removes, then require consent."""
+        lo = self.compress_from.currentText()
+        hi = self.compress_to.currentText()
+        try:
+            overlaps = ro.compress_overlap_set(self._root, lo, hi)
+        except ro.OpError as e:
+            self._status(str(e), error=True)
+            return
+        if not overlaps:
+            self._status(str(err), error=True)
+            return
+        listing = "\n".join(
+            f"- {a['from']}-{a['to']}: {a.get('text', '')[:80]}"
+            + ("…" if len(a.get("text", "")) > 80 else "")
+            for a in overlaps)
+        pick = self._choice(
+            "Replace overlapping arcs",
+            f"Compressing {lo}-{hi} overlaps existing arc(s). Replace "
+            "removes them whole, including parts outside the new range:\n"
+            + listing +
+            "\n\nConfirm Replace to make the provider call and preview the "
+            "replacement; nothing is written until you Accept it.",
+            ["Replace", "Cancel"])
+        if pick == "Replace":
+            self.compress(replace=True)
+        else:
+            self._status("Replace declined; no request was made and no arc "
+                         "or summary changed.")
 
     def continuity_history(self):
         """Read-only state/input history for the selected scene."""
@@ -1326,10 +1463,24 @@ class MainWindow(QMainWindow):
         if c is None:
             self.continuity_label.setText(
                 "Continuity — select a scene in the sidebar, then Update "
-                "state or Summary only")
+                "state, Summary only, or Compress")
             self.continuity_preview.setPlainText("")
             self.continuity_edit.setPlainText("")
             self.continuity_edit_label.setText("")
+        elif c["kind"] == "compress":
+            prep = c["prep"]
+            text = c["text"]
+            self.continuity_preview.setPlainText(text)
+            extra = "" if c["ok"] else \
+                "\nwarning: no <summary> tags in the output; check it for " \
+                "stray text"
+            self.continuity_label.setText(
+                f"Arc preview {prep.from_id}-{prep.to_id} "
+                f"({ro.words(text)} words){extra} — nothing is written "
+                "until Accept")
+            if self._cont_editing is None:
+                self.continuity_edit.setPlainText("")
+                self.continuity_edit_label.setText("")
         else:
             prep = c["prep"]
             if c.get("secs") is None:
@@ -1361,18 +1512,42 @@ class MainWindow(QMainWindow):
     def _update_continuity_ui(self):
         busy, c = self._busy, self._cont
         has = c is not None
-        secs = has and bool(c.get("secs"))
+        compress = has and c["kind"] == "compress"
+        secs = has and not compress and bool(c.get("secs"))
+        arc_ok = has and compress and c.get("text") is not None
         self.update_state_btn.setEnabled(not busy)
         self.update_state_default_btn.setEnabled(not busy)
         self.summary_only_btn.setEnabled(not busy)
         self.continuity_history_btn.setEnabled(not busy)
-        self.continuity_accept_btn.setEnabled(has and secs and not busy)
+        self.compress_btn.setEnabled(not busy)
+        self.compress_from.setEnabled(not busy)
+        self.compress_to.setEnabled(not busy)
+        self.continuity_accept_btn.setEnabled(
+            has and (secs or arc_ok) and not busy)
         self.continuity_edit_raw_btn.setEnabled(has and not busy)
-        self.continuity_edit_sections_btn.setEnabled(has and secs and not busy)
+        self.continuity_edit_sections_btn.setEnabled(
+            has and secs and not busy)
         self.continuity_save_edit_btn.setEnabled(
             has and self._cont_editing is not None and not busy)
         self.continuity_regen_btn.setEnabled(has and not busy)
         self.continuity_quit_btn.setEnabled(has and not busy)
+        self._refresh_compress_ranges()
+
+    def _refresh_compress_ranges(self):
+        """Keep the From/To choices in saved scene order without resetting an
+        in-progress choice or an open preview."""
+        ids = [r.id for r in (self.snap.scenes if self.snap else [])]
+        if ids == self._compress_ids:
+            return
+        self._compress_ids = ids
+        for combo in (self.compress_from, self.compress_to):
+            combo.blockSignals(True)
+            current = combo.currentText()
+            combo.clear()
+            combo.addItems(ids)
+            if current in ids:
+                combo.setCurrentText(current)
+            combo.blockSignals(False)
 
     def _build_review_tab(self):
         box = QWidget()
@@ -3093,7 +3268,8 @@ class MainWindow(QMainWindow):
             self._pending_action = None   # a failed save never continues a
             self._pending_root = None     # deferred transition
             if getattr(value, "collision", False) and \
-                    self._op_kind in ("import", "scenes_generate"):
+                    self._op_kind in ("import", "scenes_generate",
+                                      "compress_generate"):
                 if self._op_kind == "scenes_generate":
                     pick = self._choice(
                         "Replace drafted scenes?",
@@ -3107,6 +3283,9 @@ class MainWindow(QMainWindow):
                     else:
                         self._status("Force declined; no request was made "
                                      "and no scene or tree file changed.")
+                    return
+                if self._op_kind == "compress_generate":
+                    self._on_compress_collision(value)
                     return
                 self._on_import_collision(value)
                 return
@@ -3411,6 +3590,7 @@ class MainWindow(QMainWindow):
         elif kind == "continuity_generate" and isinstance(value, dict):
             self._cont = {"prep": value["prep"], "raw": value["raw"],
                           "finish": value["finish"], "secs": None,
+                          "kind": value.get("kind", "update"),
                           "dirty": False}
             self._cont_editing = None
             parsed = ro.update_state_parse_response(value["raw"],
@@ -3424,6 +3604,16 @@ class MainWindow(QMainWindow):
             else:
                 self._status("Continuity preview ready; nothing is written "
                              "until you press Accept.")
+        elif kind == "compress_generate" and isinstance(value, dict):
+            self._cont = {"kind": "compress", "prep": value["prep"],
+                          "raw": value["text"], "text": value["text"],
+                          "ok": value["ok"], "secs": None, "dirty": False}
+            self._cont_editing = None
+            self._update_continuity_view()
+            self._status("Arc preview ready"
+                         + ("" if value["ok"] else "; warning: no <summary> "
+                            "tags in the output; check it for stray text")
+                         + "; nothing is written until you press Accept.")
         elif kind == "continuity_input" and isinstance(value, dict):
             if self._cont is not None:
                 self._cont_after_edit(self.continuity_edit.toPlainText())
@@ -3435,6 +3625,12 @@ class MainWindow(QMainWindow):
             self.refresh(force=True)
             self._update_continuity_view()
             self._status(f"{value['message']} ({value['scene']})")
+        elif kind == "compress_accept" and isinstance(value, dict):
+            self._cont = None
+            self._cont_editing = None
+            self.refresh(force=True)
+            self._update_continuity_view()
+            self._status(value["message"])
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""

@@ -30,11 +30,11 @@ def normalize(text):
 
 
 def snapshot(root):
-    """Every saved file under root, bytes normalized; calls.jsonl excluded."""
+    """Every saved file under root, bytes and names normalized."""
     out = {}
     for f in sorted(Path(root).rglob("*")):
         if f.is_file() and f.name != "calls.jsonl" and f.suffix != ".tmp":
-            out[str(f.relative_to(root))] = normalize(
+            out[normalize(str(f.relative_to(root)))] = normalize(
                 f.read_text(encoding="utf-8"))
     return out
 
