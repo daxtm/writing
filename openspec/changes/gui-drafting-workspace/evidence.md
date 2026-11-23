@@ -53,3 +53,30 @@ E       assert []
   building a throwaway prompt; the adapter now validates at the first
   generation/inspection, so a die for unreadable sources can appear slightly
   later in the transcript (valid projects are byte-identical).
+
+## 1.3 — worker barriers, cooperative Stop, safe close, stale refusal
+
+- Headless (`tests/test_cancel_and_stale.py`, 8 tests, written first and green
+  against the seams — they are the deterministic barrier cases): cancel before
+  request (no call/save), cancel during a blocked stream chunk (distinct
+  Cancelled, no partial node), cancel at the save boundary (nothing commits),
+  external source change during the request (stale refusal, external change
+  preserved), Api token interrupting retry backoff (<1.5s wake, no second
+  request), Api token aborting a blocked stream, `Api.many` never swallowing
+  cancellation as a candidate failure, repeated Stop idempotent plus
+  shortfall reporting.
+- Offscreen (written first, red run):
+```
+AttributeError: 'NoneType' object has no attribute 'set'
+2 Qt widget case(s) failed: case_draft_stop_and_close, case_draft_stale_refusal
+```
+  (the close-during-work dialog and settlement path did not exist yet).
+- After implementing closeEvent Stop-and-wait/Keep-open, `_wait_for_settlement`
+  (pumped events, never a blocking join or thread kill) and busy-state write
+  disabling: `case_draft_stop_and_close` proves Stop at a chunk boundary saves
+  nothing, repeated Stop is safe, conflicting writes are disabled while
+  working, late payloads of superseded operations are ignored, Keep open
+  preserves the running job without cancelling, and Stop and wait settles then
+  closes; `case_draft_stale_refusal` proves stale refusal with recovery
+  guidance, dirty local text retained and no partial commit.
+- Full suite: 234 passed.

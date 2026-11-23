@@ -772,10 +772,108 @@ def case_draft_midstream_failure(root):
     win.close()
 
 
+def case_draft_stop_and_close(root):
+    """Stop settles cooperatively at a chunk boundary; conflicting writes are
+    disabled while working; close offers Stop and wait / Keep open; late
+    signals from superseded operations are ignored."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(root)
+    fake = FakeProvider()
+    answers = []
+    win = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.count_spin.setValue(1)
+
+    fake.gate = threading.Event()
+    win.generate_btn.click()
+    assert _pump(a, lambda: "First chunk." in win.preview.toPlainText())
+    assert not win.save_btn.isEnabled() and not win.clear_btn.isEnabled(), \
+        "conflicting writes are disabled while an operation runs"
+    assert not win.generate_btn.isEnabled()
+    win.stop_btn.click()
+    win.stop_btn.click()          # repeated Stop is safe/idempotent
+    assert "Stopping" in win.status.text()
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert set(t["nodes"]) == {"n1"} and t["head"] == "n1", \
+        "stopped partial output is never saved"
+    assert win.generate_btn.isEnabled(), "controls return after settlement"
+    assert "not saved" in win.status.text().lower() or "stopped" in win.status.text().lower()
+
+    # late payloads of a superseded operation never rebind the view
+    stale_op = win._op_id + 7
+    win._on_worker_event(stale_op, {"type": "delta", "text": "LATE TEXT"})
+    assert "LATE TEXT" not in win.preview.toPlainText()
+    win._on_worker_done(stale_op, "ok", object())
+    assert not win._busy
+
+    # close while working: Keep open preserves the running job, cancels nothing
+    win.generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 2)
+    answers.append("Keep open")
+    win.close()
+    assert win.isVisible(), "Keep open keeps the window and the job"
+    assert win._busy and fake.started == 2, "Keep open does not cancel"
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+
+    # close while working again: Stop and wait cancels, settles, then closes
+    win.generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 3)
+    answers.append("Stop and wait")
+    win.close()
+    assert _pump(a, lambda: not win._busy), "Stop and wait settles"
+    assert "stopping" in win.status.text().lower() or win._token.cancelled
+    assert _pump(a, lambda: not win.isVisible()), "closes only after settlement"
+
+
+def case_draft_stale_refusal(root):
+    """An external change during the request refuses the save, keeps dirty
+    local text and offers recovery."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(root)
+    fake = FakeProvider()
+    win = gw.MainWindow(str(project), choice=_no_dialogs("stale"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.count_spin.setValue(1)
+    fake.gate = threading.Event()
+    win.generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 1)
+
+    # an external writer changes the tree while the request runs
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    t["nodes"]["n7"] = {"id": "n7", "parent": "n1", "text": "external change",
+                        "created": "x", "history": [], "sep": "\n\n"}
+    _write_json(project / "trees" / "s001.json", t)
+
+    win.steer_editor.setPlainText("unsaved during work")   # dirty local text
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    assert "reload" in win.status.text().lower(), "stale refusal offers recovery"
+    got = json.loads((project / "trees" / "s001.json").read_text())
+    assert "n2" not in got["nodes"], "the stale candidate is not committed"
+    assert got["nodes"]["n7"]["text"] == "external change"
+    assert win.steer_editor.toPlainText() == "unsaved during work", \
+        "dirty local text is retained"
+    assert win.generate_btn.isEnabled()
+    win.steer_editor.setPlainText("")   # leave clean; no dialog on close
+    win.close()
+    assert not win.isVisible()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
     "case_draft_midstream_failure": case_draft_midstream_failure,
+    "case_draft_stop_and_close": case_draft_stop_and_close,
+    "case_draft_stale_refusal": case_draft_stale_refusal,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,

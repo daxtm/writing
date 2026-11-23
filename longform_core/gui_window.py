@@ -704,6 +704,15 @@ class MainWindow(QMainWindow):
             self._status("Stopping — waiting for the active request to "
                          "settle (bounded by its configured timeout)…")
 
+    def _wait_for_settlement(self):
+        """Pump GUI events until the worker settles (never a blocking join,
+        never a thread kill). Bounded loop; the operation itself is bounded by
+        the configured request timeouts."""
+        guard = 0
+        while self._busy and guard < 200000:
+            QApplication.processEvents()
+            guard += 1
+
     def _reading_text(self):
         kind, tree_id, node_id = self._sel_data or (None, None, None)
         if self.snap is None:
@@ -931,12 +940,24 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev):
         if self._busy:
-            # Full Stop-and-wait / Keep-open handling arrives with the worker
-            # hardening task; until then closing during work is refused safely.
-            ev.ignore()
-            self._status("An operation is running; Stop it (or wait for it to "
-                         "settle) before closing.", error=True)
-            return
+            pick = self._choice(
+                "Operation running",
+                "A draft operation is running on the worker.\n\n"
+                "Stop and wait requests a cooperative Stop and closes only "
+                "after the worker settles. Keep open leaves the window and "
+                "the job running.",
+                ["Stop and wait", "Keep open"])
+            if pick != "Stop and wait":
+                ev.ignore()
+                self._status("Kept open; the operation continues. Close again "
+                             "to Stop and wait.")
+                return
+            self._token.cancel()
+            self._status("Stopping — waiting for the operation to settle…")
+            self._wait_for_settlement()
+            if self._busy:
+                ev.ignore()
+                return
         if self._scene_sel is not None and self.dirty():
             pick = self._choice(
                 "Unsaved steering",
