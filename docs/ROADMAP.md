@@ -33,9 +33,13 @@ The Qt reading/steering shell is implemented but unshipped on
 Do not confuse that branch with `origin/main`. Its existing
 `openspec/changes/gui-wayland-shell/` records the shell, not working generation.
 The complete draft loop is implemented on this branch (real drafting Wayland
-acceptance remains pending). The owner has now selected milestone 2:
-`openspec/changes/gui-project-planning/` is proposed, not implemented.
-Do not create the continuity/review/export change directory yet.
+acceptance remains pending). Milestone 2 is now implemented on this branch:
+`openspec/changes/gui-project-planning/` has its eight tasks landed
+(Create/Open through saved scene cards, offline parity and offscreen journey
+coverage; real Wayland Create-to-scene acceptance recorded as PENDING in
+`openspec/changes/gui-project-planning/evidence.md`). Milestone 3
+(continuity/review/export) is not selected for build yet; do not create that
+change directory.
 
 The existing `cmd_*` commands already implement the rules. Fix/extract those
 boundaries, keeping CLI adapters and reusing `Project`, `Tree`, `Lore`, prompt/
@@ -85,7 +89,7 @@ This demonstrates drafting only, not setup-to-export GUI completion.
 
 ## GUI milestone 2 — Setup and planning
 
-- [ ] gui-project-planning — Selected/proposed, not implemented: Create/Open and init, preset import, models/roles/settings, limits, bible sections/answers/history, outline notes/N candidates/reroll/choice/edit and scene generation/view/edit/replace confirmation.
+- [x] gui-project-planning — Implemented on `feat/gui-wayland-shell` (unshipped; real Wayland acceptance PENDING): Create/Open and init, preset import, models/roles/settings, explicit limits fetch, bible sections/answers/history, outline notes/N candidates/reroll/choice/edit, scene generation/view/edit/replace confirmation and saved-card editing.
 
 Depends on drafting workspace; this is remaining change 2, not a draft-controls
 follow-up. Use existing initialization and validation/non-overwrite behavior,
@@ -102,6 +106,17 @@ choose models/preset, fetch limits, fill bible sections, generate/re-roll/select
 an outline, generate/edit/accept scenes and enter the complete drafting loop.
 The same offline temporary-project/fake-provider test compares CLI prompts and
 saved outputs; no terminal prompts or external editors.
+
+Implemented (tasks 1.1–1.8 on `feat/gui-wayland-shell`): the offscreen journey
+`case_planning_journey` runs missing-DIR → Create → preset import → settings →
+explicit limits fetch (fake Api) → bible answers/accept → outline
+generate/reroll/choose → scenes generate/edit/accept → Draft selection →
+reopen with no terminal/editor helper and no implicit provider request.
+CLI/GUI parity is frozen at the file/prompt/history level for init, bible,
+outline and scenes (`tests/test_planning_ops.py`); `limits.json` matches the
+CLI shape modulo `fetched`. Real Wayland Create-to-scene acceptance
+(pickers/forms/keyboard/scaling/themes/Stop/close) is recorded as PENDING in
+`openspec/changes/gui-project-planning/evidence.md`.
 
 ## GUI milestone 3 — Continuity, review, revision, status and export
 

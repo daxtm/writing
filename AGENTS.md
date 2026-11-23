@@ -44,11 +44,20 @@ unshipped. `openspec/changes/gui-drafting-workspace/` is now implemented on
 (`longform_core.draft_operations`), one worker (`longform_core.draft_worker`),
 cooperative Stop, stale-write refusal, and CLI adapters with byte-identical
 transcripts; real Wayland acceptance for drafting remains pending
-(`evidence.md`). Planning (`openspec/changes/gui-project-planning/`) is now
-selected and proposed for milestone 2: Create/Open through scene-ready setup,
-settings/limits, bible, outline and scene cards; no planning code is implemented
-by the proposal. Continuity/review/export (`gui-continuity-review-export`)
-remains future — do not create or implement that change yet.
+(`evidence.md`). `openspec/changes/gui-project-planning/` is now implemented on
+`feat/gui-wayland-shell`: Create/Open with create-missing-only init and
+validated preset import, the supported nonsecret settings form with explicit
+Fetch limits (credential name/availability only), bible forms/section
+acceptance/direct edits/history, outline notes/competing
+candidates/choose/edit, scene generation/previews/confirmed replacement and
+saved-card editing — all through shared Qt-independent
+`longform_core.planning_operations` on the one worker; the offscreen
+Create-to-scene journey (`case_planning_journey`) is green and CLI/GUI
+parity is frozen in `tests/test_planning_ops.py`; real Wayland
+Create-to-scene acceptance is recorded as PENDING in the change's
+`evidence.md`. Planning is unshipped. Continuity/review/export
+(`gui-continuity-review-export`) remains future — do not create or
+implement that change yet.
 Full completion requires setup through export, all draft actions, offline
 CLI/GUI parity and separate real Wayland acceptance; this plan does not authorize shipping.
 ADR-0004/0005 (integrated from the reader baseline; 0005 superseded by ADR-0006)
@@ -62,7 +71,7 @@ switching, and mouse/keyboard work remain an owner acceptance step.
 
 ## Layout
 - `longform.py`: thin PEP 723 launcher; re-exports the package's public names so `import longform` keeps working.
-- `longform_core/`: the implementation — `config` (constants, default config, templates), `utils` (logging, file/JSON/text, diff/parse helpers), `project`, `api`, `tree`, `lore` (cards/books/matching), `prompt`, `checks`, `commands` (cmd_* and interactive helpers), `cli` (argparse/main); `reader_model` (UI-independent sanitized snapshots), `scene_steering` (Qt-independent per-scene steering write adapter), `gui` (Qt-free Wayland startup policy/dispatch), `gui_window` (PySide6 Qt Widgets shell).
+- `longform_core/`: the implementation — `config` (constants, default config, templates), `utils` (logging, file/JSON/text, diff/parse helpers), `project`, `api`, `tree`, `lore` (cards/books/matching), `prompt`, `checks`, `commands` (cmd_* and interactive helpers), `cli` (argparse/main); `reader_model` (UI-independent sanitized snapshots), `scene_steering` (Qt-independent per-scene steering write adapter), `planning_operations` (Qt-independent init/settings/limits/bible/outline/scenes operations), `gui` (Qt-free Wayland startup policy/dispatch), `gui_window` (PySide6 Qt Widgets shell).
 - `scripts/`: check entry point; `tests/`: offline pytest suite (headless model/CLI tests plus `tests/qt_widget_cases.py`, the offscreen Qt widget subprocess cases launched by `tests/test_qt_cases.py`).
 - `openspec/`: behavior specs and changes; `docs/`: roadmap and ADRs.
 - `.github/`: PR template; `myfic/`: private generated sample, never a test fixture.
