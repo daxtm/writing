@@ -233,6 +233,7 @@ def compose_writer_prompt(inp):
         f"Write this scene as prose from {inp.char}'s point of view, following the POV, tense and style rules in the scenario. "
         + ("Continue from exactly where the text leaves off" if inp.continuing else "Begin the scene")
         + f", about {inp.passage_words} words. Never repeat what is already written. Stay inside this scene. "
+        "Stop near the requested length even if the scene is not finished; the next passage will continue it. "
         "When the scene's outcome has been reached, finish at a natural stopping point and write [SCENE END] on its own line."
     )
     author = inp.mac("\n\n".join(a))
@@ -312,6 +313,13 @@ def build_writer_prompt(p, preset, lore, scenes, idx, tree, steer, passage_words
     if max_comp and max_tokens > max_comp:
         notes.append(f"genamt {max_tokens} clamped to model max_completion {max_comp}")
         max_tokens = max_comp
+    if passage_words:
+        # A hard cap, not just the prompt sentence: presets often allow thousands of
+        # tokens, which lets one swipe run to the end of the scene.
+        length_cap = max(64, int(passage_words * 1.6))
+        if max_tokens > length_cap:
+            notes.append(f"max_tokens {max_tokens} capped to {length_cap} for a ~{passage_words}-word passage")
+            max_tokens = length_cap
     params["max_tokens"] = max_tokens
     avail = int(ceil * (1 - float(p.cfg["context_safety_margin"]))) - max_tokens
     rb, sb = int(B["recent"]), int(B["summary"])
