@@ -35,6 +35,8 @@ class ReaderApp:
         self.stale = False
         self._selected_scene = None
         self._selected_node = None
+        self._node_by_iid = {}
+        self._iid_by_node = {}
         self._after_id = None
         # rebuild spies for tests: unchanged panes must not be rebuilt
         self.rebuilds = {"scene_list": 0, "manuscript": 0, "branches": 0,
@@ -102,9 +104,34 @@ class ReaderApp:
 
         br = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(br, text=BRANCHES_TAB)
-        self.branches_placeholder = ttk.Label(
-            br, text="(branch index appears when a scene is selected)")
-        self.branches_placeholder.pack(fill="both", expand=True)
+        self.branches_pane = ttk.PanedWindow(br, orient="vertical")
+        self.branches_pane.pack(fill="both", expand=True)
+        index_frame = ttk.Frame(self.branches_pane)
+        self.branches_pane.add(index_frame, weight=2)
+        self.branch_tree = ttk.Treeview(
+            index_frame, columns=("parent", "words", "source", "created", "marker"),
+            selectmode="browse", show="tree headings")
+        self.branch_tree.heading("#0", text="Node")
+        self.branch_tree.heading("parent", text="Parent")
+        self.branch_tree.heading("words", text="Words")
+        self.branch_tree.heading("source", text="Source")
+        self.branch_tree.heading("created", text="Created")
+        self.branch_tree.heading("marker", text="Marker")
+        self.branch_tree.column("#0", width=170, stretch=False)
+        self.branch_tree.column("parent", width=90, stretch=False)
+        self.branch_tree.column("words", width=70, stretch=False)
+        self.branch_tree.column("created", width=170, stretch=False)
+        bsb = ttk.Scrollbar(index_frame, orient="vertical",
+                            command=self.branch_tree.yview)
+        self.branch_tree.configure(yscrollcommand=bsb.set)
+        self.branch_tree.pack(side="left", fill="both", expand=True)
+        bsb.pack(side="right", fill="y")
+        self.branch_tree.bind("<<TreeviewSelect>>", self._on_node_select)
+        self.branch_scroll = bsb
+        detail_frame = ttk.Frame(self.branches_pane)
+        self.branches_pane.add(detail_frame, weight=3)
+        self.branch_detail = self._make_text(detail_frame)
+        self._text_scrollbar(detail_frame, self.branch_detail)
 
         notes = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(notes, text=NOTES_TAB)
@@ -263,18 +290,162 @@ class ReaderApp:
 
     # ------------------------------------------------------------ branches/notes
 
-    def _populate_branches(self):
-        pass
+    BRANCH_GROUPS = ("Active path", "Saved branches", "Unlinked/invalid links")
 
-    def branches_text(self):
-        return ""
+    def _populate_branches(self):
+        self.rebuilds["branches"] += 1
+        tree = self.branch_tree
+        tree.delete(*tree.get_children())
+        self._node_by_iid = {}
+        self._iid_by_node = {}
+        view = self._scene_view()
+        if view is None:
+            self._selected_node = None
+            self._populate_branch_detail()
+            return
+        sid = self._selected_scene
+        buckets = {g: [] for g in self.BRANCH_GROUPS}
+        for nid in view.order:
+            info = view.nodes.get(nid)
+            if info is None:
+                continue
+            if info.on_active_path:
+                buckets["Active path"].append(nid)
+            elif info.link_ok:
+                buckets["Saved branches"].append(nid)
+            else:
+                buckets["Unlinked/invalid links"].append(nid)
+        for group in self.BRANCH_GROUPS:
+            nids = buckets[group]
+            if not nids:
+                continue
+            gid = f"b:{sid}:{group}"
+            tree.insert("", "end", iid=gid, text=group, open=True,
+                        values=("", "", "", "", ""))
+            placed = set()
+            by_parent = {}
+            for nid in nids:
+                by_parent.setdefault(view.nodes[nid].parent, []).append(nid)
+            nids_set = set(nids)
+            roots = [n for n in nids if view.nodes[n].parent not in nids_set]
+            stack = [(None, nid) for nid in reversed(roots)]
+            while stack:
+                parent_iid, nid = stack.pop()
+                if nid in placed:
+                    continue
+                placed.add(nid)
+                info = view.nodes[nid]
+                marker = ("head" if nid == view.head else
+                          "active" if info.on_active_path else "")
+                iid = f"n:{sid}:{nid}"
+                self._node_by_iid[iid] = nid
+                self._iid_by_node[nid] = iid
+                tree.insert(parent_iid or gid, "end", iid=iid, text=nid,
+                            values=(info.parent or "(start)", info.word_count,
+                                    info.source or "(unavailable)",
+                                    info.created or "(unavailable)", marker))
+                stack.extend((iid, k) for k in reversed(info.children)
+                             if k in nids_set)
+        # default detail: current head, else first saved node
+        if self._selected_node not in view.nodes:
+            self._selected_node = view.head if view.head in view.nodes else \
+                (view.order[0] if view.order else None)
+        self._populate_branch_detail()
+
+    def _on_node_select(self, _event=None):
+        sel = self.branch_tree.selection()
+        if not sel or not sel[0].startswith("n:"):
+            return
+        self.select_node(self._node_by_iid[sel[0]])
 
     def select_node(self, nid):
-        pass
+        view = self._scene_view()
+        if view is None or nid not in view.nodes:
+            return
+        if nid == self._selected_node:
+            return
+        self._selected_node = nid
+        self._populate_branch_detail()
+
+    def _populate_branch_detail(self):
+        view = self._scene_view()
+        nid = self._selected_node
+        if view is None or nid is None or nid not in view.nodes:
+            self._set_text(self.branch_detail, "(no node selected)")
+            return
+        info = view.nodes[nid]
+        lines = [f"ID: {nid}",
+                 f"parent: {info.parent if info.parent is not None else '(scene start)'}",
+                 "children: " + (", ".join(info.children) if info.children else "(none)"),
+                 f"source: {info.source if info.source is not None else '(unavailable)'}",
+                 f"model: {info.model if info.model is not None else '(unavailable)'}",
+                 f"created: {info.created if info.created is not None else '(unavailable)'}",
+                 f"steer: {info.steer if info.steer is not None else '(unavailable)'}",
+                 f"ended: {info.ended if info.ended is not None else '(unavailable)'}",
+                 f"trimmed: {info.trimmed if info.trimmed is not None else '(unavailable)'}"]
+        if info.history:
+            lines.append("")
+            lines.append("history:")
+            for h in info.history:
+                lines.append(f"[{h['time']} by {h['by']}]")
+                lines.append(h["text"])
+        lines.append("")
+        lines.append("text:")
+        lines.append(info.text)
+        self._set_text(self.branch_detail, "\n".join(lines))
+
+    def branches_text(self):
+        return self.branch_detail.get("1.0", "end-1c")
+
+    def branch_index_ids(self):
+        """Every node ID listed in the Branches index for the selected scene."""
+        return sorted(self._iid_by_node)
+
+    # ---- notes
 
     def _populate_notes(self):
         self.rebuilds["notes"] += 1
-        self._set_text(self.notes, "")
+        snap = self.snapshot
+        if snap is None:
+            self._set_text(self.notes, "(no project data)")
+            return
+        notes = snap.notes
+        out = []
+        out.append("== bible.md ==")
+        out.append(notes.bible if notes.bible is not None else "(absent)")
+        out.append("")
+        out.append("== state.md ==")
+        out.append(notes.state if notes.state is not None else "(absent)")
+        out.append("")
+        out.append("== Scene summaries ==")
+        if notes.summaries and notes.summaries.scenes:
+            for sid in sorted(notes.summaries.scenes):
+                e = notes.summaries.scenes[sid]
+                out.append(f"-- {sid}" +
+                           (f" (updated {e.updated})" if e.updated else ""))
+                out.append(f"detailed: {e.detailed if e.detailed is not None else '(unavailable)'}")
+                out.append(f"brief: {e.brief if e.brief is not None else '(unavailable)'}")
+        else:
+            out.append("(no scene summaries)")
+        out.append("")
+        out.append("== Arc summaries ==")
+        if notes.summaries and notes.summaries.arcs:
+            for a in notes.summaries.arcs:
+                out.append(f"-- {a.from_id}–{a.to_id}" +
+                           (f" (updated {a.updated})" if a.updated else ""))
+                out.append(a.text)
+        else:
+            out.append("(no arc summaries)")
+        for label, files in (("checks/", notes.checks), ("critiques/", notes.critiques)):
+            out.append("")
+            out.append(f"== {label} ==")
+            if files:
+                for f in files:
+                    out.append(f"-- {f.name}")
+                    out.append(f.text)
+            else:
+                out.append("(no reports)")
+        self._set_text(self.notes, "\n".join(out))
 
     def notes_text(self):
         return self.notes.get("1.0", "end-1c")
