@@ -1,6 +1,15 @@
 # Fully pinned build dependency closure for scripts/build-standalone.sh.
 # Build-only: never added to the PEP 723 runtime dependencies of longform.py.
 # Resolved with `uv pip compile --python-version 3.11` on 2026-11-23.
+#
+# GUI: PySide6-Essentials provides the PySide6 package and the QtCore/QtGui/
+# QtWidgets modules the source workspace imports. The pyside6 meta package
+# would add PySide6-Addons (WebEngine, PDF, ...), which this application does
+# not import; pinning Essentials keeps the frozen artifact bounded while
+# staying inside the source launcher's `pyside6>=6.12.0,<6.13` range.
+# PySide6 6.12.0 wheels require manylinux_2_34 (glibc 2.34+).
+pyside6-essentials==6.12.0
+shiboken6==6.12.0
 altgraph==0.17.5
 anyio==4.16.0
 certifi==2026.11.20

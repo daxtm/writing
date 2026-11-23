@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from .prompt import tail_trim_chars
 from .utils import word_diff
+from .gui import launch_advice
 from . import draft_operations as dop
 from . import planning_operations as plan
 from . import reader_model as rm
@@ -31,10 +32,10 @@ from .cancel import CancellationToken
 from .draft_worker import OpThread
 from .reader_model import SourceCache
 
-PRE_START_GUIDANCE = (
-    "longform gui: native Wayland is required. If startup fails, check your "
-    "Wayland desktop session/socket and the Qt Wayland/system libraries, then "
-    "retry: QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR")
+def pre_start_guidance():
+    return ("longform gui: native Wayland is required. If startup fails, check your "
+            "Wayland desktop session/socket and the Qt Wayland/system libraries, then "
+            f"retry: {launch_advice()}")
 
 REFRESH_MS = 2000
 
@@ -55,7 +56,7 @@ def run(dir_path):
     """Create, show, and run one project window; blocks until it closes."""
     # Flushed before QApplication construction: a platform-plugin abort below
     # ordinary Python error handling still leaves recovery advice on stderr.
-    print(PRE_START_GUIDANCE, file=sys.stderr, flush=True)
+    print(pre_start_guidance(), file=sys.stderr, flush=True)
     app = QApplication(sys.argv or ["longform gui"])
     from PySide6.QtCore import qVersion
     import PySide6
@@ -65,8 +66,7 @@ def run(dir_path):
         print(f"gui: Qt initialized platform '{app.platformName()}' instead of "
               f"'wayland'; native Wayland is required (no fallback window). "
               "Check the Wayland session/socket and Qt Wayland libraries, "
-              "then retry: QT_QPA_PLATFORM=wayland uv run --script longform.py "
-              "gui DIR", file=sys.stderr, flush=True)
+              f"then retry: {launch_advice()}", file=sys.stderr, flush=True)
         return 1
     window = MainWindow(dir_path)
     window.show()

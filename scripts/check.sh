@@ -5,9 +5,11 @@
 # processes are network-guarded and must never reach it.
 #   1. Python syntax of the CLI.
 #   2. CLI smoke test (imports httpx, parses args) when uv is available.
-#   3. Standalone: build the native executable (provisioning build deps through
-#      scripts/build-standalone.sh) and run the frozen-process tests. Requires
-#      uv and a C compiler for the test-only native network guard; never skipped.
+#   3. Standalone: build the native executable once (provisioning build deps
+#      through scripts/build-standalone.sh) and run the frozen-process tests,
+#      including the frozen GUI discovery/archive/startup-policy coverage.
+#      Requires uv and a C compiler for the test-only native network guard;
+#      never skipped.
 #   4. Source regression suite (offline; frozen executable tests are excluded
 #      here because they already ran in step 3 against the built artifact).
 set -euo pipefail

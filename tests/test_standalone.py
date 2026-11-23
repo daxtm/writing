@@ -37,6 +37,7 @@ NET_DENIAL_MARKER = "LONGFORM-NETWORK-DENIED"
 
 CREDENTIAL_VARS = ("FEATHERLESS_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 TRUST_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE")
+DISPLAY_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET", "QT_QPA_PLATFORM")
 PYTHON_VARS = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONOPTIMIZE",
                "PYTHONWARNINGS", "PYTHONUSERBASE", "PYTHONNOUSERSITE", "PYTHONUNBUFFERED")
 
@@ -246,6 +247,8 @@ def frozen_env(root: Path, guard: Path, extra=None) -> dict:
     }
     for var in CREDENTIAL_VARS + TRUST_VARS + PYTHON_VARS:
         env[var] = ""
+    for var in DISPLAY_VARS:
+        env.pop(var, None)
     env.update(extra or {})
     return env
 
@@ -262,10 +265,20 @@ def assert_no_denial(proc):
         f"native network guard denied something during a frozen run:\n{blob}")
 
 
+def _disable_core_dumps():
+    """Qt aborts at native plugin failure; tests do not need core files."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except Exception:
+        pass
+
+
 def run_frozen(binary: Path, args, env, cwd=None, stdin=None, timeout=300):
     tmp_dir = Path(env["TMPDIR"])
     proc = subprocess.run([str(binary), *args], env=env, cwd=cwd, input=stdin,
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, timeout=timeout,
+                          preexec_fn=_disable_core_dumps)
     assert_no_denial(proc)
     check_clean_extraction(tmp_dir)
     return proc
@@ -322,6 +335,8 @@ def built(tmp_path_factory, net_guard):
     venv_py = REPO / "build" / "standalone" / "venv" / "bin" / "python"
     inputs = [BUILD_SCRIPT, REPO / "scripts" / "standalone-requirements.txt", REPO / "longform.py"]
     inputs += sorted((REPO / "longform_core").glob("*.py"))
+    inputs += [REPO / "scripts" / "standalone_sidecars.py"]
+    inputs += sorted((REPO / "scripts" / "standalone-licenses").glob("*"))
     fresh = (exe.is_file() and venv_py.is_file()
              and all(p.stat().st_mtime_ns <= exe.stat().st_mtime_ns for p in inputs))
     if not fresh:
@@ -351,7 +366,21 @@ def built(tmp_path_factory, net_guard):
 # ---------------------------------------------------------------------------
 
 EXPECTED_COMMANDS = ("init", "limits", "bible", "outline", "scenes", "draft", "update-state",
-                     "compress", "critique", "check", "revise", "status", "export")
+                     "compress", "critique", "check", "revise", "status", "export", "gui")
+
+GUI_APPLICATION_MODULES = (
+    "longform_core.gui", "longform_core.gui_window", "longform_core.draft_operations",
+    "longform_core.planning_operations", "longform_core.review_operations",
+    "longform_core.draft_worker", "longform_core.reader_model", "longform_core.scene_steering",
+    "PySide6", "shiboken6",
+)
+
+# PySide6's Qt bindings and Shiboken are native extension modules: PyInstaller
+# stores them in the CArchive, not the PYZ.
+GUI_NATIVE_BINDINGS = (
+    "PySide6/QtCore.abi3.so", "PySide6/QtGui.abi3.so", "PySide6/QtWidgets.abi3.so",
+    "shiboken6/Shiboken.abi3.so",
+)
 
 
 def test_copied_binary_runs_help_without_python_uv_or_checkout(built, tmp_path):
@@ -382,6 +411,30 @@ def test_copied_binary_init_creates_project_files(built, tmp_path):
         assert (proj / d).is_dir(), d
     cfg = json.loads((proj / "project.json").read_text(encoding="utf-8"))
     assert cfg["title"] == "Untitled"
+
+
+def test_copied_binary_headless_cli_without_display_variables(built, tmp_path):
+    """help/init/status/export must not need a display, Qt or Wayland: the
+    frozen CLI keeps working when every display variable is absent."""
+    work = tmp_path / "headless caller cwd"
+    work.mkdir()
+    proj = tmp_path / "headless project"
+    env = frozen_env(tmp_path, built.guard_so)
+    for var in DISPLAY_VARS:
+        assert var not in env, f"{var} leaked into the headless environment"
+    r = run_frozen(built.copied, ["--help"], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert "gui" in r.stdout
+    r = run_frozen(built.copied, ["init", str(proj)], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert (proj / "project.json").is_file()
+    r = run_frozen(built.copied, ["status", str(proj)], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    out = work / "headless export.md"
+    r = run_frozen(built.copied, ["export", str(proj), "--out", str(out)],
+                   env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert out.is_file() and out.read_text(encoding="utf-8").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -446,10 +499,114 @@ def test_archive_contains_runtime_modules_ssl_and_ca_data(archive_contents):
     assert "BEGIN CERTIFICATE" in archive_contents["cacert_head"]
 
 
+def test_archive_contains_gui_application_modules(archive_contents):
+    """The frozen executable must contain the GUI dispatch, window, shared
+    operations and the Qt bindings it imports -- not only the CLI closure."""
+    pyz = archive_contents["pyz"]
+    for mod in GUI_APPLICATION_MODULES:
+        assert mod in pyz, f"GUI module {mod} not bundled in the PYZ archive"
+
+
+def test_archive_contains_qt_runtime_and_wayland_plugins(archive_contents):
+    """Qt native libraries and the native Wayland platform plugin must be in
+    the archive; a CLI-only executable cannot satisfy this."""
+    carchive = archive_contents["carchive"]
+    for binding in GUI_NATIVE_BINDINGS:
+        assert binding in carchive, f"Qt/Shiboken binding {binding!r} not bundled"
+    for fragment in ("libQt6Core.so", "libQt6Gui.so", "libQt6Widgets.so",
+                     "libQt6WaylandClient.so", "libshiboken6"):
+        assert any(fragment in n for n in carchive), \
+            f"Qt/Shiboken native component {fragment!r} not bundled"
+    wayland_plugins = [n for n in carchive
+                       if "PySide6/Qt/plugins/platforms/" in n and "qwayland" in n]
+    assert wayland_plugins, \
+        "no Wayland platform plugin bundled under PySide6/Qt/plugins/platforms/"
+
+
 def test_archive_contains_no_private_or_test_inputs(archive_contents):
     names = archive_contents["carchive"] + archive_contents["pyz"]
     for fragment in FORBIDDEN_ARCHIVE_FRAGMENTS:
         assert not any(fragment in n for n in names), f"private/test input {fragment!r} in bundle"
+
+
+# ---------------------------------------------------------------------------
+# GUI startup policy and recovery advice (standalone GUI)
+# ---------------------------------------------------------------------------
+
+REFUSED_PLATFORMS = ("xcb", "offscreen", "wayland,xcb", "wayland,offscreen")
+
+
+def project_snapshot(root):
+    return {p.relative_to(root).as_posix(): p.read_bytes()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.parametrize("platform", REFUSED_PLATFORMS)
+def test_frozen_gui_refuses_platforms_before_qt(built, tmp_path, platform):
+    """The copied executable refuses every non-Wayland platform before Qt
+    loads: no fallback window, no project writes, no uv advice."""
+    root = make_project(tmp_path / "frozen policy project")
+    before = project_snapshot(root)
+    env = frozen_env(tmp_path, built.guard_so, extra={"QT_QPA_PLATFORM": platform})
+    r = run_frozen(built.copied, ["gui", str(root)], env=env, cwd=tmp_path)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "native Wayland" in r.stderr
+    assert str(built.copied) in r.stderr, "advice must name the copied executable"
+    assert "uv run" not in r.stderr, "frozen advice must not require uv or source"
+    assert "gui DIR" in r.stderr
+    assert project_snapshot(root) == before, "refused GUI must not write project files"
+
+
+@pytest.mark.parametrize("platform", REFUSED_PLATFORMS)
+def test_source_gui_refuses_platforms_before_qt(built, tmp_path, platform):
+    root = make_project(tmp_path / "source policy project")
+    before = project_snapshot(root)
+    r = run_source(["gui", str(root)], root=tmp_path,
+                   extra_env={"QT_QPA_PLATFORM": platform})
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "native Wayland" in r.stderr
+    assert "uv run --script longform.py gui" in r.stderr
+    assert str(built.copied) not in r.stderr
+    assert project_snapshot(root) == before
+
+
+@pytest.mark.parametrize("platform", (None, "wayland"))
+def test_frozen_gui_missing_wayland_socket_gives_standalone_advice(
+        built, tmp_path, platform):
+    """With no Wayland socket the native plugin aborts after the flushed
+    pre-start guidance; the copied executable must point at itself, not uv."""
+    root = make_project(tmp_path / f"missing socket project {platform}")
+    before = project_snapshot(root)
+    runtime = tmp_path / f"isolated-runtime-{platform or 'unset'}"
+    runtime.mkdir()
+    extra = {"XDG_RUNTIME_DIR": str(runtime), "WAYLAND_DISPLAY": "missing-socket-0"}
+    if platform:
+        extra["QT_QPA_PLATFORM"] = platform
+    else:
+        extra["QT_QPA_PLATFORM"] = ""
+    env = frozen_env(tmp_path, built.guard_so, extra=extra)
+    r = run_frozen(built.copied, ["gui", str(root)], env=env, cwd=tmp_path, timeout=120)
+    assert r.returncode != 0, "GUI must fail when the Wayland socket is missing"
+    blob = r.stdout + r.stderr
+    assert "native Wayland is required" in blob
+    assert str(built.copied) in blob, "frozen guidance must name the copied executable"
+    assert "uv run" not in blob, "frozen guidance must not require uv or source"
+    assert project_snapshot(root) == before, "failed GUI startup must not write project files"
+
+
+@pytest.mark.parametrize("platform", (None, "wayland"))
+def test_source_gui_missing_wayland_socket_keeps_source_advice(built, tmp_path, platform):
+    root = make_project(tmp_path / f"source missing socket {platform}")
+    runtime = tmp_path / f"source-runtime-{platform or 'unset'}"
+    runtime.mkdir()
+    extra = {"XDG_RUNTIME_DIR": str(runtime), "WAYLAND_DISPLAY": "missing-socket-0",
+             "QT_QPA_PLATFORM": platform or ""}
+    r = run_source(["gui", str(root)], root=tmp_path, extra_env=extra, timeout=180)
+    assert r.returncode != 0
+    blob = r.stdout + r.stderr
+    assert "native Wayland is required" in blob
+    assert "uv run --script longform.py gui" in blob
+    assert str(built.copied) not in blob
 
 
 # ---------------------------------------------------------------------------
@@ -858,8 +1015,47 @@ def test_build_json_records_source_platform_interpreter_deps(built, build_json):
     import hashlib
     assert art["sha256"] == hashlib.sha256(built.exe.read_bytes()).hexdigest()
 
+    for name, version in (("pyside6-essentials", "6.12.0"), ("shiboken6", "6.12.0")):
+        actual = next((v for k, v in deps.items()
+                       if k.lower().replace("_", "-") == name), None)
+        assert actual == version, f"{name}: expected {version}, recorded {actual}"
 
-def test_third_party_notices_cover_bundled_licenses(built):
+
+def test_build_json_records_gui_versions_plugins_and_native_inspection(built, build_json):
+    """The sidecar records the actual GUI closure: binding/Qt versions, every
+    bundled plugin, and ldd results that separate bundled libraries from host
+    dependencies for the Qt/Wayland files."""
+    gui = build_json["gui"]
+    assert gui["pyside6"] == "6.12.0"
+    assert gui["shiboken6"] == "6.12.0"
+    assert re.fullmatch(r"6\.12\.\d+", gui["qt"]), gui["qt"]
+    assert gui["bindings_distribution"] == "pyside6-essentials"
+    assert "LGPL-3.0-only" in gui["license"]
+
+    inventory = gui["inventory"]
+    for binding in GUI_NATIVE_BINDINGS:
+        assert binding in inventory["bindings"], binding
+    assert any(n.startswith("PySide6/Qt/lib/libQt6Core.so") for n in inventory["libraries"].values())
+    assert any(n.startswith("PySide6/Qt/lib/libQt6WaylandClient.so")
+               for n in inventory["libraries"].values())
+    assert inventory["wayland_platform_plugins"], "no Wayland platform plugin recorded"
+    assert all("libqwayland" in n for n in inventory["wayland_platform_plugins"])
+    assert any("libxdg-shell" in n for n in inventory["wayland_shell_plugins"])
+    assert inventory["wayland_decoration_plugins"]
+    assert inventory["wayland_graphics_plugins"]
+    assert "PySide6/Qt/plugins/platforms/libqwayland.so" in inventory["plugins"]
+
+    native = gui["native_dependency_inspection"]
+    assert native["inspected"], "no native GUI files inspected"
+    assert any("libQt6Core.so" in entry for entry in native["inspected"])
+    assert any("libqwayland" in entry for entry in native["inspected"])
+    assert native["bundled"], "no bundled native dependencies detected"
+    assert "libwayland-client.so.0" in native["host"], \
+        "Wayland client library must stay a documented host dependency"
+    assert all(name for name in native["bundled"] + native["host"])
+
+
+def test_third_party_notices_cover_bundled_licenses(built, build_json):
     path = REPO / "dist" / "THIRD-PARTY-NOTICES.txt"
     if not path.is_file():
         pytest.fail("dist/THIRD-PARTY-NOTICES.txt missing; the build must record license texts")
@@ -871,6 +1067,16 @@ def test_third_party_notices_cover_bundled_licenses(built):
                           ("pyinstaller", "6.22.3"), ("pyinstaller-hooks-contrib", "2026.10")):
         assert f"{name} {version}  (" in text if version else f"{name} " in text, \
             f"license section for {name} missing"
+    gui = build_json["gui"]
+    assert f"PySide6 {gui['pyside6']}" in text
+    assert f"Shiboken6 {gui['shiboken6']}" in text
+    assert f"Qt {gui['qt']} native libraries" in text
+    assert "GNU LESSER GENERAL PUBLIC LICENSE" in text, "LGPLv3 text missing"
+    assert "GNU GENERAL PUBLIC LICENSE\nVersion 2, June 1991" in text, "GPLv2 text missing"
+    assert "GNU GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007" in text, "GPLv3 text missing"
+    assert "Bundled plugin inventory:" in text
+    for plugin in gui["inventory"]["wayland_platform_plugins"]:
+        assert plugin in text, f"bundled plugin {plugin} not listed in notices"
 
 
 def test_copied_binary_runs_without_sidecars(built, tmp_path):
