@@ -114,6 +114,11 @@ class MainWindow(QMainWindow):
         self._cont_editing = None    # None | "raw" | "sections"
         self._cont_history = False   # history view currently shown
         self._compress_ids = []      # last From/To choice population
+        self._report_preview = None  # generated critique/check preview
+        self._report_edit_target = None  # saved report being edited
+        self._report_edit_dirty = False
+        self._report_key = None      # selected report path
+        self._report_rows = []       # last report list paths
         self._plan = plan.project_overview(self._root)
 
         self.snap = None              # last valid Snapshot
@@ -1116,6 +1121,262 @@ class MainWindow(QMainWindow):
         l.addWidget(self.continuity_edit, 1)
         return box
 
+    # --------------------------------------------------------- review ops
+
+    def _report_edited(self):
+        if self._report_edit_target is not None:
+            self._report_edit_dirty = True
+
+    def _saved_reports(self):
+        out = []
+        if self.snap is None:
+            return out
+        n = self.snap.notes
+        for f_ in n.critiques:
+            name = f_.name[:-3] if f_.name.endswith(".md") else f_.name
+            out.append(("critiques", name, f"critiques/{name}.md", f_.text))
+        for f_ in n.checks:
+            name = f_.name[:-3] if f_.name.endswith(".md") else f_.name
+            out.append(("checks", name, f"checks/{name}.md", f_.text))
+        return out
+
+    def _resolve_report_dirty(self, what):
+        """Save/Discard/Cancel an open report editor before a transition."""
+        if self._report_edit_target is None or not self._report_edit_dirty:
+            return True
+        target = self._report_edit_target
+        pick = self._choice(
+            "Unsaved report edit",
+            f"The built-in report editor for {target['sub']}/{target['name']}"
+            f".md has unsaved changes. Save before {what}?",
+            ["Save", "Discard", "Cancel"])
+        if pick == "Save":
+            return self._report_save_edit_now() is not None
+        if pick == "Discard":
+            self._report_edit_dirty = False
+            return True
+        self._status("Cancelled; the edit is kept and nothing changed.")
+        return False
+
+    def _report_save_edit_now(self):
+        target = self._report_edit_target
+        text = self.report_edit.toPlainText()
+        try:
+            return ro.report_save_edit(self._root, target["sub"],
+                                       target["name"], text,
+                                       baseline=dict(target["baseline"]))
+        except ro.OpError as e:
+            self._status(str(e), error=True)
+            return None
+
+    def critique_scene(self):
+        """Critic request for the selected scene; the preview is unsaved
+        until Save report. Needs provider credentials."""
+        if self._busy:
+            self._status("An operation is running; review actions are paused "
+                         "until it settles.", error=True)
+            return
+        if not self._session.get("creds_ok"):
+            env = self._session.get("api_key_env") or "the configured key"
+            self._status("Critique is unavailable: supply provider "
+                         f"credentials (api_key in project.json or export "
+                         f"{env}=...). Checks, editing and reports keep "
+                         "working without credentials.", error=True)
+            return
+        if not self._resolve_report_dirty("opening a critique preview"):
+            return
+        scene = self._scene_sel
+        if scene is None:
+            self._status("Select a scene in the sidebar to critique.")
+            return
+
+        def fn(sink, token):
+            prep = ro.critique_prepare(self._root, scene, token=token)
+            res = ro.critique_generate(
+                self._root, prep, provider_factory=self._provider_factory,
+                token=token, events=sink)
+            ext = ro.critique_extract(res["raw"])
+            return {"prep": prep, "text": ext["text"], "ok": ext["ok"]}
+
+        self._dispatch(fn, kind="critique_generate")
+
+    def _run_check(self, scene):
+        if self._busy:
+            self._status("An operation is running; review actions are paused "
+                         "until it settles.", error=True)
+            return
+        if not self._resolve_report_dirty("opening a check preview"):
+            return
+        if scene is not None and scene not in self._card_ids():
+            self._status("Select a scene in the sidebar to check.")
+            return
+
+        def fn(sink, token):
+            out = ro.check_report_for(self._root, scene, token=token)
+            return {"name": out["name"], "report": out["report"],
+                    "baseline": out["baseline"]}
+
+        self._dispatch(fn, kind="check_generate")
+
+    def check_scene(self):
+        self._run_check(self._scene_sel)
+
+    def check_all(self):
+        self._run_check(None)
+
+    def _on_report_selected(self):
+        row = self.report_list.currentRow()
+        rows = self._saved_reports()
+        if not 0 <= row < len(rows):
+            return
+        sub, name, path, text = rows[row]
+        if self._report_edit_target is not None:
+            if not self._resolve_report_dirty("switching reports"):
+                self._rebuild_report_list()
+                return
+        self._report_key = path
+        self._update_review_view()
+
+    def report_edit_open(self):
+        if self._busy:
+            return
+        row = self.report_list.currentRow()
+        rows = self._saved_reports()
+        if not 0 <= row < len(rows):
+            self._status("Select a saved report to edit it.")
+            return
+        sub, name, path, text = rows[row]
+        if not self._resolve_report_dirty("switching the editor"):
+            return
+        try:
+            baseline = ro.report_baseline(self._root, sub, name)
+        except ro.OpError as e:
+            self._status(str(e), error=True)
+            return
+        self._report_edit_target = {"sub": sub, "name": name,
+                                    "baseline": baseline}
+        self._report_edit_dirty = False
+        self.report_edit.setPlainText(text)
+        self.report_edit_label.setText(
+            f"Editing {sub}/{name}.md — Save report commits this Markdown "
+            "verbatim"
+            + ("; the previous critique is backed up first"
+               if sub == "critiques" else "; checks keep no backups") + ".")
+        self._update_review_ui()
+
+    def report_edit_cancel(self):
+        if self._report_edit_target is None:
+            return
+        if self._report_edit_dirty and not self._resolve_report_dirty(
+                "cancelling the edit"):
+            return
+        self._report_edit_target = None
+        self._report_edit_dirty = False
+        self.report_edit.setPlainText("")
+        self.report_edit_label.setText("")
+        self._update_review_view()
+
+    def report_save(self):
+        """Save the generated preview or the open report edit."""
+        if self._busy:
+            return
+        if self._report_edit_target is not None:
+            if self._report_save_edit_now() is not None:
+                self._report_edit_target = None
+                self._report_edit_dirty = False
+                self.report_edit.setPlainText("")
+                self.report_edit_label.setText("")
+                self.refresh(force=True)
+                self._update_review_view()
+            return
+        pv = self._report_preview
+        if pv is None:
+            self._status("Nothing to save: generate or select a report "
+                         "first.")
+            return
+        baseline = dict(pv["baseline"])
+        if pv["kind"] == "critique":
+            prep, text, scene = pv["prep"], pv["text"], pv["scene"]
+
+            def fn(sink, token):
+                return ro.critique_save(self._root, prep, text,
+                                        baseline=baseline, token=token,
+                                        events=sink)
+        else:
+            name, text = pv["name"], pv["text"]
+
+            def fn(sink, token):
+                return ro.check_save(self._root, name, text,
+                                     baseline=baseline, token=token,
+                                     events=sink)
+
+        self._dispatch(fn, kind="report_save")
+
+    def _update_review_view(self):
+        rows = self._saved_reports()
+        labels = [r[2] for r in rows]
+        if labels != self._report_rows:
+            self._report_rows = labels
+            self._rebuild_report_list()
+        pv = self._report_preview
+        if self._report_edit_target is not None:
+            target = self._report_edit_target
+            self.report_label.setText(
+                f"Editing {target['sub']}/{target['name']}.md (unsaved "
+                "changes are kept until Save report or Cancel)")
+        elif pv is not None:
+            extra = "" if pv.get("ok", True) else \
+                "\nwarning: untagged output; check it for stray text"
+            self.report_label.setText(
+                f"{pv['kind']} preview — unsaved; Save report writes "
+                f"{pv['path_label']}{extra}")
+        else:
+            self.report_label.setText(
+                "Saved reports (select to view; Critique/Check generate "
+                "previews that only Save report writes)")
+        selected = next((r for r in rows if r[2] == self._report_key), None)
+        if self._report_edit_target is None:
+            shown = selected[3] if selected else ""
+            if pv is not None:
+                shown = pv["text"]
+            self._update_pane(self.report_view, shown)
+        self._update_review_ui()
+
+    def _rebuild_report_list(self):
+        self.report_list.blockSignals(True)
+        self.report_list.clear()
+        rows = self._saved_reports()
+        for _sub, _name, path, _text in rows:
+            self.report_list.addItem(QListWidgetItem(path))
+        idx = (self._report_rows.index(self._report_key)
+               if self._report_key in (self._report_rows or []) else -1)
+        if 0 <= idx < self.report_list.count():
+            self.report_list.setCurrentRow(idx)
+        self.report_list.blockSignals(False)
+
+    def _update_review_ui(self):
+        busy = self._busy
+        has_scene = self._scene_sel is not None
+        creds = bool(self._session.get("creds_ok"))
+        self.critique_btn.setEnabled(
+            not busy and creds and has_scene
+            and self._scene_sel in self._card_ids())
+        self.critique_btn.setToolTip(
+            "Run the scene's critic request in the background and preview "
+            "the report; nothing is written until Save report"
+            + ("" if creds else
+               "; unavailable: supply provider credentials first"))
+        self.check_scene_btn.setEnabled(
+            not busy and has_scene and self._scene_sel in self._card_ids())
+        self.check_all_btn.setEnabled(not busy)
+        editing = self._report_edit_target is not None
+        self.report_edit_btn.setEnabled(
+            not busy and not editing and self.report_list.currentRow() >= 0
+            and not self._report_preview)
+        self.report_save_btn.setEnabled(
+            not busy and (editing or self._report_preview is not None))
+        self.report_cancel_btn.setEnabled(not busy and editing)
+
     # ------------------------------------------------------ continuity ops
 
     def _cont_edited(self):
@@ -1550,15 +1811,77 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
 
     def _build_review_tab(self):
+        """Critique/check generation and saved-report viewing/editing; no
+        provider access for checks and no external editor."""
         box = QWidget()
         l = QVBoxLayout(box)
         l.setContentsMargins(0, 0, 0, 0)
-        l.addWidget(QLabel("Critique and deterministic check reports are "
-                           "added by the review feature commit."))
-        l.addStretch(1)
+        btns = QHBoxLayout()
+        self.critique_btn = QPushButton("Critique scene")
+        self.critique_btn.setToolTip(
+            "Run the scene's critic request in the background and preview "
+            "the report; nothing is written until Save report")
+        self.critique_btn.clicked.connect(self.critique_scene)
+        btns.addWidget(self.critique_btn)
+        self.check_scene_btn = QPushButton("Check scene")
+        self.check_scene_btn.setToolTip(
+            "Deterministic banned-phrase/n-gram report for the selected "
+            "scene's active path; no provider access")
+        self.check_scene_btn.clicked.connect(self.check_scene)
+        btns.addWidget(self.check_scene_btn)
+        self.check_all_btn = QPushButton("Check all scenes")
+        self.check_all_btn.setToolTip(
+            "Deterministic check over every scene's active path in scene "
+            "order; no provider access")
+        self.check_all_btn.clicked.connect(self.check_all)
+        btns.addWidget(self.check_all_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        self.report_label = QLabel("Saved reports (select to view)")
+        l.addWidget(self.report_label)
+        self.report_view = QPlainTextEdit()
+        self.report_view.setReadOnly(True)
+        self.report_view.setPlaceholderText(
+            "Generated critique/check previews and saved reports appear "
+            "here; a preview is only written when you press Save report.")
+        l.addWidget(self.report_view, 2)
+        l.addWidget(QLabel("Saved reports"))
+        self.report_list = QListWidget()
+        self.report_list.setToolTip(
+            "critiques/*.md and checks/*.md; editing a saved report writes "
+            "the same Markdown path (critique edits keep the prev backup)")
+        self.report_list.itemSelectionChanged.connect(
+            self._on_report_selected)
+        l.addWidget(self.report_list, 1)
+        rbtns = QHBoxLayout()
+        self.report_edit_btn = QPushButton("Edit report")
+        self.report_edit_btn.setToolTip(
+            "Open the built-in editor on the selected saved report (no "
+            "external editor)")
+        self.report_edit_btn.clicked.connect(self.report_edit_open)
+        rbtns.addWidget(self.report_edit_btn)
+        self.report_save_btn = QPushButton("Save report")
+        self.report_save_btn.setToolTip(
+            "Save the generated preview or the edited report; critique "
+            "saves back up the previous report first")
+        self.report_save_btn.clicked.connect(self.report_save)
+        rbtns.addWidget(self.report_save_btn)
+        self.report_cancel_btn = QPushButton("Cancel edit")
+        self.report_cancel_btn.clicked.connect(self.report_edit_cancel)
+        rbtns.addWidget(self.report_cancel_btn)
+        rbtns.addStretch(1)
+        l.addLayout(rbtns)
+        self.report_edit_label = QLabel("")
+        l.addWidget(self.report_edit_label)
+        self.report_edit = QPlainTextEdit()
+        self.report_edit.setPlaceholderText(
+            "Edit the saved report here; Save report commits it verbatim.")
+        self.report_edit.textChanged.connect(self._report_edited)
+        l.addWidget(self.report_edit, 1)
         return box
 
     def _build_revision_tab(self):
+        """Passage-by-passage revision over the shared session (task 1.5)."""
         box = QWidget()
         l = QVBoxLayout(box)
         l.setContentsMargins(0, 0, 0, 0)
@@ -2747,6 +3070,11 @@ class MainWindow(QMainWindow):
         self._scenes_card_row = None
         self._scenes_preview_baseline = None
         self._scenes_force_once = False
+        self._report_preview = None
+        self._report_edit_target = None
+        self._report_edit_dirty = False
+        self._report_key = None
+        self._report_rows = []
         self._cont = None
         self._cont_editing = None
         self._bind_steering(None)
@@ -3116,6 +3444,7 @@ class MainWindow(QMainWindow):
         self._update_draft_actions()
         self._update_steering_label()
         self._update_continuity_ui()
+        self._update_review_ui()
 
     def _update_draft_actions(self):
         """Generate/Stop/Accept availability with recovery guidance."""
@@ -3631,6 +3960,48 @@ class MainWindow(QMainWindow):
             self.refresh(force=True)
             self._update_continuity_view()
             self._status(value["message"])
+        elif kind == "critique_generate" and isinstance(value, dict):
+            self._report_preview = {
+                "kind": "critique", "prep": value["prep"],
+                "scene": value["prep"].scene_id, "text": value["text"],
+                "ok": value["ok"],
+                "baseline": dict(value["prep"].baseline),
+                "path_label": f"critiques/{value['prep'].scene_id}.md"}
+            self._report_edit_target = None
+            self._report_edit_dirty = False
+            self._update_review_view()
+            self._status("Critique preview ready (unsaved)"
+                         + ("" if value["ok"] else
+                            "; warning: no <critique> tags in the output; "
+                            "check it for stray text")
+                         + "; Save report writes it.")
+        elif kind == "check_generate" and isinstance(value, dict):
+            self._report_preview = {
+                "kind": "check", "name": value["name"], "text": value["report"],
+                "baseline": dict(value["baseline"]),
+                "path_label": f"checks/{value['name']}.md"}
+            self._report_edit_target = None
+            self._report_edit_dirty = False
+            self._update_review_view()
+            self._status("Check preview ready (unsaved); Save report "
+                         f"writes checks/{value['name']}.md.")
+        elif kind == "report_save" and isinstance(value, dict):
+            was_edit = self._report_edit_target is not None
+            self._report_preview = None
+            self._report_edit_target = None
+            self._report_edit_dirty = False
+            self.report_edit.setPlainText("")
+            self.report_edit_label.setText("")
+            self.refresh(force=True)
+            self._update_review_view()
+            msg = value.get("message") or f"wrote {value['path']}"
+            if value.get("backup"):
+                msg += f"; previous report backed up to {value['backup']}"
+            self._status(msg if not was_edit else
+                         f"saved {value['sub']}/{value['name']}.md"
+                         + (f"; previous critique backed up to "
+                            f"{value['backup']}" if value.get("backup")
+                            else ""))
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
@@ -4118,6 +4489,7 @@ class MainWindow(QMainWindow):
         self._update_bible_tab()
         self._update_outline_tab()
         self._update_scenes_tab()
+        self._update_review_view()
         self._update_steering_ui()
 
     def _reconcile_selection(self):

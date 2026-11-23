@@ -568,3 +568,180 @@ def test_ops_check_facts_match_cli_behaviour(project):
     assert chk["later"] == ["s002"]
     assert ro.update_state_check(str(project))["error"].startswith(
         "no done scene is waiting")
+
+
+# ------------------------------------------------------- critique/check
+
+def test_critique_transcript_files_and_backup(project):
+    t, snap, calls = rf.run_cli(project, "critique", [CRITIQUE_TEXT],
+                                args={"scene": "s001"})
+    assert t == ("critiquing s001...\n"
+                 '1. [style-rule] "counts" - flat verb - vary the verb\n'
+                 "wrote " + str(project / "critiques" / "s001.md") +
+                 " (edit it to drop points you disagree with before running "
+                 "revise)\n")
+    assert snap["critiques/s001.md"] == \
+        "# Critique s001 ((TS))\n\n1. [style-rule] \"counts\" - flat verb " \
+        "- vary the verb\n"
+    t, snap, _ = rf.run_cli(project, "critique",
+                            ['<critique>2. [pov-tense] "is" - tense - fix'
+                             "</critique>"],
+                            args={"scene": "s001"})
+    assert snap["critiques/s001.md"].endswith(
+        '2. [pov-tense] "is" - tense - fix\n')
+    prev = [k for k in snap if k.startswith("critiques/s001_prev_")]
+    assert len(prev) == 1 and "vary the verb" in snap[prev[0]], \
+        "the replaced report is backed up with the prev convention"
+
+
+def test_critique_untagged_and_errors(project):
+    t, snap, _ = rf.run_cli(project, "critique", ["no tags"],
+                            args={"scene": "s001"})
+    assert t == ("critiquing s001...\n"
+                 "warning: no <critique> tags in the output; check it for "
+                 "stray text\nno tags\nwrote " +
+                 str(project / "critiques" / "s001.md") +
+                 " (edit it to drop points you disagree with before running "
+                 "revise)\n")
+    assert snap["critiques/s001.md"] == "# Critique s001 ((TS))\n\nno tags\n"
+    t, _, _ = rf.run_cli(project, "critique", [], args={"scene": "s009"})
+    assert t == "error: no scene with id s009\n"
+    (project / "trees" / "s008.json").write_text(
+        '{"nodes": {}, "head": null, "counter": 0}', encoding="utf-8")
+    scenes = scenes_of(project)
+    scenes.append({"id": "s008", "chapter": 1, "title": "E",
+                   "target_words": 100, "status": "done"})
+    (project / "scenes.json").write_text(
+        json.dumps(scenes, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, _, _ = rf.run_cli(project, "critique", [], args={"scene": "s008"})
+    assert t == "error: scene s008 has no text\n"
+
+
+def test_check_scene_and_all_bytes(project):
+    t, snap, _ = rf.run_cli(project, "check", [], args={"scene": "s001"})
+    report = snap["checks/s001.md"]
+    assert report.startswith("# Check scene s001 ((TS))\n\n"
+                             "## Banned phrases\n\n(none)\n\n"
+                             "## Repeated 5-grams (count >= 3)\n\n(none)\n")
+    frozen = "# Check scene s001 (2026-01-01T00:00:00+00:00)\n\n" \
+             "## Banned phrases\n\n(none)\n\n" \
+             "## Repeated 5-grams (count >= 3)\n\n(none)\n"
+    assert t == frozen + "\n" + \
+        f"wrote {project / 'checks' / 's001.md'}\n"
+    t, snap, _ = rf.run_cli(project, "check", [])
+    assert snap["checks/all.md"].startswith("# Check all scenes ((TS))\n")
+    before = snap["checks/all.md"]
+    t, snap, _ = rf.run_cli(project, "check", [])
+    assert snap["checks/all.md"] == before, "re-check overwrites in place"
+    assert not [k for k in snap if "prev" in k], "checks keep no backups"
+
+
+def test_check_only_active_paths_and_empty_scenes(project):
+    (project / "trees" / "s003.json").write_text(
+        '{"nodes": {}, "head": null, "counter": 0}', encoding="utf-8")
+    scenes = scenes_of(project)
+    scenes.append({"id": "s003", "chapter": 1, "title": "E",
+                   "target_words": 100, "status": "done"})
+    (project / "scenes.json").write_text(
+        json.dumps(scenes, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    # an inactive branch with a banned phrase must not appear
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    tree["nodes"]["n9"] = {"id": "n9", "parent": "n1",
+                           "text": "shivers down inactive",
+                           "created": "2026-01-01T00:00:00+00:00",
+                           "history": [], "sep": "\n\n"}
+    (project / "trees" / "s001.json").write_text(
+        json.dumps(tree, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, snap, _ = rf.run_cli(project, "check", [])
+    assert "(none)" in snap["checks/all.md"]
+    assert "n9" not in snap["checks/all.md"]
+    assert "s003" not in snap["checks/all.md"], "empty scenes are skipped"
+
+
+# --------------------------------------------------- critique/check ops
+
+def test_ops_critique_prepare_parity(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    _, _, calls = rf.run_cli(project, "critique", [CRITIQUE_TEXT],
+                             args={"scene": "s001"})
+    prep = ro.critique_prepare(str(ops_root), "s001")
+    assert calls[0][2] == prep.msgs
+    assert calls[0][1] == "critic"
+
+
+def test_ops_critique_generate_save_parity(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    t, cli_snap, _ = rf.run_cli(project, "critique", [CRITIQUE_TEXT],
+                                args={"scene": "s001"})
+    prep = ro.critique_prepare(str(ops_root), "s001")
+    res = ro.critique_generate(
+        str(ops_root), prep,
+        provider_factory=lambda p: FakeProvider([CRITIQUE_TEXT]))
+    extracted = ro.critique_extract(res["raw"])
+    assert extracted["ok"] and extracted["text"].startswith("1. [style-rule]")
+    out = ro.critique_save(str(ops_root), prep, extracted["text"])
+    assert rf.snapshot(ops_root) == cli_snap
+    assert "wrote" in out["message"] and out["backup"] is None
+
+
+def test_ops_critique_save_refuses_stale(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    prep = ro.critique_prepare(str(ops_root), "s001")
+    (ops_root / "state.md").write_text("externally changed\n",
+                                       encoding="utf-8")
+    extracted = ro.critique_extract(CRITIQUE_TEXT)
+    with pytest.raises(ro.OpError) as e:
+        ro.critique_save(str(ops_root), prep, extracted["text"])
+    assert e.value.stale
+    assert not (ops_root / "critiques" / "s001.md").exists()
+
+
+def test_ops_report_edit_semantics(project, tmp_path):
+    rf.run_cli(project, "critique", [CRITIQUE_TEXT], args={"scene": "s001"})
+    ops_root = _copy(project, tmp_path)
+    base = ro.report_baseline(str(ops_root), "critiques", "s001")
+    ro.report_save_edit(str(ops_root), "critiques", "s001", "edited note",
+                        baseline=base)
+    assert (ops_root / "critiques" / "s001.md").read_text() == "edited note"
+    prevs = list((ops_root / "critiques").glob("s001_prev_*.md"))
+    assert len(prevs) == 1 and "vary the verb" in \
+        prevs[0].read_text(encoding="utf-8")
+    base2 = ro.report_baseline(str(ops_root), "critiques", "s001")
+    (ops_root / "critiques" / "s001.md").write_text("external\n",
+                                                   encoding="utf-8")
+    with pytest.raises(ro.OpError) as e:
+        ro.report_save_edit(str(ops_root), "critiques", "s001", "local",
+                            baseline=base2)
+    assert e.value.stale
+    assert (ops_root / "critiques" / "s001.md").read_text() == "external\n"
+
+
+def test_ops_check_parity_and_no_provider(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    t, cli_snap, _ = rf.run_cli(project, "check", [], args={"scene": "s001"})
+    out = ro.check_report_for(str(ops_root), "s001")
+    ro.check_save(str(ops_root), out["name"], out["report"],
+                  baseline=out["baseline"])
+    assert rf.snapshot(ops_root) == cli_snap
+    t2, cli_snap2, _ = rf.run_cli(project, "check", [])
+    out2 = ro.check_report_for(str(ops_root))
+    assert out2["name"] == "all"
+    ro.check_save(str(ops_root), out2["name"], out2["report"],
+                  baseline=out2["baseline"])
+    assert rf.snapshot(ops_root) == cli_snap2
+
+
+def test_ops_check_stale_refusal(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    out = ro.check_report_for(str(ops_root))
+    (ops_root / "trees" / "s001.json").write_text(
+        json.dumps({"nodes": {}, "head": None, "counter": 0}),
+        encoding="utf-8")
+    with pytest.raises(ro.OpError) as e:
+        ro.check_save(str(ops_root), out["name"], out["report"],
+                      baseline=out["baseline"])
+    assert e.value.stale
+    assert not (ops_root / "checks" / "all.md").exists()

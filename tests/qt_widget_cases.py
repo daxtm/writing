@@ -2676,6 +2676,133 @@ def case_review_update_state(root):
     win.close()
 
 
+def case_review_reports(root):
+    """Critique/check controls: previews saved explicitly, prev backups,
+    built-in report editing, no-provider checks, no-creds guidance and stale
+    refusal (task 1.4)."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _review_project(root, "p")
+    fake = ReviewChatFake([REVIEW_CRITIQUE,
+                           '<critique>2. [pov-tense] "is" - tense - fix'
+                           "</critique>", "no tags", REVIEW_CRITIQUE])
+    win = gw.MainWindow(str(project), choice=_no_dialogs("review reports"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.tabs.setCurrentIndex(gw.REVIEW)
+
+    # critique preview is unsaved until Save report
+    n0 = len(fake.calls)
+    win.critique_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == n0 + 1
+    assert '1. [style-rule] "counts"' in win.report_view.toPlainText()
+    assert not (project / "critiques" / "s001.md").exists(), \
+        "preview writes nothing"
+    win.report_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    crit = (project / "critiques" / "s001.md").read_text(encoding="utf-8")
+    assert crit.startswith("# Critique s001 (") and \
+        crit.endswith("vary the verb\n")
+
+    # re-critique replaces with a prev backup (distinct stamps)
+    import longform_core.review_operations as ro_
+    real_stamp = ro_._utils.stamp
+    try:
+        win.critique_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        ro_._utils.stamp = lambda: "20990101-000001"
+        win.report_save_btn.click()
+        assert _pump(a, lambda: not win._busy)
+    finally:
+        ro_._utils.stamp = real_stamp
+    assert (project / "critiques" / "s001.md").read_text(
+        encoding="utf-8").endswith('tense - fix\n')
+    prevs = list((project / "critiques").glob("s001_prev_*.md"))
+    assert len(prevs) == 1 and "vary the verb" in \
+        prevs[0].read_text(encoding="utf-8")
+
+    # scene and all checks need no provider call
+    n_calls = len(fake.calls)
+    win.check_scene_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == n_calls, "checks never touch the provider"
+    assert win.report_view.toPlainText().startswith("# Check scene s001 (")
+    win.report_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "checks" / "s001.md").read_text(
+        encoding="utf-8").endswith("(none)\n")
+    win.check_all_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win.report_view.toPlainText().startswith("# Check all scenes (")
+    win.report_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "checks" / "all.md").exists()
+
+    # saved report selection and built-in editing (verbatim, prev backup)
+    win.report_list.setCurrentRow(0)
+    assert "s001" in win.report_view.toPlainText()
+    win.report_edit_btn.click()
+    win.report_edit.setPlainText("edited note")
+    try:
+        ro_._utils.stamp = lambda: "20990101-000002"
+        win.report_save_btn.click()
+        assert _pump(a, lambda: not win._busy)
+    finally:
+        ro_._utils.stamp = real_stamp
+    assert (project / "critiques" / "s001.md").read_text(
+        encoding="utf-8") == "edited note"
+    prevs = list((project / "critiques").glob("s001_prev_*.md"))
+    assert len(prevs) == 2, "the edited-over report is backed up too"
+
+    # untagged critique output is previewable with the CLI warning
+    win.critique_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "no <critique> tags" in win.status.text()
+    win.report_cancel_btn.click()   # nothing to cancel; no-op
+    win.report_save_btn.click()     # the writer may still save it verbatim
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "critiques" / "s001.md").read_text(
+        encoding="utf-8").endswith("no tags\n")
+    win.close()
+
+    # without credentials critique is disabled with guidance; checks work
+    noproj = _review_project(root, "nocreds")
+    cfg = json.loads((noproj / "project.json").read_text())
+    cfg["api_key"] = ""
+    _write_json(noproj / "project.json", cfg)
+    win2 = gw.MainWindow(str(noproj), choice=_no_dialogs("nocreds"),
+                         provider_factory=lambda _p: ReviewChatFake([]))
+    win2.show()
+    win2.select_item("manuscript", "s001", None)
+    win2.tabs.setCurrentIndex(gw.REVIEW)
+    assert not win2.critique_btn.isEnabled()
+    assert "credentials" in win2.critique_btn.toolTip().lower(), \
+        "recovery guidance is on the disabled control"
+    win2.check_scene_btn.click()
+    assert _pump(a, lambda: not win2._busy)
+    assert win2.report_view.toPlainText().startswith("# Check scene s001 (")
+    win2.close()
+
+    # stale refusal: the report destination changed under the open preview
+    win3 = gw.MainWindow(str(project), choice=_no_dialogs("stale report"),
+                         provider_factory=lambda _p: fake)
+    win3.show()
+    win3.select_item("manuscript", "s001", None)
+    win3.tabs.setCurrentIndex(gw.REVIEW)
+    win3.critique_btn.click()
+    assert _pump(a, lambda: not win3._busy)
+    (project / "critiques" / "s001.md").write_text("external\n",
+                                                  encoding="utf-8")
+    win3.report_save_btn.click()
+    assert _pump(a, lambda: not win3._busy)
+    assert "changed on disk" in win3.status.text()
+    assert (project / "critiques" / "s001.md").read_text(
+        encoding="utf-8") == "external\n"
+    win3.close()
+
+
 def case_review_journey(root):
     """Completed scenes → continuity → compression → reports → revision →
     status → picked export → reopen, compared with fixed-clock CLI fixtures
@@ -2942,6 +3069,7 @@ CASES = {
     "case_planning_card_edit": case_planning_card_edit,
     "case_review_update_state": case_review_update_state,
     "case_review_compress": case_review_compress,
+    "case_review_reports": case_review_reports,
     "case_review_journey": case_review_journey,
 }
 

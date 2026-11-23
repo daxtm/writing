@@ -25,6 +25,7 @@ from .draft_operations import (OpError, _advance, _capture, _check_tree_writable
 from .prompt import format_card, layered_summary
 from .reader_model import _no_symlink_below
 from .tree import Tree
+from .utils import FatalError
 from . import utils as _utils
 from .utils import (extract_tagged, keep_lead, line_diff, parse_sections,
                     read_text, save_input, tag_instr, text_hash, warn,
@@ -191,6 +192,215 @@ def compress_accept(root, prep, text, *, baseline=None, token=None,
     _emit(events, "accepted", arc=f"{prep.from_id}-{prep.to_id}")
     return {"message": f"saved arc {prep.from_id}-{prep.to_id}",
             "from": prep.from_id, "to": prep.to_id}
+
+
+# =========================================================== critique/check
+
+@dataclass
+class CritiquePrep:
+    scene_id: str
+    idx: int
+    msgs: list
+    warnings: list         # layered-summary notes (budget/missing)
+    baseline: dict
+
+
+def critique_extract(raw):
+    """The CLI's extract_tagged for critique output."""
+    text, ok = extract_tagged(raw or "", "critique")
+    return {"text": text, "ok": ok}
+
+
+def critique_prepare(root, scene_id, *, token=None):
+    """Resolve the scene and build the exact critic request; no call, no
+    write. Missing text is refused; layered-summary notes become warnings."""
+    p = _project_of(root)
+    scenes = _scenes(p)
+    idx = _find_idx(scenes, scene_id)
+    if idx is None:
+        raise OpError(f"no scene with id {scene_id}")
+    sc = scenes[idx]
+    tree = _tree(p, scene_id)
+    if not tree.head:
+        raise OpError(f"scene {scene_id} has no text")
+    model = p.cfg["roles"]["critic"]["model"]
+    try:
+        summary, notes = layered_summary(p, scenes, idx,
+                                         int(p.cfg["budget_tokens"]["summary"]),
+                                         model)
+        banned = ", ".join(f'"{b}"' for b in p.cfg["banned_phrases"])
+    except FatalError as e:
+        raise OpError(str(e.msg), from_die=True) from None
+    user = (
+        f"# Story bible\n{read_text(p.f('bible.md')).strip()}\n\n"
+        + (f"# Story before this scene\n{summary}\n\n" if summary else "")
+        + f"# Current continuity state\n{read_text(p.f('state.md')).strip()}\n\n"
+        f"# Scene card\n{format_card(sc)}\n\n# Scene text\n{tree.text()}\n\n"
+        "Review the scene text. List every problem as a numbered item in this exact format:\n"
+        'N. [category] "exact quote from the text" - what is wrong - concrete fix\n'
+        "Categories: continuity (contradicts the summary, state or bible), cast (a character not listed as present "
+        "appears, speaks or acts), pov-tense, style-rule, cliche, repetition, pacing (relative to the scene card's "
+        "goal/conflict/outcome), dialogue, logic.\n"
+        f"Phrases the author has banned: {banned}.\n"
+        "After the list, one line: 'Scene card fulfilled: yes/partly/no - reason'. "
+        + tag_instr("critique")
+    )
+    msgs = [{"role": "system", "content": CRITIC_SYSTEM},
+            {"role": "user", "content": user}]
+    baseline = _capture(p, ["project.json", "scenes.json", "summaries.json",
+                            "bible.md", "state.md", "limits.json",
+                            "calib.json", f"trees/{scene_id}.json",
+                            f"critiques/{scene_id}.md"])
+    if token:
+        token.check()
+    return CritiquePrep(scene_id=scene_id, idx=idx, msgs=msgs,
+                        warnings=list(notes), baseline=baseline)
+
+
+def critique_generate(root, prep, *, provider=None, provider_factory=None,
+                      token=None, events=None):
+    """One critic chat call with the prepared messages; nothing written."""
+    p = _project_of(root)
+    if token:
+        token.check()
+    _emit(events, "progress", msg=f"critiquing {prep.scene_id}...")
+    provider = provider or _provider(p, provider_factory)
+    try:
+        raw, finish, _ = provider.chat("critic", prep.msgs, token=token,
+                                       on_retry_event=(lambda why, delay:
+                                                       _emit(events, "retry"))
+                                                      if events else None)
+    except Cancelled:
+        raise
+    except (HttpErr, NoAnswerErr) as e:
+        raise OpError(f"critic failed: {e}", soft=True) from None
+    _advance(p, prep.baseline, "calib.json")
+    return {"raw": raw, "finish": finish, "scene": prep.scene_id}
+
+
+def critique_save(root, prep, text, *, baseline=None, token=None, events=None):
+    """Explicit save: the CLI heading/body bytes; an existing report is
+    copied to <scene>_prev_<stamp>.md first."""
+    p = _project_of(root)
+    baseline = dict(prep.baseline if baseline is None else baseline)
+    if token:
+        token.check()
+    if not _no_symlink_below(p.root, "critiques", f"{prep.scene_id}.md"):
+        raise OpError(f"critiques/{prep.scene_id}.md is a symlink; refusing "
+                      "to write")
+    _stale_check(p, baseline)
+    out = p.f("critiques", f"{prep.scene_id}.md")
+    backup = None
+    try:
+        if out.exists():
+            backup = f"{prep.scene_id}_prev_{_utils.stamp()}.md"
+            shutil.copy2(out, p.f("critiques", backup))
+        write_text(out, f"# Critique {prep.scene_id} ({_utils.now()})\n\n"
+                        f"{text}\n")
+    except OSError as e:
+        raise OpError(f"critiques/{prep.scene_id}.md could not be saved "
+                      f"({type(e).__name__})", soft=True) from None
+    _advance(p, baseline, f"critiques/{prep.scene_id}.md")
+    _emit(events, "saved", scene=prep.scene_id)
+    return {"scene": prep.scene_id, "ok": True, "backup": backup,
+            "path": str(out),
+            "message": f"wrote {out} (edit it to drop points you disagree "
+                       "with before running revise)"}
+
+
+def report_baseline(root, sub, name):
+    """Captured bytes of a saved report for edit/save staleness checks."""
+    p = _project_of(root)
+    return _capture(p, [f"{sub}/{name}.md"])
+
+
+def report_save_edit(root, sub, name, text, *, baseline=None, token=None,
+                     events=None):
+    """Save a built-in review-note edit verbatim at the existing report path;
+    critique edits use the same prev-backup convention, check edits none."""
+    p = _project_of(root)
+    if sub not in ("critiques", "checks"):
+        raise OpError(f"unknown report directory {sub}", soft=True)
+    baseline = dict(report_baseline(root, sub, name)
+                    if baseline is None else baseline)
+    if token:
+        token.check()
+    if not _no_symlink_below(p.root, sub, f"{name}.md"):
+        raise OpError(f"{sub}/{name}.md is a symlink; refusing to write")
+    _stale_check(p, baseline)
+    out = p.f(sub, f"{name}.md")
+    backup = None
+    try:
+        if sub == "critiques" and out.exists():
+            backup = f"{name}_prev_{_utils.stamp()}.md"
+            shutil.copy2(out, p.f(sub, backup))
+        write_text(out, text)
+    except OSError as e:
+        raise OpError(f"{sub}/{name}.md could not be saved "
+                      f"({type(e).__name__})", soft=True) from None
+    _advance(p, baseline, f"{sub}/{name}.md")
+    _emit(events, "saved", report=f"{sub}/{name}.md")
+    return {"sub": sub, "name": name, "backup": backup, "path": str(out)}
+
+
+def check_report_for(root, scene_id=None, *, token=None):
+    """Deterministic check over the selected scene or all scenes' active
+    paths (empty scenes skipped); no provider instance or credential is
+    involved."""
+    p = _project_of(root)
+    scenes = _scenes(p)
+    if scene_id:
+        idx = _find_idx(scenes, scene_id)
+        if idx is None:
+            raise OpError(f"no scene with id {scene_id}")
+        targets = [scenes[idx]]
+    else:
+        targets = scenes
+    banned = [b for b in p.cfg["banned_phrases"] if b.strip()]
+    ng = p.cfg["ngram"]
+    n, min_count, top = int(ng["n"]), int(ng["min_count"]), int(ng["top"])
+    scene_texts = []
+    keys = ["project.json", "scenes.json"]
+    for s in targets:
+        tree = _tree(p, s["id"])
+        keys.append(f"trees/{s['id']}.json")
+        if not tree.head:
+            continue
+        scene_texts.append((s["id"],
+                            [(nid, tree.node(nid)["text"])
+                             for nid in tree.chain()],
+                            tree.text()))
+    baseline = _capture(p, keys + [f"checks/{scene_id or 'all'}.md"])
+    if token:
+        token.check()
+    title = (f"# Check {'scene ' + scene_id if scene_id else 'all scenes'} "
+             f"({_utils.now()})")
+    report = check_report(scene_texts, banned, n, min_count, top, title)
+    name = scene_id or "all"
+    return {"name": name, "report": report, "baseline": baseline,
+            "path": str(p.f("checks", f"{name}.md"))}
+
+
+def check_save(root, name, report, *, baseline=None, token=None, events=None):
+    """Explicit save of the scoped report; overwrites the existing path with
+    no new backup scheme."""
+    p = _project_of(root)
+    baseline = dict(report_baseline(root, "checks", name)
+                    if baseline is None else baseline)
+    if token:
+        token.check()
+    if not _no_symlink_below(p.root, "checks", f"{name}.md"):
+        raise OpError(f"checks/{name}.md is a symlink; refusing to write")
+    _stale_check(p, baseline)
+    out = p.f("checks", f"{name}.md")
+    try:
+        write_text(out, report)
+    except OSError as e:
+        raise OpError(f"checks/{name}.md could not be saved "
+                      f"({type(e).__name__})", soft=True) from None
+    _advance(p, baseline, f"checks/{name}.md")
+    _emit(events, "saved", report=f"checks/{name}.md")
+    return {"name": name, "path": str(out), "message": f"wrote {out}"}
 
 
 # ============================================================ update state

@@ -1082,61 +1082,49 @@ def cmd_compress(p, args):
 
 
 def cmd_critique(p, args):
-    scenes = p.scenes()
-    idx = p.scene_index(scenes, args.scene)
-    sc = scenes[idx]
-    tree = Tree(p, sc["id"])
-    if not tree.head:
-        die(f"scene {sc['id']} has no text")
-    model = p.cfg["roles"]["critic"]["model"]
-    summary, notes = layered_summary(p, scenes, idx, int(p.cfg["budget_tokens"]["summary"]), model)
-    for n in notes:
+    """CLI adapter over the shared critique operations: identical warnings,
+    request, tag warning order, backup, page and wrote-message."""
+    import longform_core.review_operations as ro
+
+    try:
+        prep = ro.critique_prepare(p.root, args.scene)
+    except ro.OpError as e:
+        _op_fail(e)
+    for n in prep.warnings:
         warn(n)
-    banned = ", ".join(f'"{b}"' for b in p.cfg["banned_phrases"])
-    user = (
-        f"# Story bible\n{read_text(p.f('bible.md')).strip()}\n\n"
-        + (f"# Story before this scene\n{summary}\n\n" if summary else "")
-        + f"# Current continuity state\n{read_text(p.f('state.md')).strip()}\n\n"
-        f"# Scene card\n{format_card(sc)}\n\n# Scene text\n{tree.text()}\n\n"
-        "Review the scene text. List every problem as a numbered item in this exact format:\n"
-        'N. [category] "exact quote from the text" - what is wrong - concrete fix\n'
-        "Categories: continuity (contradicts the summary, state or bible), cast (a character not listed as present "
-        "appears, speaks or acts), pov-tense, style-rule, cliche, repetition, pacing (relative to the scene card's "
-        "goal/conflict/outcome), dialogue, logic.\n"
-        f"Phrases the author has banned: {banned}.\n"
-        "After the list, one line: 'Scene card fulfilled: yes/partly/no - reason'. " + tag_instr("critique")
-    )
-    msgs = [{"role": "system", "content": CRITIC_SYSTEM}, {"role": "user", "content": user}]
-    print(f"critiquing {sc['id']}...")
-    raw, _, _ = Api(p).chat("critic", msgs)
-    text, ok = extract_tagged(raw, "critique")
-    if not ok:
+    print(f"critiquing {prep.scene_id}...")
+    api = ro.provider_for(p.root, api_cls=Api)
+    res = ro.critique_generate(p.root, prep, provider=api)
+    extracted = ro.critique_extract(res["raw"])
+    if not extracted["ok"]:
         warn("no <critique> tags in the output; check it for stray text")
-    out = p.f("critiques", f"{sc['id']}.md")
-    if out.exists():
-        shutil.copy2(out, p.f("critiques", f"{sc['id']}_prev_{stamp()}.md"))
-    write_text(out, f"# Critique {sc['id']} ({now()})\n\n{text}\n")
-    page(text)
-    print(f"wrote {out} (edit it to drop points you disagree with before running revise)")
+    try:
+        out = ro.critique_save(p.root, prep, extracted["text"],
+                               baseline=prep.baseline)
+    except ro.OpError as e:
+        _op_fail(e, soft_ok=True)
+        return
+    page(extracted["text"])
+    print(out["message"])
+
 
 def cmd_check(p, args):
-    scenes = p.scenes()
-    targets = [scenes[p.scene_index(scenes, args.scene)]] if args.scene else scenes
-    banned = [b for b in p.cfg["banned_phrases"] if b.strip()]
-    ng = p.cfg["ngram"]
-    n, min_count, top = int(ng["n"]), int(ng["min_count"]), int(ng["top"])
-    scene_texts = []
-    for s in targets:
-        tree = Tree(p, s["id"])
-        if not tree.head:
-            continue
-        scene_texts.append((s["id"], [(nid, tree.node(nid)["text"]) for nid in tree.chain()], tree.text()))
-    title = f"# Check {'scene ' + args.scene if args.scene else 'all scenes'} ({now()})"
-    report = check_report(scene_texts, banned, n, min_count, top, title)
-    out = p.f("checks", f"{args.scene or 'all'}.md")
-    write_text(out, report)
-    print(report)
-    print(f"wrote {out}")
+    """CLI adapter over the shared deterministic check: identical report
+    bytes and save; no provider instance is involved."""
+    import longform_core.review_operations as ro
+
+    try:
+        out = ro.check_report_for(p.root, args.scene)
+    except ro.OpError as e:
+        _op_fail(e)
+    print(out["report"])
+    try:
+        ro.check_save(p.root, out["name"], out["report"],
+                      baseline=out["baseline"])
+    except ro.OpError as e:
+        _op_fail(e, soft_ok=True)
+        return
+    print(f"wrote {out['path']}")
 
 
 def cmd_revise(p, args):
