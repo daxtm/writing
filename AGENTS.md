@@ -8,15 +8,15 @@ Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27`; argparse CLI, JSON
 
 ## Checks
 `./scripts/check.sh`: py_compile; CLI `--help` if uv exists; pytest if `tests/` exists (fails without uv).
-Suite: `uv run --with pytest --with httpx pytest -q tests` (once implemented); no lint/build step.
-`ock check` runs committed checks in a clean checkout. CI invokes the script but does not yet install uv.
+Suite: `uv run --with pytest --with httpx pytest -q tests`; no lint/build step.
+`ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
 
 ## Layout
 - `longform.py`: CLI, API, project state, branching trees, lore, prompts, deterministic checks.
-- `scripts/`: check entry point; `tests/`: planned offline pytest suite.
+- `scripts/`: check entry point; `tests/`: offline pytest suite.
 - `openspec/`: behavior specs and changes; `docs/`: roadmap and ADRs.
-- `.github/`: PR checks; `myfic/`: private generated sample, never a test fixture.
+- `.github/`: PR template; `myfic/`: private generated sample, never a test fixture.
 
 ## Rules
 - Specs: `openspec/`. Decisions: `docs/adr/`. Plan: `docs/ROADMAP.md`.
