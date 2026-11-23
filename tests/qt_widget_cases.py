@@ -2321,6 +2321,287 @@ def case_planning_card_edit(root):
     win.close()
 
 
+REVIEW_RECORD_S1 = (
+    "<record>\n=== DETAILED SUMMARY ===\nMara opens the gate and counts the "
+    "windows.\n\n=== BRIEF SUMMARY ===\nMara opens the gate.\n\n"
+    "=== UPDATED STATE ===\nMara is inside the yard.\n</record>")
+REVIEW_RECORD_S2 = (
+    "<record>\n=== DETAILED SUMMARY ===\nMara closes the gate behind her.\n\n"
+    "=== BRIEF SUMMARY ===\nMara closes the gate.\n\n"
+    "=== UPDATED STATE ===\nMara left the yard.\n</record>")
+REVIEW_ARC = "<summary>Mara opened the gate.</summary>"
+REVIEW_CRITIQUE = ('<critique>1. [style-rule] "counts" - flat verb - vary the '
+                   "verb</critique>")
+REVIEW_PASSAGE = "<passage>Mara pushed the gate open.</passage>"
+REVIEW_EDIT_NOTE = "edited note"
+
+
+def _review_project(root, name):
+    project = _build_project(
+        root / name,
+        scenes=[_scene("s001", title="Yard", pov="Mara", characters=["Mara"],
+                       status="done"),
+                _scene("s002", title="Panes", status="done")],
+        trees={
+            "s001": _tree({"n1": _node("n1", None,
+                                       "Mara counts the lit windows."),
+                           "n2": _node("n2", "n1", "She ticks off each pane.")},
+                          head="n1"),
+            "s002": _tree({"n1": _node("n1", None, "Mara closes the gate.")},
+                          head="n1")},
+        bible="# Story bible\n\nQuiet town.",
+        state="Mara is at the yard.",
+        project_extra={"api_key": "sk-test"})
+    _write_json(project / "writer_preset.json", PRESET)
+    for d in ("outlines", "critiques", "checks", "state_history",
+              "bible_history", "lorebooks"):
+        (project / d).mkdir(exist_ok=True)
+    return project
+
+
+def case_review_journey(root):
+    """Completed scenes → continuity → compression → reports → revision →
+    status → picked export → reopen, compared with fixed-clock CLI fixtures
+    (task 1.1; red until the review controls exist). Terminal/editor helpers
+    are forbidden and no step runs without its own explicit action."""
+    import longform_core.gui_window as gw
+    a = app()
+    import review_fixtures as rf
+
+    # CLI fixtures on their own copies, GUI on another; identical starts.
+    base = _review_project(root, "base")
+    import shutil
+    cli = root / "cli"
+    gui = root / "gui"
+    shutil.copytree(base, cli)
+    shutil.copytree(base, gui)
+    cli_out = str(root / "cli_manuscript.md")
+    gui_out = str(root / "gui_manuscript.md")
+
+    _, cli_us, _ = rf.run_cli(cli, "update-state", [REVIEW_RECORD_S1])
+    _, cli_so, _ = rf.run_cli(cli, "update-state", [REVIEW_RECORD_S2],
+                              args={"scene": "s002", "summary_only": True})
+    _, cli_comp, _ = rf.run_cli(cli, "compress", [REVIEW_ARC],
+                                args={"from_id": "s001", "to_id": "s001"})
+    _, cli_crit, _ = rf.run_cli(cli, "critique", [REVIEW_CRITIQUE],
+                                args={"scene": "s001"})
+    # The CLI tells the writer to edit the saved report externally; do it.
+    (cli / "critiques" / "s001.md").write_text(REVIEW_EDIT_NOTE,
+                                               encoding="utf-8")
+    _, cli_check, _ = rf.run_cli(cli, "check", [], args={"scene": "s001"})
+    _, cli_rev, _ = rf.run_cli(cli, "revise",
+                               [REVIEW_PASSAGE, "NO CHANGES"],
+                               args={"scene": "s001"})
+    cli_status, _, _ = rf.run_cli(cli, "status", [])
+    cli_export, _, _ = rf.run_cli(cli, "export", [], args={"out": cli_out})
+    cli_manuscript = (root / "cli_manuscript.md").read_text(encoding="utf-8")
+
+    # Terminal/editor helpers must never run in the GUI.
+    import builtins
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called in the review "
+                             "journey")
+
+    saved_t = {n: getattr(utils, n) for n in ("edit_text", "page", "ask")}
+    saved_pager, saved_run = utils.pydoc.pager, utils.subprocess.run
+    saved_input = builtins.input
+    try:
+        utils.edit_text = _no_terminal
+        utils.page = _no_terminal
+        utils.ask = _no_terminal
+        utils.pydoc.pager = _no_terminal
+        utils.subprocess.run = _no_terminal
+        builtins.input = _no_terminal
+
+        responses = [REVIEW_RECORD_S1, REVIEW_RECORD_S2, REVIEW_ARC,
+                     REVIEW_CRITIQUE, REVIEW_PASSAGE, "NO CHANGES"]
+
+        class ReviewFake:
+            def __init__(self, p):
+                self.p = p
+
+            def chat(self, role, msgs, max_tokens=None, stream_cb=None,
+                     progress=True, token=None, on_retry_event=None):
+                if token is not None:
+                    token.check()
+                return responses.pop(0), "stop", {}
+
+        fake = ReviewFake(None)
+        win = gw.MainWindow(
+            str(gui), choice=_no_dialogs("review journey"),
+            provider_factory=lambda _p: fake,
+            save_picker=lambda title, default: (gui_out, ""))
+        win.show()
+
+        # --- continuity: full update for s001 (preview, no writes yet)
+        win.select_item("manuscript", "s001", None)
+        win.tabs.setCurrentIndex(gw.CONTINUITY)
+        state_before = (gui / "state.md").read_text(encoding="utf-8")
+        win.update_state_btn.click()
+        assert _pump(a, lambda: not win._busy), "update-state settles"
+        assert "Mara opens the gate and counts the windows." in \
+            win.continuity_preview.toPlainText()
+        assert "STATE DIFF" in win.continuity_preview.toPlainText()
+        assert "-Mara is at the yard." in win.continuity_preview.toPlainText()
+        assert "+Mara is inside the yard." in \
+            win.continuity_preview.toPlainText()
+        assert (gui / "state.md").read_text(encoding="utf-8") == state_before, \
+            "preview never writes continuity files"
+        assert win.continuity_accept_btn.isEnabled()
+
+        win.continuity_accept_btn.click()
+        assert _pump(a, lambda: not win._busy), "accept settles"
+        t = json.loads((gui / "trees" / "s001.json").read_text())
+        assert t["nodes"]["n1"]["text"] == "Mara counts the lit windows.", \
+            "continuity never edits prose"
+        scenes = json.loads((gui / "scenes.json").read_text())
+        assert scenes[0]["state_updated"] is True
+        sums = json.loads((gui / "summaries.json").read_text())
+        assert sums["scenes"]["s001"]["detailed"].startswith("Mara opens")
+        assert sums["scenes"]["s001"]["brief"] == "Mara opens the gate."
+        assert sums["scenes"]["s001"]["text_hash"]
+        backups = list((gui / "state_history").glob("before_s001_*.md"))
+        assert len(backups) == 1 and \
+            backups[0].read_text(encoding="utf-8") == "Mara is at the yard.\n"
+        assert (gui / "state.md").read_text(encoding="utf-8") == \
+            "Mara is inside the yard.\n"
+
+        # --- summary-only for s002 (explicit flags; state untouched)
+        state_after_s1 = (gui / "state.md").read_text(encoding="utf-8")
+        win.select_item("manuscript", "s002", None)
+        win.summary_only_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        assert "Mara closes the gate behind her." in \
+            win.continuity_preview.toPlainText()
+        assert "UPDATED STATE" not in win.continuity_preview.toPlainText()
+        win.continuity_accept_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        scenes = json.loads((gui / "scenes.json").read_text())
+        assert not scenes[1].get("state_updated"), \
+            "summary-only never sets state_updated"
+        assert (gui / "state.md").read_text(encoding="utf-8") == \
+            state_after_s1
+        assert len(list((gui / "state_history").glob("*"))) == 1
+
+        # --- compress s001..s001 (explicit From/To; replace not needed)
+        win.compress_from.setCurrentText("s001")
+        win.compress_to.setCurrentText("s001")
+        win.compress_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        assert "Mara opened the gate." in win.continuity_preview.toPlainText()
+        win.continuity_accept_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        sums = json.loads((gui / "summaries.json").read_text())
+        assert len(sums["arcs"]) == 1
+        assert sums["arcs"][0]["from"] == "s001" and \
+            sums["arcs"][0]["to"] == "s001"
+        assert sums["arcs"][0]["text"] == "Mara opened the gate."
+        assert sums["scenes"]["s001"]["detailed"], "scene summaries kept"
+
+        # --- reports: critique and check, saved explicitly
+        win.tabs.setCurrentIndex(gw.REVIEW)
+        win.critique_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        assert '1. [style-rule] "counts"' in win.report_view.toPlainText()
+        win.report_save_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        crit = (gui / "critiques" / "s001.md").read_text(encoding="utf-8")
+        assert crit.startswith("# Critique s001 (")
+        assert crit.endswith("vary the verb\n")
+        win.check_scene_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        assert win.report_view.toPlainText().startswith("# Check scene s001 (")
+        win.report_save_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        chk = (gui / "checks" / "s001.md").read_text(encoding="utf-8")
+        assert chk.startswith("# Check scene s001 (") and chk.endswith("\n")
+
+        # built-in report editing (no external editor)
+        win.report_list.setCurrentRow(0)
+        win.report_edit_btn.click()
+        win.report_edit.setPlainText(REVIEW_EDIT_NOTE)
+        win.report_save_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        assert (gui / "critiques" / "s001.md").read_text(
+            encoding="utf-8") == REVIEW_EDIT_NOTE
+        prevs = list((gui / "critiques").glob("s001_prev_*.md"))
+        assert len(prevs) == 1 and "vary the verb" in \
+            prevs[0].read_text(encoding="utf-8")
+
+        # --- revision: accept the first passage, skip the second
+        win.tabs.setCurrentIndex(gw.REVISION)
+        win.select_item("manuscript", "s001", None)
+        win.revise_btn.click()
+        assert _pump(a, lambda: not win._busy), "first passage settles"
+        assert "Mara counts the lit windows." in win.revise_view.toPlainText()
+        assert "Mara pushed the gate open." in win.revise_view.toPlainText()
+        win.revise_accept_btn.click()
+        assert _pump(a, lambda: not win._busy), "accept + next passage"
+        assert "She ticks off each pane." in win.revise_view.toPlainText()
+        win.revise_skip_btn.click()
+        assert _pump(a, lambda: not win._busy), "session completes"
+        assert "revised 1 passages" in win.revise_label.text()
+        assert "stale" in win.revise_label.text().lower()
+        t = json.loads((gui / "trees" / "s001.json").read_text())
+        assert t["nodes"]["n1"]["text"] == "Mara pushed the gate open."
+        assert t["nodes"]["n1"]["history"][-1]["by"] == "revise"
+        assert t["nodes"]["n1"]["history"][-1]["text"] == \
+            "Mara counts the lit windows."
+        assert t["head"] == "n2" and set(t["nodes"]) == {"n1", "n2"}
+        assert t["nodes"]["n2"]["text"] == "She ticks off each pane."
+
+        # --- status: read-only facts matching the CLI transcript
+        win.tabs.setCurrentIndex(gw.STATUS)
+        win.status_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        gui_status = win.status_view.toPlainText()
+        want = cli_status.replace(str(cli), "(ROOT)")
+        got = gui_status.replace(str(gui), "(ROOT)")
+        assert rf.normalize(got) == rf.normalize(want), \
+            "status facts must match the CLI calculations"
+
+        # --- export through the picker (no overwrite needed)
+        win.export_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        assert Path(gui_out).read_text(encoding="utf-8") == cli_manuscript
+        assert str(gui_out) in win.status.text()
+        assert "words" in win.status.text()
+        before = {f.relative_to(gui): f.stat().st_mtime_ns
+                  for f in gui.rglob("*") if f.is_file()}
+        win.close()
+
+        # --- reopen: saved reports/history/state readable, nothing re-runs
+        win2 = gw.MainWindow(str(gui), choice=_no_dialogs("review reopen"),
+                             provider_factory=lambda _p: fake)
+        win2.tabs.setCurrentIndex(gw.NOTES)
+        keys = [win2._notes_entries[i][0] for i in range(len(win2._notes_entries))]
+        assert "critiques:s001.md" in keys and "checks:s001.md" in keys
+        win2.select_note("state")
+        assert "Mara is inside the yard." in win2.notes_view.toPlainText()
+        win2.close()
+        after = {f.relative_to(gui): f.stat().st_mtime_ns
+                 for f in gui.rglob("*") if f.is_file()}
+        assert after == before, "reopening must not write project files"
+
+        # --- parity with the fixed-clock CLI fixtures
+        gui_snap = rf.snapshot(gui)
+        cli_snap = rf.snapshot(cli)
+        shared = ["state.md", "summaries.json", "scenes.json",
+                  "trees/s001.json", "trees/s002.json", "checks/s001.md"]
+        for key in shared:
+            assert gui_snap[key] == cli_snap[key], f"parity mismatch: {key}"
+        assert (root / "gui_manuscript.md").read_text(encoding="utf-8") == \
+            cli_manuscript
+    finally:
+        for k, v in saved_t.items():
+            setattr(utils, k, v)
+        utils.pydoc.pager = saved_pager
+        utils.subprocess.run = saved_run
+        builtins.input = saved_input
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -2352,6 +2633,7 @@ CASES = {
     "case_planning_outline": case_planning_outline,
     "case_planning_scenes": case_planning_scenes,
     "case_planning_card_edit": case_planning_card_edit,
+    "case_review_journey": case_review_journey,
 }
 
 
