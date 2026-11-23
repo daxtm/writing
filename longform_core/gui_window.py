@@ -137,6 +137,8 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._op_id = 0
         self._thread = None
+        self._settling = False       # inside the terminal-op handler; only
+                                     # _dispatch chains are allowed to start
         self._token = CancellationToken()
         self._batch = None            # {"scene","parent","saved","streamed"}
         self._preview_text = ""
@@ -1157,6 +1159,8 @@ class MainWindow(QMainWindow):
             return self._report_save_edit_now() is not None
         if pick == "Discard":
             self._report_edit_dirty = False
+            self.report_edit.setPlainText(target["text"])
+            self._update_review_view()
             return True
         self._status("Cancelled; the edit is kept and nothing changed.")
         return False
@@ -1257,7 +1261,7 @@ class MainWindow(QMainWindow):
             self._status(str(e), error=True)
             return
         self._report_edit_target = {"sub": sub, "name": name,
-                                    "baseline": baseline}
+                                    "baseline": baseline, "text": text}
         self._report_edit_dirty = False
         self.report_edit.setPlainText(text)
         self.report_edit_label.setText(
@@ -1537,9 +1541,19 @@ class MainWindow(QMainWindow):
             return ok
         if pick == "Discard":
             self._cont["dirty"] = False
+            self._cont_restore_edit()
             return True
         self._status("Cancelled; the edit is kept and nothing changed.")
         return False
+
+    def _cont_restore_edit(self):
+        """Discard: put the editor back on the preview's baseline content."""
+        prep = self._cont["prep"]
+        if self._cont["kind"] == "compress" or self._cont_editing == "raw":
+            self.continuity_edit.setPlainText(self._cont["raw"])
+        else:
+            self.continuity_edit.setPlainText(
+                ro.edit_blob(prep, self._cont["secs"]))
 
     def _cont_after_edit(self, text):
         """Re-parse a saved edit and return to the preview (CLI edit flow,
@@ -1635,7 +1649,7 @@ class MainWindow(QMainWindow):
         """Arc preview for the inclusive From–To range. An overlap collision
         offers the explicit whole-arc Replace confirmation; declining makes
         no request and no write."""
-        if self._busy:
+        if self._busy and not self._settling:
             self._status("An operation is running; continuity actions are "
                          "paused until it settles.", error=True)
             return
@@ -1971,6 +1985,115 @@ class MainWindow(QMainWindow):
         self.revise_edit_label.setText("")
         self._update_revise_view()
 
+    def _resolve_saved_sources(self, action):
+        """Revise/Export run only from saved sources: unsaved steering,
+        planning, continuity-preview, report and revision edits are resolved
+        with Save/Discard/Cancel first. A successful Save never silently
+        launches the action — it must be repeated explicitly; Discard
+        abandons the local edits and continues; Cancel keeps everything."""
+        if self._scene_sel is not None and self.dirty():
+            pick = self._choice(
+                "Unsaved steering",
+                f"Steering for {self._scene_sel} has unsaved changes. Save "
+                f"before {action}?", ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self._persist(self.steer_editor.toPlainText()):
+                    return False
+                self._status(f"Steering saved; press {action} again.")
+                return False
+            if pick != "Discard":
+                self._status("Cancelled; the prose is unsaved and nothing "
+                             "ran.")
+                return False
+        if self._planning_dirty():
+            pick = self._choice(
+                "Unsaved planning input",
+                f"Settings, bible, outline or scene editing has unsaved "
+                f"changes. Save before {action}?",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self._save_planning_dirty():
+                    return False
+                self._status(f"Planning edits saved; press {action} again.")
+                return False
+            if pick == "Discard":
+                self._discard_planning_dirty()
+            else:
+                self._status("Cancelled; the planning edits are kept and "
+                             "nothing ran.")
+                return False
+        if self._report_edit_target is not None and self._report_edit_dirty:
+            target = self._report_edit_target
+            pick = self._choice(
+                "Unsaved report edit",
+                f"The built-in report editor for {target['sub']}/"
+                f"{target['name']}.md has unsaved changes. Save before "
+                f"{action}?", ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                res = self._report_save_edit_now()
+                if res is None:
+                    return False
+                self._report_edit_target = None
+                self._report_edit_dirty = False
+                self.report_edit.setPlainText("")
+                self.report_edit_label.setText("")
+                self.refresh(force=True)
+                self._update_review_view()
+                self._status(f"Saved {target['sub']}/{target['name']}.md; "
+                             f"press {action} again.")
+                return False
+            if pick == "Discard":
+                self._report_edit_dirty = False
+                self.report_edit.setPlainText(target["text"])
+                self._update_review_view()
+            else:
+                self._status("Cancelled; the edit is kept and nothing "
+                             "changed.")
+                return False
+        if self._cont is not None and self._cont_editing is not None \
+                and self._cont.get("dirty"):
+            pick = self._choice(
+                "Unsaved continuity edit",
+                f"The built-in continuity editor has unsaved changes. Save "
+                f"them to the existing input history before {action}?",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                res = self._cont_save_input_now()
+                if res is None:
+                    return False
+                self._cont_after_edit(self.continuity_edit.toPlainText())
+                self._status(f"Saved {res['saved']}; press {action} again.")
+                return False
+            if pick == "Discard":
+                self._cont["dirty"] = False
+                self._cont_restore_edit()
+            else:
+                self._status("Cancelled; the edit is kept and nothing "
+                             "changed.")
+                return False
+        if self._revision is not None and self._rev_editing \
+                and self._revision.get("dirty"):
+            rv = self._revision
+            pick = self._choice(
+                "Unsaved revision edit",
+                f"The built-in revision editor has unsaved changes. Save "
+                f"them to the existing input history before {action}?",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                res = self._rev_save_input_now()
+                if res is None:
+                    return False
+                self._status(f"Saved {res['saved']}; press {action} again.")
+                return False
+            if pick == "Discard":
+                rv["dirty"] = False
+                self.revise_edit.setPlainText(rv.get("text") or "")
+            else:
+                self._status("Cancelled; the edit is kept and nothing "
+                             "changed.")
+                return False
+        return True
+
     def revise_begin(self):
         """Start (or restart) the shared revision session for the selected
         scene; missing notes show the CLI's prerequisite message."""
@@ -1984,7 +2107,7 @@ class MainWindow(QMainWindow):
                          f"credentials (api_key in project.json or export "
                          f"{env}=...).", error=True)
             return
-        if not self._resolve_rev_dirty("beginning a new revision session"):
+        if not self._resolve_saved_sources("Revise"):
             return
         scene = self._scene_sel
         if scene is None:
@@ -2121,6 +2244,7 @@ class MainWindow(QMainWindow):
             return ok
         if pick == "Discard":
             self._revision["dirty"] = False
+            self.revise_edit.setPlainText(rv.get("text") or "")
             return True
         self._status("Cancelled; the edit is kept and nothing changed.")
         return False
@@ -2260,9 +2384,7 @@ class MainWindow(QMainWindow):
             self._status("An operation is running; export is paused until "
                          "it settles.", error=True)
             return
-        if not self._resolve_review_dirty("exporting") or \
-                not self._resolve_report_dirty("exporting") or \
-                not self._resolve_rev_dirty("exporting"):
+        if not self._resolve_saved_sources("Export"):
             return
         default = str(self._root / "manuscript.md")
         picked, _flt = self._save_picker("Export: choose the manuscript "
@@ -2353,7 +2475,7 @@ class MainWindow(QMainWindow):
     def scenes_generate(self):
         """Generate cards from the saved outline (worker); force-equivalent
         confirmation is offered through the worker error path."""
-        if self._busy:
+        if self._busy and not self._settling:
             return
         over = self._scenes_overview or {}
         if over.get("error") or not over.get("outline"):
@@ -3503,6 +3625,7 @@ class MainWindow(QMainWindow):
         self._revision = None
         self._rev_editing = False
         self._status_facts = None
+        self._settling = False
         self._cont = None
         self._cont_editing = None
         self._bind_steering(None)
@@ -3947,8 +4070,10 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- worker
 
     def _dispatch(self, fn, kind="generate", rows=None):
-        """Start one operation on the worker thread; refuses when busy."""
-        if self._busy:
+        """Start one operation on the worker thread; refuses when busy
+        (settlement handlers may chain the next operation of the same
+        sequence). The busy gate clears only on actual thread finish."""
+        if self._busy and not self._settling:
             return False
         self._op_id += 1
         self._op_kind = kind
@@ -3956,9 +4081,12 @@ class MainWindow(QMainWindow):
         self._view_override = None
         op_id = self._op_id
         self._token = CancellationToken()
-        thread = OpThread(op_id, lambda sink: fn(sink, self._token), parent=self)
+        token = self._token
+        thread = OpThread(op_id, lambda sink, tok=token: fn(sink, tok),
+                          parent=self)
         thread.event_sig.connect(self._on_worker_event)
         thread.done_sig.connect(self._on_worker_done)
+        thread.finished.connect(lambda t=thread: self._on_thread_finished(t))
         thread.finished.connect(thread.deleteLater)
         self._thread = thread
         self._busy = True
@@ -3997,70 +4125,126 @@ class MainWindow(QMainWindow):
             self._status("warning: a response cleaned to empty and was discarded")
 
     def _on_worker_done(self, op_id, outcome, value):
-        if op_id != self._op_id:
-            return  # a superseded operation settled late
-        self._busy = False
+        """One terminal outcome per operation. Settlement runs here, but the
+        busy gate stays on until the worker thread has actually finished
+        (`_on_thread_finished`): a terminal result signal alone never
+        re-enables conflicting actions."""
+        if op_id != self._op_id or self._thread is None:
+            return  # a superseded or already-settled operation
+        settled = op_id
+        self._settling = True
+        try:
+            if outcome == "ok":
+                try:
+                    self._on_op_ok(value)
+                except Exception as e:  # noqa: BLE001 — a settlement bug
+                    self._status(       # must never wedge the controls
+                        f"settlement error: {type(e).__name__}: {e}",
+                        error=True)
+            elif outcome == "cancelled":
+                self._on_op_cancelled()
+            else:
+                self._on_op_error(value)
+        finally:
+            self._settling = False
+        if self._op_id != settled:
+            return  # a chained operation already owns the gate
+        self._update_steering_ui()
+
+    def _on_thread_finished(self, thread):
+        """The busy gate clears only when the worker thread has actually
+        finished — never merely because the terminal result arrived."""
+        if thread is not self._thread:
+            return  # superseded or replaced; the gate belongs to the live op
         self._thread = None
-        if outcome == "ok":
-            try:
-                self._on_op_ok(value)
-            except Exception as e:  # noqa: BLE001 — a settlement bug must
-                self._busy = False  # never wedge the window's controls
-                self._status(f"settlement error: {type(e).__name__}: {e}",
-                             error=True)
-            self._update_steering_ui()
-        elif outcome == "cancelled":
-            if self._op_kind == "status_overview":
-                self._update_steering_ui()
-                self._status("Stopped; the status view is unchanged "
-                             "(read-only facts, nothing was written).")
+        self._settling = False
+        self._busy = False
+        self._update_steering_ui()
+
+    def _on_op_cancelled(self):
+        """Cooperative Stop settlement: completed writes stay saved, the
+        provisional output is discarded and the messages name exactly what
+        happened (never a rollback promise)."""
+        self._update_steering_ui()
+        kind = self._op_kind
+        if kind == "status_overview":
+            self._status("Stopped; the status view is unchanged "
+                         "(read-only facts, nothing was written).")
+            return
+        if kind == "export_write":
+            self._status("Stopped; nothing was written.")
+            return
+        if kind in ("continuity_generate", "continuity_input",
+                    "continuity_accept"):
+            self._status("Stopped; nothing was accepted. Saved inputs "
+                         "and previously accepted continuity are "
+                         "unchanged.")
+            return
+        if kind in ("critique_generate", "check_generate"):
+            self._status("Stopped; no preview was kept and nothing was "
+                         "written. Saved reports are unchanged.")
+            return
+        if kind == "report_save":
+            self._status("Stopped; the report was not written. Existing "
+                         "reports and the open edit are unchanged.")
+            return
+        if kind == "revise_input":
+            self._status("Stopped; the proposal edit was not saved and the "
+                         "node is unchanged.")
+            return
+        if kind == "revise_accept":
+            rv = self._revision
+            changed = rv["session"].changed if rv is not None else 0
+            self._status(f"Stopped; this passage was not changed. "
+                         f"{changed} earlier accepted revision(s) remain "
+                         "saved.")
+            return
+        if kind == "revise_generate":
+            rv = self._revision
+            if rv is None:
+                self._status("Stopped; no revision was accepted and "
+                             "nothing was saved.")
                 return
-            if self._op_kind == "export_write":
-                self._update_steering_ui()
-                self._status("Stopped; nothing was written.")
+            changed = rv["session"].changed
+            self._rev_reset()
+            self._status(f"revised {changed} passages — stopped; remaining "
+                         "passages were not revised.")
+            return
+        self._preview_text = ""
+        self.preview.setPlainText("")
+        self._status("Stopped; nothing was saved. Head and saved "
+                     "branches are unchanged.")
+
+    def _on_op_error(self, value):
+        self._update_steering_ui()
+        self._pending_action = None   # a failed save never continues a
+        self._pending_root = None     # deferred transition
+        if getattr(value, "collision", False) and \
+                self._op_kind in ("import", "scenes_generate",
+                                  "compress_generate"):
+            if self._op_kind == "scenes_generate":
+                pick = self._choice(
+                    "Replace drafted scenes?",
+                    str(value) + "\n\nConfirming makes the provider call "
+                    "and previews replacement candidates; scenes.json "
+                    "and every tree file stay unchanged until you accept "
+                    "a preview.", ["Generate (force)", "Cancel"])
+                if pick == "Generate (force)":
+                    self._scenes_force_once = True
+                    self.scenes_generate()
+                else:
+                    self._status("Force declined; no request was made "
+                                 "and no scene or tree file changed.")
                 return
-            if self._op_kind in ("continuity_generate", "continuity_input",
-                                 "continuity_accept"):
-                self._update_steering_ui()
-                self._status("Stopped; nothing was accepted. Saved inputs "
-                             "and previously accepted continuity are "
-                             "unchanged.")
+            if self._op_kind == "compress_generate":
+                self._on_compress_collision(value)
                 return
-            self._update_steering_ui()
-            self._preview_text = ""
-            self.preview.setPlainText("")
-            self._status("Stopped; nothing was saved. Head and saved "
-                         "branches are unchanged.")
-        else:
-            self._update_steering_ui()
-            self._pending_action = None   # a failed save never continues a
-            self._pending_root = None     # deferred transition
-            if getattr(value, "collision", False) and \
-                    self._op_kind in ("import", "scenes_generate",
-                                      "compress_generate"):
-                if self._op_kind == "scenes_generate":
-                    pick = self._choice(
-                        "Replace drafted scenes?",
-                        str(value) + "\n\nConfirming makes the provider call "
-                        "and previews replacement candidates; scenes.json "
-                        "and every tree file stay unchanged until you accept "
-                        "a preview.", ["Generate (force)", "Cancel"])
-                    if pick == "Generate (force)":
-                        self._scenes_force_once = True
-                        self.scenes_generate()
-                    else:
-                        self._status("Force declined; no request was made "
-                                     "and no scene or tree file changed.")
-                    return
-                if self._op_kind == "compress_generate":
-                    self._on_compress_collision(value)
-                    return
-                self._on_import_collision(value)
-                return
-            self._status(str(value), error=True)
-            if getattr(value, "stale", False):
-                self._status(str(value) + " — Reload (Refresh) or retry.",
-                             error=True)
+            self._on_import_collision(value)
+            return
+        self._status(str(value), error=True)
+        if getattr(value, "stale", False):
+            self._status(str(value) + " — Reload (Refresh) or retry.",
+                         error=True)
 
     def _on_op_ok(self, value):
         kind = self._op_kind
@@ -4661,7 +4845,7 @@ class MainWindow(QMainWindow):
         self._dispatch(fn, kind="scene")
 
     def mark_done(self):
-        if self._busy or self._scene_sel is None:
+        if (self._busy and not self._settling) or self._scene_sel is None:
             return
         scene = self._scene_sel
         self._op_scene = scene
@@ -4800,8 +4984,13 @@ class MainWindow(QMainWindow):
 
     def _wait_for_settlement(self):
         """Pump GUI events until the worker settles (never a blocking join,
-        never a thread kill). Bounded loop; the operation itself is bounded by
-        the configured request timeouts."""
+        never a thread kill). Cooperative-timeout limit: the wait itself is
+        bounded by this event-pump loop, the operation by its configured
+        request timeouts — if the bound runs out the close is abandoned
+        (the window stays open) instead of force-terminating the thread.
+        Nontransactional-save limit: an operation's commit groups are not
+        atomic across files; Stop lands at group boundaries, so completed
+        groups stay saved and the settlement messages name what happened."""
         guard = 0
         while self._busy and guard < 200000:
             QApplication.processEvents()
@@ -5074,4 +5263,24 @@ class MainWindow(QMainWindow):
             elif pick != "Discard":  # Cancel or dismissed
                 ev.ignore()
                 return
+        if self._planning_dirty():
+            pick = self._choice(
+                "Unsaved planning input",
+                "Settings, bible, outline or scene editing has unsaved "
+                "changes. Save before closing?",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self._save_planning_dirty():
+                    ev.ignore()
+                    return
+            elif pick == "Discard":
+                self._discard_planning_dirty()
+            else:
+                ev.ignore()
+                return
+        if not self._resolve_report_dirty("closing") or \
+                not self._resolve_review_dirty("closing") or \
+                not self._resolve_rev_dirty("closing"):
+            ev.ignore()
+            return
         ev.accept()

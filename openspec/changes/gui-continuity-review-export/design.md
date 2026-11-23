@@ -103,7 +103,10 @@ Prevent actions from retargeting work if selection changes while it runs.
 One operation at a time includes the interval until the underlying thread
 finishes: do not clear the busy gate early merely because a terminal-result
 signal arrived. Reuse/fix current settlement handling and retain one terminal
-outcome. Stop checks the token before requests, at available chunk callbacks,
+outcome. (Implemented as `_on_worker_done` settling without clearing the
+gate, plus `_on_thread_finished` clearing it only for the live worker thread;
+`_settling` lets settlement chain the next operation of a sequence.) Stop
+checks the token before requests, at available chunk callbacks,
 after responses and before the next commit. `Api.chat` is currently a
 nonstreaming request; show indeterminate progress and respect its configured
 timeouts instead of promising immediate Stop or inventing a streaming engine.

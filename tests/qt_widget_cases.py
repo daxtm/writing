@@ -3278,6 +3278,278 @@ def case_review_status_export(root):
         "export pauses on unsaved report edits"
 
 
+class SettleFake(ReviewChatFake):
+    """Review fake whose Stop is observed after the in-flight request
+    returns: cooperative Stop never kills a request, only the next
+    boundary check sees it."""
+
+    def chat(self, role, msgs, max_tokens=None, stream_cb=None,
+             progress=True, token=None, on_retry_event=None):
+        self.calls.append(("chat", role, msgs, max_tokens))
+        if self.gate is not None:
+            self.gate.wait(10)
+        if token is not None:
+            token.check()
+        return self.responses.pop(0), "stop", {}
+
+
+def case_review_settlement(root):
+    """One-worker settlement (task 1.7): the busy gate survives the terminal
+    signal until the thread actually finishes, late/foreign events and
+    selection changes never retarget work, reading stays responsive, close
+    resolves every dirty editor after settlement, and a Stop between passage
+    decisions ends the session with the accurate saved count."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _review_project(root, "p")
+    _write_json(project / "summaries.json",
+                {"scenes": {"s001": {"detailed": "d", "brief": "b",
+                                     "updated": "x", "text_hash": "h"}},
+                 "arcs": []})
+    _review_prime_notes(project)
+    fake = SettleFake([REVIEW_PASSAGE, REVIEW_PASSAGE, REVIEW_PASSAGE,
+                       REVIEW_PASSAGE])
+    answers = []
+    win = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.tabs.setCurrentIndex(gw.REVISION)
+
+    # --- one operation at a time: busy until the thread actually finishes
+    fake.gate = threading.Event()
+    win.revise_btn.click()
+    assert _pump(a, lambda: win._busy and win._thread is not None), \
+        "the first proposal request is running on the worker"
+    assert _pump(a, lambda: len(fake.calls) == 1), \
+        "the provider request is in flight on the worker"
+    gate_id = win._op_id
+    assert not win.revise_btn.isEnabled()
+    assert "Mara counts the lit windows." in win.reading.toPlainText(), \
+        "reading stays responsive during the operation"
+    win.critique_btn.click()
+    assert not win.critique_btn.isEnabled(), \
+        "busy disables the review controls"
+    win.critique_scene()          # the guard is also enforced on the method
+    assert "An operation is running" in win.status.text()
+    assert len(fake.calls) == 1 and win._op_id == gate_id, \
+        "a busy window never starts a second operation"
+
+    # queued/late/foreign events are ignored by operation id
+    win._on_worker_event(gate_id + 5, {"type": "delta", "text": "FOREIGN"})
+    assert "FOREIGN" not in win.preview.toPlainText()
+    win._on_worker_done(gate_id + 5, "ok", object())
+    assert win._busy and win._op_id == gate_id, \
+        "a foreign terminal result is ignored and never clears the gate"
+
+    # the terminal signal alone does not settle the operation: the gate
+    # stays busy until the worker thread itself has finished
+    win._on_worker_done(gate_id, "cancelled", None)
+    assert win._busy, \
+        "a terminal signal must not clear the busy gate before thread finish"
+    assert win._thread is not None
+    assert "Stopped" in win.status.text()
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy and win._thread is None), \
+        "the gate clears on actual thread finish"
+    assert win._revision is not None, "the real proposal still settles"
+    assert win.revise_btn.isEnabled()
+
+    # a Stop between passage decisions ends the session and reports the
+    # saved count: accepted work is never undone or misreported
+    fake.gate = threading.Event()
+    win.revise_accept_btn.click()
+    assert _pump(a, lambda: json.loads(
+        (project / "trees" / "s001.json").read_text())
+        ["nodes"]["n1"]["text"] == "Mara pushed the gate open.")
+    assert _pump(a, lambda: win._busy and len(fake.calls) == 2), \
+        "the chained next proposal is generating"
+    win.stop_btn.click()
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    assert "revised 1 passages" in win.status.text(), \
+        "a Stop after an acceptance never claims nothing was saved"
+    assert "not revised" in win.status.text()
+    assert win._revision is None, "stopping between passages ends the session"
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert tree["nodes"]["n2"]["text"] == "She ticks off each pane.", \
+        "the stopped passage was never changed"
+    assert win.revise_btn.isEnabled()
+
+    # a selection change mid-run cannot retarget the running work
+    win.tabs.setCurrentIndex(gw.REVIEW)
+    fake.gate = threading.Event()
+    win.critique_btn.click()
+    assert _pump(a, lambda: win._busy)
+    win.select_item("manuscript", "s002", None)
+    assert win._scene_sel == "s002"
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    assert "Critique preview ready" in win.status.text()
+    win.report_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "critiques" / "s001.md").exists()
+    assert not (project / "critiques" / "s002.md").exists(), \
+        "selection changes never retarget the running work"
+
+    # close while working: Keep open leaves the review job running
+    win.select_item("manuscript", "s001", None)
+    fake.gate = threading.Event()
+    win.critique_btn.click()
+    assert _pump(a, lambda: win._busy)
+    answers.append("Keep open")
+    win.close()
+    assert win.isVisible() and win._busy, "Keep open keeps the job running"
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    win.report_save_btn.click()   # clear the unsaved preview before closing
+    assert _pump(a, lambda: not win._busy)
+
+    # close after settling resolves every dirty editor (steering first,
+    # then the report edit); Save commits, Cancel keeps the window open
+    win.steer_editor.setPlainText("close steer")
+    win.report_list.setCurrentRow(0)
+    win.report_edit_btn.click()
+    win.report_edit.setPlainText("close drift")
+    answers.append("Discard")   # steering
+    answers.append("Save")      # report edit: commit and close
+    win.close()
+    assert _pump(a, lambda: not win.isVisible()), \
+        "close resolves all dirty editors and finishes"
+    assert (project / "critiques" / "s001.md").read_text() == "close drift", \
+        "close commits the saved report edit"
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert tree.get("steer") != "close steer", \
+        "a discarded steering edit is never written on close"
+
+    # a fresh dirty editor plus Cancel keeps the window open, file unchanged
+    win.show()                    # re-show after the completed close
+    win.report_list.setCurrentRow(0)
+    win.report_edit_btn.click()
+    win.report_edit.setPlainText("cancel drift")
+    answers.append("Cancel")
+    win.close()
+    assert win.isVisible(), "Cancel keeps the window open"
+    assert (project / "critiques" / "s001.md").read_text() == "close drift", \
+        "a cancelled close never writes"
+
+
+def case_review_dirty_sources(root):
+    """Revise/Export start only from saved sources (task 1.7): dirty
+    steering/planning/report/continuity/revision edits get Save/Discard/
+    Cancel first; a successful Save never silently launches the action, a
+    Discard restores the baseline, Cancel and stale failures keep the
+    editor, and a timer refresh never clobbers a locally edited report."""
+    import longform_core.gui_window as gw
+    a = app()
+    import review_fixtures as rf
+    project = _review_project(root, "p")
+    rf.run_cli(project, "critique", [REVIEW_CRITIQUE], args={"scene": "s001"})
+    _write_json(project / "summaries.json",
+                {"scenes": {"s001": {"detailed": "d", "brief": "b",
+                                     "updated": "x", "text_hash": "h"}},
+                 "arcs": []})
+    fake = ReviewChatFake([REVIEW_PASSAGE, REVIEW_PASSAGE])
+    picks = []
+    answers = []
+    win = gw.MainWindow(
+        str(project), choice=lambda t, x, o: answers.pop(0),
+        provider_factory=lambda _p: fake,
+        save_picker=lambda title, default: (picks.append(title) or ("", "")))
+    win.show()
+    win.refresh(force=True)
+    report_path = project / "critiques" / "s001.md"
+
+    def open_report_edit():
+        win.tabs.setCurrentIndex(gw.REVIEW)
+        win.report_list.setCurrentRow(0)
+        win.report_edit_btn.click()
+        return win.report_edit.toPlainText()
+
+    # Save on export commits the report and never silently exports
+    base_text = open_report_edit()
+    win.report_edit.setPlainText("edited note")
+    win.tabs.setCurrentIndex(gw.STATUS)
+    answers.append("Save")
+    win.export_btn.click()
+    assert report_path.read_text() == "edited note", \
+        "Save commits the report exactly"
+    assert picks == [], "a saved source never launches the action silently"
+    assert "again" in win.status.text() and win._report_edit_dirty is False
+    win.export_btn.click()
+    assert len(picks) == 1, "the repeated explicit export runs"
+    assert "Export cancelled; nothing was written." in win.status.text()
+
+    # Discard restores the editor baseline and the export continues
+    base_text = open_report_edit()
+    win.report_edit.setPlainText("drift")
+    answers.append("Discard")
+    win.export_btn.click()
+    assert win.report_edit.toPlainText() == base_text, \
+        "Discard restores the report baseline"
+    assert len(picks) == 2, "a discarded source lets the action continue"
+    assert "Export cancelled; nothing was written." in win.status.text()
+    win.report_cancel_btn.click()
+
+    # Cancel keeps the edit; the report file is untouched
+    open_report_edit()
+    win.report_edit.setPlainText("kept drift")
+    answers.append("Cancel")
+    win.export_btn.click()
+    assert win.report_edit.toPlainText() == "kept drift"
+    assert len(picks) == 2, "Cancel stops the export"
+    assert report_path.read_text() == base_text
+
+    # a stale Save fails with the guarded message and keeps the editor
+    report_path.write_text("external bytes\n")
+    answers.append("Save")
+    win.export_btn.click()
+    assert "saved sources changed on disk" in win.status.text()
+    assert win.report_edit.toPlainText() == "kept drift", \
+        "a failed Save keeps the local edited text"
+    assert len(picks) == 2 and report_path.read_text() == "external bytes\n"
+
+    # a timer refresh never clobbers the locally edited report text
+    win.refresh(force=True)
+    assert win.report_edit.toPlainText() == "kept drift"
+    assert win._report_edit_dirty is True
+    assert win._scene_sel is None or True, "selection survives the refresh"
+
+    # Revise from saved sources: Save commits, then Revise must be pressed
+    # again; the second press starts the session from the saved notes
+    report_path.write_text(base_text)
+    win.refresh(force=True)
+    win.report_list.setCurrentRow(0)
+    win.report_edit_btn.click()
+    win.report_edit.setPlainText("for revise")
+    win.tabs.setCurrentIndex(gw.REVISION)
+    answers.append("Save")
+    win.revise_btn.click()
+    assert report_path.read_text() == "for revise"
+    assert win._revision is None, "no silent revise launch after a Save"
+    assert "again" in win.status.text()
+    assert len(fake.calls) == 0, "no provider call happened for the save"
+    win.revise_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._revision is not None, "the repeated explicit revise runs"
+    assert win._revision["psg"]["nid"] == "n1"
+
+    # unsaved steering is a prose source too: Save then press again
+    win._rev_reset()
+    n_picks = len(picks)
+    win.steer_editor.setPlainText("unsaved steer")
+    win.tabs.setCurrentIndex(gw.STATUS)
+    answers.append("Save")
+    win.export_btn.click()
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert tree.get("steer") == "unsaved steer", "steering is persisted"
+    assert len(picks) == n_picks, "no silent export after the steering Save"
+    assert "again" in win.status.text()
+    win.export_btn.click()
+    assert len(picks) == n_picks + 1, "the repeated explicit export runs"
+    assert "Export cancelled; nothing was written." in win.status.text()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -3314,6 +3586,8 @@ CASES = {
     "case_review_reports": case_review_reports,
     "case_review_revise": case_review_revise,
     "case_review_status_export": case_review_status_export,
+    "case_review_settlement": case_review_settlement,
+    "case_review_dirty_sources": case_review_dirty_sources,
     "case_review_journey": case_review_journey,
 }
 

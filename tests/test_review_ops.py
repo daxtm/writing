@@ -1134,3 +1134,57 @@ def test_ops_export_guards(project, tmp_path):
     assert target.read_text(encoding="utf-8") == "target\n", \
         "the symlinked final target is never written through"
     link.unlink()
+
+
+# -------------------------------------------------- 1.7 stop / commit groups
+
+def test_ops_accept_stop_before_commit_group(project, tmp_path):
+    """A Stop raised before the acceptance group writes nothing: no state
+    backup, no state.md change, no summaries, no scenes flag (the token is
+    checked at the group boundary only)."""
+    from longform_core.cancel import Cancelled, CancellationToken
+    ops_root = _copy(project, tmp_path)
+    prep = ro.update_state_prepare(str(ops_root), "s001")
+    secs = ro.update_state_parse_response(RECORD_S1, prep)["secs"]
+    tok = CancellationToken()
+    tok.cancel()
+    with pytest.raises(Cancelled):
+        ro.update_state_accept(str(ops_root), prep, secs, token=tok)
+    assert (ops_root / "state.md").read_text() == "Mara is at the yard."
+    assert json.loads((ops_root / "summaries.json").read_text())["scenes"] \
+        == {}
+    assert not list((ops_root / "state_history").glob("before_s001_*")), \
+        "a Stop before the group never writes the state backup"
+
+
+def test_ops_accept_finishes_inflight_commit_group(project, tmp_path):
+    """Stop pressed while the acceptance group is already writing never
+    interrupts the tiny backup/state/summaries/scenes commit: the group
+    completes (no mid-group token check) and the completed writes are what
+    the GUI reports — no rollback promise."""
+    ops_root = _copy(project, tmp_path)
+    prep = ro.update_state_prepare(str(ops_root), "s001")
+    secs = ro.update_state_parse_response(RECORD_S1, prep)["secs"]
+
+    class StopMidGroup:
+        """Simulates Stop pressed after the group's boundary check passed."""
+
+        def __init__(self):
+            self.checks = 0
+
+        def check(self):
+            self.checks += 1
+            if self.checks > 1:
+                raise Cancelled("stopped")
+
+    tok = StopMidGroup()
+    out = ro.update_state_accept(str(ops_root), prep, secs, token=tok)
+    assert out["message"] == "saved summaries and state.md"
+    assert (ops_root / "state.md").read_text() == \
+        "Mara is inside the yard.\n"
+    assert list((ops_root / "state_history").glob("before_s001_*")), \
+        "the in-flight backup survived the mid-group Stop"
+    scenes = json.loads((ops_root / "scenes.json").read_text())
+    row = next(s for s in scenes if s["id"] == "s001")
+    assert row["state_updated"] is True
+    assert tok.checks == 1, "the commit group is never re-checked mid-write"
