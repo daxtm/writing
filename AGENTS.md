@@ -11,14 +11,14 @@ Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27`; argparse CLI, JSON
 Suite: `uv run --with pytest --with httpx pytest -q tests`; no lint/build step.
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
-Planned (not implemented): `uv run --script longform.py gui DIR` opens the native
-read-only Tkinter/ttk reader (ADR-0005, `add-desktop-reader`). Use the CLI's uv
-runtime: Tk works there locally, not in the system Python. No browser/server.
+`uv run --script longform.py gui DIR` opens the native read-only Tkinter/ttk
+reader (ADR-0005) in a blocking window; F5 refreshes, Ctrl+Q closes. Use the
+CLI's uv runtime: Tk works there locally, not in the system Python. No
+browser/server.
 
 ## Layout
 - `longform.py`: thin PEP 723 launcher; re-exports the package's public names so `import longform` keeps working.
-- `longform_core/`: the implementation — `config` (constants, default config, templates), `utils` (logging, file/JSON/text, diff/parse helpers), `project`, `api`, `tree`, `lore` (cards/books/matching), `prompt`, `checks`, `commands` (cmd_* and interactive helpers), `cli` (argparse/main).
-- Planned reader modules: `reader_model` (safe UI-independent writing snapshots), `gui` (native Tkinter/ttk widgets and refresh); do not describe them as shipped until implemented.
+- `longform_core/`: the implementation — `config` (constants, default config, templates), `utils` (logging, file/JSON/text, diff/parse helpers), `project`, `api`, `tree`, `lore` (cards/books/matching), `prompt`, `checks`, `commands` (cmd_* and interactive helpers), `reader_model` (safe UI-independent writing snapshots), `gui` (native Tkinter/ttk widgets and refresh), `cli` (argparse/main).
 - `scripts/`: check entry point; `tests/`: offline pytest suite.
 - `openspec/`: behavior specs and changes; `docs/`: roadmap and ADRs.
 - `.github/`: PR template; `myfic/`: private generated sample, never a test fixture.
@@ -28,5 +28,5 @@ runtime: Tk works there locally, not in the system Python. No browser/server.
 - Keep `myfic/` and the third-party `56295265-LLam_ception-1.3.json` preset untracked.
 - Never commit API keys or `.env`; synthetic test credentials only.
 - Tests are offline/deterministic: no live API calls; use MockTransport/fakes and temporary projects.
-- Planned GUI tests: model/CLI tests always run without Tk/display; real-widget smoke tests use withdrawn roots and skip only for unavailable Tk/display. Keep network guards unchanged.
+- GUI tests: model/CLI tests always run without Tk/display; real-widget smoke tests use withdrawn roots and skip only for unavailable Tk/display. Keep network guards unchanged.
 - Keep `longform.py` as the thin PEP 723 launcher over `longform_core/` (ADR-0003); behavior, output, and file formats are frozen behind the test suite. Monkeypatch at the owning module (e.g. `longform.api.warn`), not the launcher re-exports.

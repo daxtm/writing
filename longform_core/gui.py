@@ -3,14 +3,20 @@
 `ReaderApp` builds one withdrawn-capable root's UI and reads only through
 `reader_model` sanitized snapshots. It never writes project files, never
 starts servers/browsers, and never touches provider APIs.
+
+The tkinter import is guarded so importing this module never crashes a
+Tk-less interpreter; `launch()` converts that into a concise error.
 """
 
-import tkinter as tk
-from tkinter import font as tkfont
-from tkinter import ttk
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+    from tkinter import ttk
+except ImportError as _tk_error:  # missing Tk runtime; launch() reports it
+    tk = None
+    _TK_IMPORT_ERROR = _tk_error
 
 from . import reader_model as model
-
 REFRESH_MS = 2000
 MIN_SIZE = (900, 600)
 INIT_SIZE = "1200x800"
@@ -656,9 +662,7 @@ def launch(project_dir):
         print("gui: not a readable longform project (missing or invalid "
               "project.json): " + str(project_dir), file=sys.stderr)
         sys.exit(2)
-    try:
-        import tkinter as tk
-    except ImportError:
+    if tk is None:
         print("gui: this Python has no Tk runtime; use the project's uv runtime: "
               "uv run --script longform.py gui DIR (and check a desktop display "
               "is available)", file=sys.stderr)
