@@ -22,10 +22,12 @@ from PySide6.QtWidgets import (
 from .prompt import tail_trim_chars
 from .utils import word_diff
 from . import draft_operations as dop
+from . import planning_operations as plan
 from . import reader_model as rm
 from . import scene_steering as ss
 from .cancel import CancellationToken
 from .draft_worker import OpThread
+from .reader_model import SourceCache
 
 PRE_START_GUIDANCE = (
     "longform gui: native Wayland is required. If startup fails, check your "
@@ -36,6 +38,7 @@ REFRESH_MS = 2000
 
 # Tabs
 MANUSCRIPT, BRANCHES, DRAFT, SCENE, CONTEXT, LORE, NOTES = 0, 1, 2, 3, 4, 5, 6
+SETUP = 7
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -90,15 +93,19 @@ class MainWindow(QMainWindow):
     draft loop through shared operations on one background worker."""
 
     def __init__(self, dir_path, *, load=None, timer_factory=None, choice=None,
-                 provider_factory=None, picker=None):
+                 provider_factory=None, picker=None, dir_picker=None,
+                 preset_picker=None):
         super().__init__()
         self._root = Path(dir_path)
         self._load = load or rm.load_snapshot
-        self._cache = rm.SourceCache()
+        self._cache = SourceCache()
         self._choice = choice or _ask_choice
         self._timer_factory = timer_factory
         self._provider_factory = provider_factory
         self._picker = picker or self._default_picker
+        self._dir_picker = dir_picker or self._default_dir_picker
+        self._preset_picker = preset_picker or self._default_preset_picker
+        self._plan = plan.project_overview(self._root)
 
         self.snap = None              # last valid Snapshot
         self._stale_config = False    # required configuration currently invalid
@@ -123,6 +130,8 @@ class MainWindow(QMainWindow):
         self._draft_left = False
         self._scene_edit_dirty = {}   # scene -> user edited pov/cast fields
         self._editor_target = None
+        self._pending_root = None     # project root bound after Create/Open ok
+        self._import_src = None       # picked preset source bytes identity
         try:
             self._session = dop.session_info(self._root)
         except dop.OpError as e:
@@ -150,6 +159,18 @@ class MainWindow(QMainWindow):
 
         top = QHBoxLayout()
         top.setSpacing(6)
+        self.create_btn = QPushButton("Create…")
+        self.create_btn.setToolTip("Initialize a project directory with the "
+                                   "CLI init contents (create-missing-only; "
+                                   "existing files are never replaced)")
+        self.create_btn.clicked.connect(self.create_project)
+        top.addWidget(self.create_btn)
+        self.open_btn = QPushButton("Open…")
+        self.open_btn.setToolTip("Open an existing project directory; "
+                                 "reads without initializing or calling "
+                                 "the provider")
+        self.open_btn.clicked.connect(self.open_project_dialog)
+        top.addWidget(self.open_btn)
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setToolTip("Re-read saved sources; keeps selection, "
                                     "scroll, and unsaved steering")
@@ -192,6 +213,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_context_tab(), "Context")
         self.tabs.addTab(self._build_lore_tab(), "Lore")
         self.tabs.addTab(self._build_notes_tab(), "Notes")
+        self.tabs.addTab(self._build_setup_tab(), "Setup")
         right_l.addWidget(self.tabs, 1)
 
         steer_box = QGroupBox("Steering")
@@ -857,6 +879,193 @@ class MainWindow(QMainWindow):
         notes_split.setStretchFactor(1, 2)
         return notes_split
 
+    def _build_setup_tab(self):
+        """Setup pane: project state, preset import; settings arrive with the
+        settings task. Create/Open stay on the top bar for every state."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.setup_status = QLabel("")
+        self.setup_status.setWordWrap(True)
+        l.addWidget(self.setup_status)
+        row = QHBoxLayout()
+        self.preset_import_btn = QPushButton("Import writer preset…")
+        self.preset_import_btn.setToolTip("Pick a SillyTavern master-export "
+                                          "JSON; its original bytes are "
+                                          "copied to writer_preset.json. An "
+                                          "existing destination is never "
+                                          "overwritten.")
+        self.preset_import_btn.clicked.connect(self.import_preset)
+        row.addWidget(self.preset_import_btn)
+        row.addStretch(1)
+        l.addLayout(row)
+        self.preset_note = QLabel("")
+        self.preset_note.setWordWrap(True)
+        l.addWidget(self.preset_note)
+        self.setup_note = QLabel("")
+        self.setup_note.setWordWrap(True)
+        l.addWidget(self.setup_note)
+        l.addStretch(1)
+        return box
+
+    # ------------------------------------------------------------- create/open
+
+    def _resolve_dirty(self):
+        """Resolve unsaved input before a destructive transition (project
+        Create/Open); False cancels the transition."""
+        if self._scene_sel is not None and self.dirty():
+            pick = self._choice(
+                "Unsaved steering",
+                f"Steering for {self._scene_sel} has unsaved changes.",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self._persist(self.steer_editor.toPlainText()):
+                    return False
+            elif pick != "Discard":
+                return False
+        return True
+
+    def create_project(self):
+        """Desktop Create: pick a location, initialize create-missing-only."""
+        if self._busy:
+            self._status("An operation is running; Create is disabled until "
+                         "it settles.", error=True)
+            return
+        if not self._resolve_dirty():
+            return
+        picked = self._dir_picker("Create: choose a project directory",
+                                  self._plan.get("root") or self._root)
+        if not picked:
+            self._status("No location picked; nothing was created.")
+            return
+        target = plan.canonical_root(picked)
+        self._pending_root = target
+
+        def fn(sink, token):
+            return plan.init_project(target, token=token, events=sink)
+
+        self._dispatch(fn, kind="init")
+
+    def open_project_dialog(self):
+        """Desktop Open: select an existing directory and read it without
+        initializing, repairing or calling the provider."""
+        if self._busy:
+            self._status("An operation is running; Open is disabled until it "
+                         "settles.", error=True)
+            return
+        if not self._resolve_dirty():
+            return
+        picked = self._dir_picker("Open: choose a project directory",
+                                  self._plan.get("root") or self._root)
+        if not picked:
+            self._status("No location picked; the current project is "
+                         "unchanged.")
+            return
+        target = plan.canonical_root(picked)
+        if target == plan.canonical_root(self._root):
+            self._plan = plan.project_overview(target)
+            self.refresh(force=True)
+            self._status("Reopened the current project.")
+            return
+        self._pending_root = target
+
+        def fn(sink, token):
+            return plan.project_overview(target)
+
+        self._dispatch(fn, kind="open")
+
+    def _rebind_root(self, root):
+        """Bind a new project root; clear caches, baselines and planning
+        state, then reload the views."""
+        self._root = Path(root)
+        self._cache = SourceCache()
+        self.snap = None
+        self._sel_data = None
+        self._scene_sel = None
+        self._steer = None
+        self._batch = None
+        self._preview_text = ""
+        self._view_override = None
+        self._draft_left = False
+        self._stale_config = False
+        self._plan = plan.project_overview(self._root)
+        self._bind_steering(None)
+        self.refresh(force=True)
+        self._autoselect()
+
+    def _update_setup_tab(self):
+        """Refresh the setup pane from the read-only overview."""
+        p = self._plan
+        lines = [f"project: {p['root']}"]
+        if not p["exists"]:
+            lines.append("The directory does not exist yet. Create "
+                         "initializes it with the CLI init contents; "
+                         "nothing is created without an explicit Create.")
+        elif not p["config_ok"]:
+            lines.append("project.json is missing or invalid; setup stays "
+                         "usable and nothing is written against bad data. "
+                         "Create fills only missing files.")
+        else:
+            lines.append(f"title: {p['title']}  target words: "
+                         f"{p['target_words']}")
+            lines.append(f"scenes saved: {p['scenes']}"
+                         + (f"  (statuses: {', '.join(p['scene_status'])})"
+                            if p["scene_status"] else ""))
+            lines.append("outline.md: " + ("present" if p["outline_present"]
+                                           else "absent"))
+            missing = p["missing_files"]
+            if missing:
+                lines.append("missing init files: " + ", ".join(missing)
+                             + " (Create creates only these)")
+        if p["preset_found"]:
+            lines.append("writer preset: found")
+        else:
+            lines.append("writer preset: not found (import one here or "
+                         "configure roles.writer.preset in Settings)")
+        creds = []
+        if p["api_key_env"]:
+            creds.append(f"environment {p['api_key_env']}: "
+                         + ("set" if p["env_set"] else "not set"))
+        creds.append("effective credentials: "
+                     + ("available" if p["creds_ok"] else "missing"))
+        lines.append("credentials: " + "; ".join(creds)
+                     + " (availability only; no key value is shown)")
+        for w in p["warnings"]:
+            lines.append("warning: " + w)
+        self.setup_status.setText("\n".join(lines))
+
+    # ------------------------------------------------------------ preset import
+
+    def import_preset(self):
+        """Desktop preset import through the shared validation; no overwrite."""
+        if self._busy:
+            self._status("An operation is running; import is disabled until "
+                         "it settles.", error=True)
+            return
+        src = self._preset_picker("Import a SillyTavern master-export preset")
+        if not src:
+            self._status("No preset picked; nothing was written.")
+            return
+        root = plan.canonical_root(self._root)
+        self._import_src = src
+
+        def fn(sink, token):
+            return plan.import_preset(root, src, token=token, events=sink)
+
+        self._dispatch(fn, kind="preset_import")
+
+    def _default_dir_picker(self, title, proposed):
+        from PySide6.QtWidgets import QFileDialog
+        path = QFileDialog.getExistingDirectory(self, title,
+                                                str(proposed or self._root))
+        return path or None
+
+    def _default_preset_picker(self, title):
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(self, title, str(self._root),
+                                              "Presets (*.json)")
+        return path or None
+
     def _wire_tab_order(self):
         """Visible, predictable keyboard order: sidebar → reading → editor →
         actions → refresh/size."""
@@ -940,6 +1149,9 @@ class MainWindow(QMainWindow):
 
     def refresh(self, force=False):
         """Reload the snapshot; preserve selection, tab, scroll, focus, dirty."""
+        if force:
+            self._plan = plan.project_overview(self._root)
+        self._update_setup_tab()
         try:
             res = self._load(self._root, cache=self._cache, force=force)
         except OSError as e:
@@ -1159,6 +1371,8 @@ class MainWindow(QMainWindow):
             + ("; you left the draft loop (Leave draft again to re-enter)"
                if self._draft_left else ""))
         self.stop_btn.setEnabled(self._busy)
+        for b in (self.create_btn, self.open_btn, self.preset_import_btn):
+            b.setEnabled(not self._busy)
         has_batch = bool(self._batch and self._batch.get("saved"))
         for b in (self.accept_btn, self.view_btn, self.reroll_btn,
                   self.reroll_all_btn, self.add_btn, self.delete_btn,
@@ -1378,6 +1592,45 @@ class MainWindow(QMainWindow):
                                 if value.get("replaced") else "") + ")")
             else:
                 self._status("Lorebooks updated")
+        elif kind == "init" and isinstance(value, dict):
+            root = Path(value["root"])
+            created = value["created"] + value["dirs"]
+            if self._pending_root is not None and \
+                    plan.canonical_root(self._pending_root) == root:
+                self._pending_root = None
+                self._rebind_root(root)
+                msg = "initialized " + root.name + ": " + \
+                    (", ".join(created) if created else
+                     "(nothing; all files already exist)")
+                if value.get("preset"):
+                    msg += "; writer_preset.json imported"
+                self._status(msg)
+            else:
+                self.refresh(force=True)
+                self._status("initialized " + root.name)
+        elif kind == "open" and isinstance(value, dict):
+            root = Path(value["root"])
+            if self._pending_root is not None and \
+                    plan.canonical_root(self._pending_root) == root:
+                self._pending_root = None
+                if not value["exists"]:
+                    self._status("That directory does not exist; the current "
+                                 "project is unchanged.", error=True)
+                elif not value["config_ok"]:
+                    self._status("That directory has no valid project.json; "
+                                 "nothing was changed. Use Create there to "
+                                 "initialize it.", error=True)
+                else:
+                    self._rebind_root(root)
+                    self._status(f"opened {root.name} (read without "
+                                 "initializing or provider calls)")
+            else:
+                self.refresh(force=True)
+        elif kind == "preset_import" and isinstance(value, dict):
+            self.refresh(force=True)
+            self._status(f"imported {value['imported']} "
+                         f"({value['bytes']} bytes copied unchanged); "
+                         "readiness refreshed")
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
@@ -1861,6 +2114,7 @@ class MainWindow(QMainWindow):
         self._update_steering_pane()
         self._update_scene_tab()
         self._lore_refresh()
+        self._update_setup_tab()
         self._update_steering_ui()
 
     def _reconcile_selection(self):

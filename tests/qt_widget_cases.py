@@ -1408,7 +1408,7 @@ def case_planning_journey(root):
             '"beats": ["Mara counts."], "target_words": 1700}]</scenes>',
         ])
 
-    picks = {"dir": [str(missing)], "preset": [str(src / "master.json")]}
+    picks = {"dir": [None, str(missing)], "preset": [str(src / "master.json")]}
     choices = []
 
     win = gw.MainWindow(
@@ -1420,8 +1420,7 @@ def case_planning_journey(root):
     assert fake.calls == [], "opening a missing project makes no provider call"
 
     # -- Create through the directory picker; nothing without confirmation.
-    assert (missing / "project.json").exists() is False or True  # placeholder
-    picks["dir"].append(None)   # cancelled pick creates nothing
+    picks["dir"].append(None)   # a later cancelled pick creates nothing
     win.create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert not (missing / "project.json").exists(), \
@@ -1565,6 +1564,136 @@ def case_planning_journey(root):
     win2.close()
 
 
+def case_planning_create_open(root):
+    """Create/Open behavior: cancelled pickers, partial projects, invalid
+    open, preset import rules, dirty switches, and no provider/terminal use."""
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+
+    missing = root / "newproj"
+    dir_picks, preset_picks, choices = [], [], []
+
+    win = gw.MainWindow(str(missing), choice=lambda t, x, o: choices.pop(0),
+                        dir_picker=lambda t, p: dir_picks.pop(0),
+                        preset_picker=lambda t: preset_picks.pop(0))
+    win.show()
+    assert "does not exist" in win.setup_status.text().lower()
+
+    # cancelled Create and Open: nothing changes
+    before = sorted(str(p) for p in root.rglob("*")) + sorted(
+        str(p) for p in missing.rglob("*")) if missing.exists() else \
+        sorted(str(p) for p in root.rglob("*"))
+    dir_picks.append(None)
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "nothing was created" in win.status.text().lower()
+    dir_picks.append(None)
+    win.open_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert sorted(str(p) for p in root.rglob("*")) == before, \
+        "cancelled pickers create nothing"
+
+    # Create with the same root while a partial project is open
+    dir_picks.append(str(missing))
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (missing / "project.json").exists() and (missing / "trees").is_dir()
+    assert "initialized" in win.status.text().lower()
+    assert win._root == missing
+
+    # partial project: existing files are never replaced by a repeated Create
+    (missing / "project.json").write_text('{"title": "Kept"}\n',
+                                          encoding="utf-8")
+    (missing / "bible.md").unlink()
+    dir_picks.append(str(missing))
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert json.loads((missing / "project.json").read_text())["title"] == "Kept"
+    assert (missing / "bible.md").exists(), "only missing files are filled"
+
+    # preset import: cancelled picker, then a valid import
+    preset_picks.append(None)
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "no preset picked" in win.status.text().lower()
+    assert not (missing / "writer_preset.json").exists()
+
+    src = root / "master.json"
+    src.write_text(json.dumps({"preset": {}, "instruct": {}, "context": {},
+                               "sysprompt": {}}), encoding="utf-8")
+    preset_picks.append(str(src))
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (missing / "writer_preset.json").read_bytes() == src.read_bytes()
+    assert "imported" in win.status.text().lower()
+
+    # collision: warning, no overwrite, source untouched
+    preset_picks.append(str(src))
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not overwritten" in win.status.text().lower()
+    assert (missing / "writer_preset.json").read_bytes() == src.read_bytes()
+
+    # invalid JSON preset: error, nothing written
+    (missing / "writer_preset.json").unlink()
+    bad = root / "bad.json"
+    bad.write_text("{nope", encoding="utf-8")
+    preset_picks.append(str(bad))
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not valid JSON" in win.status.text()
+    assert not (missing / "writer_preset.json").exists()
+
+    # dirty steering: Save proceeds, Cancel blocks the destructive switch
+    _write_json(missing / "scenes.json", [_scene("s001")])
+    win.refresh(force=True)
+    win.select_item("manuscript", "s001", None)
+    win.steer_editor.setPlainText("dirty for switch")
+    other = root / "other"
+    from longform_core import planning_operations as plan
+    plan.init_project(other)
+
+    choices.append("Cancel")
+    dir_picks[:] = [str(other)]
+    win.open_btn.click()
+    assert win._root == missing, "Cancel keeps the current project"
+
+    choices.append("Save")
+    dir_picks[:] = [str(other)]
+    win.open_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._root == other, "Save completes before the switch"
+    assert json.loads((missing / "trees" / "s001.json").read_text())["steer"] \
+        == "dirty for switch"
+
+    # open on an invalid directory: reported, current project unchanged
+    broken = root / "broken"
+    broken.mkdir()
+    (broken / "project.json").write_text("{nope", encoding="utf-8")
+    dir_picks[:] = [str(broken)]
+    win.open_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._root == other, "an invalid Open does not replace the project"
+    assert "no valid project.json" in win.status.text()
+
+    # open a valid project
+    dir_picks[:] = [str(missing)]
+    win.open_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._root == missing
+    assert [r.id for r in win.snap.scenes] == ["s001"]
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -1576,7 +1705,6 @@ CASES = {
     "case_draft_edit_and_branches": case_draft_edit_and_branches,
     "case_draft_lore": case_draft_lore,
     "case_draft_help_and_leave": case_draft_help_and_leave,
-    "case_planning_journey": case_planning_journey,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,
@@ -1590,6 +1718,8 @@ CASES = {
     "case_refresh_preserves_state": case_refresh_preserves_state,
     "case_removed_node_and_scene": case_removed_node_and_scene,
     "case_invalid_config_and_recovery": case_invalid_config_and_recovery,
+    "case_planning_journey": case_planning_journey,
+    "case_planning_create_open": case_planning_create_open,
 }
 
 
