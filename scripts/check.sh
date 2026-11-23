@@ -32,7 +32,7 @@ if [ -d tests ]; then
 	bash scripts/build-standalone.sh >/dev/null
 	uv run --with pytest --with httpx pytest -q tests/test_standalone.py
 	echo "== tests"
-	uv run --with pytest --with httpx pytest -q tests --ignore=tests/test_standalone.py
+	uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests --ignore=tests/test_standalone.py
 else
 	echo "no tests/ yet: see docs/ROADMAP.md for the testing plan"
 fi
