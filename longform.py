@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx>=0.27"]
+# dependencies = ["httpx>=0.27", "pyside6>=6.12.0,<6.13"]
 # ///
 """longform.py - plan-then-collaborate longform fiction pipeline for Featherless.
 
@@ -56,9 +56,10 @@ from longform_core.utils import *      # noqa: F401,F403
 
 if __name__ == "__main__":
     try:
-        main()
+        code = main()
     except KeyboardInterrupt:
         print("\naborted")
         sys.exit(130)
     except (HttpErr, NoAnswerErr) as e:
         die(str(e))
+    sys.exit(code or 0)

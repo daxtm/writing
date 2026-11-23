@@ -20,117 +20,181 @@ tests. Existing CLI capabilities becoming GUI controls are in scope; changing
 their prompts, sampling policy, or file formats is not. Dependency provisioning
 may use network; test execution must not.
 
-## Planning baseline
+## Planning baseline and completion bar
 
-This extends the completed foundation below; the GUI milestones are new,
-unimplemented plans, not OpenSpec changes. No change artifacts are created here.
-`origin/main` currently has the CLI but no `gui` command. The separate
-`feat/reader-gui` branch contains the Tkinter/ttk reader, UI-independent
-`reader_model` snapshots, and ADR-0004/0005; it is not yet on main.
-Reuse its safe reading/model behavior and tests when available, not a second
-reader or a second writing engine. Integrating that work is a prerequisite of
-GUI milestone 1, not an instruction to merge it here.
+The owner's completion bar is **every feature the CLI/TUI has, start to finish,
+must exist in the GUI**. No individual change below completes the workspace.
+Completion requires the entire three-change remaining sequence, command/action
+parity tests, the from-empty-project through export demo and separate real
+Wayland acceptance. This plan does not authorize shipping.
 
-The existing `cmd_*` commands already implement the flow, but their `ask`,
-`$EDITOR`, paging, printing, and blocking API calls prevent direct button
-invocation. Extract only the operation being exposed, keep the CLI as an adapter,
-and reuse `Project`, `Tree`, `Lore`, prompt/check helpers, and `Api`.
-New desktop controls are necessary because neither the CLI nor the separate
-read-only reader supplies editable, asynchronous workflow interactions.
+The Qt reading/steering shell is implemented but unshipped on
+`feat/gui-wayland-shell`; it integrates the reader snapshots and ADR-0004/0005.
+Do not confuse that branch with `origin/main`. Its existing
+`openspec/changes/gui-wayland-shell/` records the shell, not working generation.
+The complete draft loop is implemented on this branch (real drafting Wayland
+acceptance remains pending). Milestone 2 is now implemented on this branch:
+`openspec/changes/gui-project-planning/` has its eight tasks landed
+(Create/Open through saved scene cards, offline parity and offscreen journey
+coverage; real Wayland Create-to-scene acceptance recorded as PENDING in
+`openspec/changes/gui-project-planning/evidence.md`). Milestone 3
+(`gui-continuity-review-export`) is now selected/proposed in
+`openspec/changes/gui-continuity-review-export/`, with eight unchecked test-first
+tasks. It is not implemented; this proposal does not authorize shipping.
+Stop planning after this final change: after implementation, audit the full
+parity matrix below before any whole-workspace completion claim.
 
-## GUI milestone 1 — Walking skeleton: steer, generate, accept on Wayland
+The existing `cmd_*` commands already implement the rules. Fix/extract those
+boundaries, keeping CLI adapters and reusing `Project`, `Tree`, `Lore`, prompt/
+check helpers and `Api`. Terminal input, `$EDITOR`, paging and blocking calls
+cannot serve desktop controls; neither a duplicated writing engine nor terminal
+automation is acceptable. ADR-0007 governs shared operations and one background
+worker throughout the sequence.
 
-- [ ] gui-wayland-shell — Replace the pending Tk presentation with a PySide6/Qt Widgets workspace while retaining safe reader snapshots, all-branch navigation, notes, refresh, and the `gui DIR` entry point.
-- [ ] gui-steered-drafting — Extract shared draft operations and connect scene selection, saved steering, one-candidate generation, preview, acceptance, and cooperative stop to a responsive background worker.
+## GUI milestone 1 — Walking skeleton and complete drafting workspace
 
-Depend on the reader baseline above; `gui-steered-drafting` depends on
-`gui-wayland-shell`. Start with an existing synthetic project containing a
-preset and one planned scene. The shell must have a resizable scene/branch
-sidebar, readable manuscript/candidate area, multiline steering box, a clear
-primary action, and a status/error area. Use consistent spacing and typography,
-system light/dark palette with readable contrast, keyboard focus, and adjustable
-prose size; do not postpone all visual work to a later polish phase.
+- [x] gui-wayland-shell — Native Wayland Qt reading shell: safe snapshots, all saved branches/notes, state-preserving refresh and persistent steering Save/Clear; implemented, unshipped, no generation yet.
+- [x] gui-drafting-workspace — Complete the draft loop: shared operations, one worker, Generate/swipes/reroll/add/progressive display, Accept/keep/discard/delete, Stop/safe close/stale protection, length/POV/cast/card/context/exact prompt, manual edit/history/rewind/jump/tree/tail, lore management/import and scene done.
 
-Steering is the existing per-scene `Tree.d["steer"]`: Save steering persists it,
-Clear saves an empty value, and Generate captures/saves the current box before
-building the existing writer prompt. It remains active until changed, survives
-reopening, and is recorded on each candidate exactly as in the CLI. Selection
-changes with unsaved text offer Save/Discard/Cancel. Generated candidates are
-saved branches, not accepted prose; only Accept moves the active head.
+This consolidates the former `gui-steered-drafting` and `gui-draft-controls`;
+neither is a separate future change. The shell is the walking-skeleton baseline,
+not completion. PySide6 6.12.0 and offscreen widget tests are already in the
+launcher/check environment. Its real Wayland smoke is recorded in the shell
+design (KWin/Plasma 6.8.3, `wayland`, 1920×1080 DPR 1.0, persisted steering,
+clean close); interactive scaling, themes and mouse/keyboard acceptance remain.
 
-One project operation runs at a time. Reading remains usable while generating;
-conflicting writes/project switches are disabled. Stop enters a visible
-stopping state and cancels cooperatively at an I/O boundary, not by killing a
-thread; network waits remain bounded by configured request timeouts. Keep
-already saved branches and accepted text; never save a partial streamed passage.
-Closing during work offers Stop and wait or Keep open, and closes only after
-the worker settles. Refresh must not overwrite dirty editors. Compare captured
-inputs before writes; external changes require reload/retry rather than a stale
-overwrite. Concurrent CLI/GUI writers are unsupported.
+Drafting starts from an existing synthetic project with preset and planned
+scenes. Generate saves current multiline steering before building the shared
+prompt; default swipes or explicit N create complete saved candidate branches,
+not accepted text. Only Accept (or explicit branch/manual operations) changes
+head. Reroll keeps old nodes, Keep branches/Discard preview never deletes saved
+prose, Delete uses existing leaf semantics. Preserve all metadata, histories,
+separators, warnings and CLI prompt/sampler/file parity. Prompt inspection
+includes budgets, actual samplers, injected lore, exact preview and `last_prompt.txt`.
+Lore JSON/PNG imports use desktop pickers and existing validation.
+
+One project operation at a time, queued worker signals, GUI-only widget updates,
+reading usable during work and conflicting writes disabled. Stop is cooperative
+at request/stream/save boundaries with existing request timeouts, never thread
+kill; no partial passage saves or failure-induced head changes. Close offers
+Stop and wait / Keep open and waits for worker settlement without freezing the
+UI. Saved complete branches survive Stop/failure. Compare captured inputs before
+writes, refuse stale/unsafe targets, preserve dirty editors; concurrent CLI/GUI
+writers remain unsupported.
 
 Observe after implementation:
 `QT_QPA_PLATFORM=wayland uv run --script longform.py gui /path/to/project`.
-Without relying on XWayland, select the scene, type direction, Generate, scroll
-while text arrives, and Accept. Close/reopen: the accepted passage and steering
-remain; CLI status/export sees the same text. Inject a fake API failure: readable
-error, no active-head change, controls usable again.
+Set steering/length/cast, inspect the exact prompt, Generate two candidates,
+reroll/add/view and Accept. Write/edit manually, rewind/switch branches, import/
+toggle/classify lore, mark done and reopen to see saved text/history/branches.
+Fake-provider failure/Stop leaves prior head/branches intact and controls usable.
+This demonstrates drafting only, not setup-to-export GUI completion.
 
-Accept this milestone only with offline fake-provider button-flow tests and a
-real Wayland smoke recording the compositor, Qt platform name (`wayland`),
-runtime version, and 100%/200% plus available fractional/mixed-monitor scaling,
-clipboard, focus, resize, and file-dialog results. Offscreen widget tests do not
-prove compositor integration. Missing Qt/Wayland support must produce an
-actionable diagnostic, not silently fall back in this explicit launch mode.
+## GUI milestone 2 — Setup and planning
 
-Decisions forced now:
-[ADR-0006](adr/0006-wayland-writing-workspace.md) chooses the presentation toolkit
-and supersedes the reader's Tk/no-new-dependency restriction for this workspace;
-[ADR-0007](adr/0007-shared-writing-operations.md) fixes the shared-operation and
-background-execution boundary.
+- [x] gui-project-planning — Implemented on `feat/gui-wayland-shell` (unshipped; real Wayland acceptance PENDING): Create/Open and init, preset import, models/roles/settings, explicit limits fetch, bible sections/answers/history, outline notes/N candidates/reroll/choice/edit, scene generation/view/edit/replace confirmation and saved-card editing.
 
-## GUI milestone 2 — Set up, plan, and control drafting without a terminal
+Depends on drafting workspace; this is remaining change 2, not a draft-controls
+follow-up. Use existing initialization and validation/non-overwrite behavior,
+bible fixed-question forms with answer/edit/accept/skip/quit choices, outline
+notes and candidate loops, scene validation and explicit force/replace choices.
+Built-in plain-text Save/Cancel panes replace terminal editors; no implicit paid
+call or automatic next command. A settings form exposes supported nonsecret
+models/roles and configuration; credentials use the existing environment
+mechanism, showing only variable name/missing-key status, never an existing key.
+Desktop preset picker retains existing master-export validation.
 
-- [ ] gui-project-planning — Add Create/Open, preset import, model/role settings, limits, bible question forms, outline notes/candidate choice, and scene generation/editing with overwrite confirmation.
-- [ ] gui-draft-controls — Add multi-candidate generation/reroll, manual passage entry/edit/history, rewind/jump/delete eligible branches, passage length, POV/cast, lorebook toggles/classification/aliases, prompt-budget inspection, and scene completion.
+Observe after implementation: launch the GUI for a missing directory, Create,
+choose models/preset, fetch limits, fill bible sections, generate/re-roll/select
+an outline, generate/edit/accept scenes and enter the complete drafting loop.
+The same offline temporary-project/fake-provider test compares CLI prompts and
+saved outputs; no terminal prompts or external editors.
 
-Both depend on milestone 1; planning precedes the from-empty-project demo.
-Use existing initialization, bible forms/history, outline selection, scene
-validation, and draft semantics. A settings form edits only explicitly supported
-nonsecret configuration fields; obtain credentials through the existing
-environment-variable mechanism, display its variable name/missing-key status,
-and never display/log an existing key. Import presets/lore files through desktop
-file pickers with existing validation. Edit supported planning text in built-in
-plain-text panes with Save/Cancel, never launch `$EDITOR` or ask in a terminal.
-Outline regeneration/selection and scene replacement preserve existing
-confirmation and history behavior. Disabled controls explain missing
-prerequisites; no implicit paid call or automatic next command.
+Implemented (tasks 1.1–1.8 on `feat/gui-wayland-shell`): the offscreen journey
+`case_planning_journey` runs missing-DIR → Create → preset import → settings →
+explicit limits fetch (fake Api) → bible answers/accept → outline
+generate/reroll/choose → scenes generate/edit/accept → Draft selection →
+reopen with no terminal/editor helper and no implicit provider request.
+CLI/GUI parity is frozen at the file/prompt/history level for init, bible,
+outline and scenes (`tests/test_planning_ops.py`); `limits.json` matches the
+CLI shape modulo `fetched`. Real Wayland Create-to-scene acceptance
+(pickers/forms/keyboard/scaling/themes/Stop/close) is recorded as PENDING in
+`openspec/changes/gui-project-planning/evidence.md`.
 
-Observe: launch `uv run --script longform.py gui /path/to/new-project` and use
-Create when the directory is absent. With credentials already in the environment,
-choose models/preset, fetch limits, fill the bible, choose an outline, create a
-scene, generate two candidates, reroll one, edit/accept one, explore the retained
-branch, and mark the scene done—all without terminal prompts or external editors.
-The offline test performs that same sequence with temporary files and fake
-responses, and compares CLI/GUI prompt and saved-tree behavior.
+## GUI milestone 3 — Continuity, review, revision, status and export
 
-## GUI milestone 3 — Finish continuity, review, revision, and export
+- [x] gui-continuity-review-export — Implemented on `feat/gui-wayland-shell` (unshipped; real Wayland acceptance PENDING): update-state/summary-only previews/edit/regenerate/accept/quit and warnings; compress ranges/replace/edit/accept; critique/check/review-note editing; revise diff/accept/skip/edit/regenerate/quit; status and destination-selected export.
 
-- [ ] gui-continuity-review — Add summary/state preview, edit/regenerate/accept, summary-only mode and earlier-scene warning, plus arc compression range/replace and preview/accept.
-- [ ] gui-check-revise-export — Add critique and deterministic checks, editable review notes, passage revision diffs with accept/skip/edit/regenerate/quit, project status, and manuscript export with destination selection.
+Implemented (all eight tasks on `feat/gui-wayland-shell`, unshipped). Depends
+on setup/planning; this change consolidated the former `gui-continuity-review`
+and `gui-check-revise-export` roadmap items. Reuse the worker and
+shared-operation boundary, not a new job system. Preserve
+state_history, summaries, stale/earlier-scene warnings, arc overlap checks,
+revision history and existing report/export formats. Status and notes remain
+visible; saves refresh affected views without losing position or dirty input.
+Replacement/destructive choices name their target and retain confirmation.
+The selected proposal/design/spec/eight (all completed) tasks are in
+`openspec/changes/gui-continuity-review-export/`; ADR-0007 already governs this
+work, so no new ADR/dependency/schema is required. Full-state and arc previews
+never implicitly commit; report saves and passage acceptance remain explicit.
+Arc history retains existing edited-input versions, not a new automatic arc
+snapshot store. Status must not trigger lore-discovery writes. Real Wayland
+M3 acceptance is PENDING, separate from future offscreen test results.
 
-Both depend on milestone 2; they reuse the execution boundary already chosen,
-not a new job system. Preserve `state_history`, summaries, revision history,
-stale-summary warnings, arc overlap checks, and existing report/export formats.
-Status and notes remain visible alongside the writing pane; each save refreshes
-affected views without losing the current reading position. Destructive or
-replacement actions name their target and require the existing confirmation.
+Observed implementation (tasks 1.1–1.8 on `feat/gui-wayland-shell`): the
+offscreen journey `case_review_journey` runs completed scenes → continuity
+preview/Accept → summary-only recovery → compress → critique/check/reports →
+revise Accept/Skip → status → picked export → reopen, with file parity against
+fixed-clock CLI fixtures (`tests/test_review_ops.py`, 57 tests). One-worker
+settlement, dirty-source Save/Discard/Cancel before Revise/Export and
+Stop/commit-group behavior are covered by `case_review_settlement` and
+`case_review_dirty_sources`. `./scripts/check.sh` runs every headless and
+offscreen case (unregistered-case guard), 381 tests + 38 offscreen cases green;
+failure injection (missing Qt, failing journey) fails the check instead of
+skipping. Real Wayland review/export acceptance (pickers, keyboard, scaling,
+themes, Stop/close during review) is recorded as PENDING in
+`openspec/changes/gui-continuity-review-export/evidence.md`.
 
-Observe: from a completed scene, update continuity after reviewing its diff,
-compress a valid scene range, run critique/check, accept one revision and skip
-another, refresh stale summaries, then Export. The saved manuscript matches the
-CLI export for the same active paths; restart restores the saved project state.
-Offline end-to-end tests cover this full flow, including rejection/error paths,
-without credentials, `$EDITOR`, terminal input, or network access.
+After implementing this final change, the full-parity matrix across
+milestones 1–3 was audited row by row against actual controls, headless/
+offscreen tests and evidence (see
+`openspec/changes/gui-continuity-review-export/evidence.md`): every row maps
+to real executed controls and tests; documented deviations are completion-based
+progress (nonstreaming `Api.chat`), unsupported concurrent CLI/GUI writers, no
+terminal/editor helpers, credential-name-only forms, and per-scene all-check
+scope. Explicit remaining gap: separate real Wayland acceptance for all three
+milestones. This audit does **not** mark the workspace complete and no
+shipping is authorized; no more speculative changes.
+
+## Full-parity coverage map — no CLI command or draft action left behind
+
+| Existing CLI surface | Required GUI control(s) | Implementing change |
+|---|---|---|
+| `gui DIR` | Native Wayland project window, reading/notes, refresh/navigation, font size | Existing shell; retained throughout |
+| `draft [--scene ID]`, resume/default next unfinished | Select scene / Next unfinished / reopen done scene, resume head, status/prerequisite warnings | `gui-drafting-workspace` |
+| `g [N]` / `gN`, default writer.swipes | Generate, count, streaming/completion progress, Stop | `gui-drafting-workspace` |
+| Candidate `K`, `r K…` / `r all`, `+ N`, `v K`, `d K`, Enter | Accept, Reroll selected/all, Add N, View, Delete leaf, Keep branches/Discard preview | `gui-drafting-workspace` |
+| `s TEXT` / `s -` / `se`, `l N`, `who`, `pov` | Multiline steering Save/Clear/capture, passage length/token cap, cast/POV forms | `gui-drafting-workspace` |
+| `w`, `e`, `r`, `t`, `j ID`, `x ID` | New passage, Edit head/diff/history, Rewind, full branch tree/metadata, Jump/Use as head, Delete leaf | `gui-drafting-workspace` |
+| `v`, `v ID`, `tail [N]`, `card`, `c`, `cp` | Marked manuscript, full node viewer, Tail N, scene card, context/budget/sampler/injected-lore panel, exact prompt preview/Save last_prompt.txt | `gui-drafting-workspace` |
+| `lb`, `lb N…`, `lb all on/off`, `char NAME`, `alias A,B`, `world`; lorebook/card files | Lore list, individual/multi/all toggles, character name/aliases/world, JSON/PNG import picker | `gui-drafting-workspace` |
+| `d`, scene-end confirmation, `q`, `?` / `h` / `help` | Mark done/decline end suggestion, Leave draft, action help; dirty-editor Save/Discard/Cancel | `gui-drafting-workspace` |
+| `init [--preset FILE]`, project configuration | Create/Open directory, preset picker, models/roles/settings forms | `gui-project-planning` |
+| `limits`, `bible` | Fetch/display limits, section question/answer/edit/accept/skip/quit forms/history | `gui-project-planning` |
+| `outline --n --notes`, candidate selection/new notes/reroll/view/quit | Count/notes editor, Generate/Reroll, candidate viewer/selection, Cancel | `gui-project-planning` |
+| `scenes [--force]`, view/regenerate/accept/quit | Scene cards list/editor/validation, Generate/Regenerate, Accept/Replace confirmation, Cancel | `gui-project-planning` |
+| `update-state [--scene] [--summary-only]`, invalid raw edit/retry, warnings | Scene/summary-only selection, diff/raw editor, Accept/Edit/Regenerate/Cancel, warning confirmation | `gui-continuity-review-export` |
+| `compress --from --to [--replace]` | Range/overlap validation, Replace confirmation, preview/Edit/Accept/Regenerate/Cancel | `gui-continuity-review-export` |
+| `critique --scene`, `check [--scene]` | Critique, Check scene/all, report viewer/editable review notes | `gui-continuity-review-export` |
+| `revise --scene` | Per-passage diff, Accept/Skip/Edit/Regenerate/Quit, saved revision history | `gui-continuity-review-export` |
+| `status`, `export [--out FILE]` | Project status, Export with destination picker | `gui-continuity-review-export` |
+
+The sequence is drafting workspace -> setup/planning -> continuity/review/export.
+Do not tick future work based on its proposal. Every row of the map is now
+implemented through GUI controls with offline parity coverage (audited row by
+row in `openspec/changes/gui-continuity-review-export/evidence.md`), but the
+finish line still requires separate native Wayland acceptance for all three
+milestones; no offscreen result or shell smoke establishes it.
 
 ## Delivery rules for every GUI change
 
@@ -144,15 +208,22 @@ skip missing dependencies. Real Wayland checks are a separate required desktop
 acceptance step; document unavailable compositor coverage rather than claiming
 headless success proves it. No separate hardening/polish milestone is planned.
 
-## Open questions
+## Decisions and acceptance details
 
-- Which compositor/distribution and monitor scaling form the owner's primary
-  acceptance setup? Native Wayland is the target, not merely an XWayland window.
-- Which compatible PySide6 release and Linux runtime libraries work in the
-  actual uv environment? Verify/pin the tested dependency range in
-  `gui-wayland-shell`; bundled Qt binaries alone do not establish that result.
-- Any visual reference or preferred reading font? Until supplied, use the
-  system palette, restrained controls, and adjustable prose typography above.
+[ADR-0006](adr/0006-wayland-writing-workspace.md) selects Qt Widgets/native
+Wayland; [ADR-0007](adr/0007-shared-writing-operations.md) selects shared
+operations/one worker. These already decide the boundaries; this consolidation
+needs no new ADR, data format or dependency. Do not edit accepted ADRs merely to
+rename old roadmap IDs.
+
+KWin/Plasma 6.8.3 and PySide6 6.12.0/DPR 1.0 are recorded for the shell, not
+whole-workspace acceptance. Record real Wayland platform/runtime/compositor,
+100%/200% plus available fractional/mixed-monitor scaling, light/dark themes,
+clipboard/focus/resize, file picker and worker Stop/close results separately.
+Missing compositor coverage remains explicit; do not weaken Wayland startup
+policy or infer compositor support from offscreen tests. No blocking product
+choices remain; preferred font/additional monitor combinations are optional
+owner acceptance details.
 
 ## Phase 0 — Walking skeleton: source, checks, and project facts
 

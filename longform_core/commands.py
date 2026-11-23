@@ -5,13 +5,12 @@ import re
 import shutil
 from pathlib import Path
 
-import httpx
-
-from .api import Api, HttpErr, NoAnswerErr
+from . import draft_operations as dop
+from .api import Api, HttpErr
 from .checks import check_report
-from .config import (BIBLE_TEMPLATE, CRITIC_SYSTEM, DEFAULT_CONFIG, EDITOR_SYSTEM, PLANNER_SYSTEM, SAMPLING_KEYS, STATE_TEMPLATE, SUMMARIZER_SYSTEM)
+from .config import (BIBLE_TEMPLATE, CRITIC_SYSTEM, DEFAULT_CONFIG, EDITOR_SYSTEM, PLANNER_SYSTEM, STATE_TEMPLATE, SUMMARIZER_SYSTEM)
 from .lore import is_present, Lore, pov_name
-from .prompt import (build_writer_prompt, clean_continuation, format_card, layered_summary, print_report,
+from .prompt import (format_card, layered_summary, print_report,
                      tail_trim_chars)
 from .tree import Tree
 from .utils import (ask, col, die, edit_saved, extract_tagged, keep_lead, line_diff, now, page, parse_sections, read_json, read_text, save_input, slug, stamp, tag_instr, text_hash, warn, word_diff, words, write_json, write_text)
@@ -669,11 +668,14 @@ def pick_candidates(p, tree, sc, scenes, cands, seen, gen):
         m_del = re.fullmatch(r"d\s*(\d+)", c)
         if m_acc and 1 <= int(c) <= len(cands):
             nid = cands[int(c) - 1]
-            tree.head = nid
-            tree.save()
-            if sc["status"] == "planned":
-                sc["status"] = "drafting"
-                p.save_scenes(scenes)
+            try:
+                dop.accept_candidate(p.root, sc["id"], nid)
+            except dop.OpError as e:
+                _op_fail(e, soft_ok=True)
+                continue
+            tree = Tree(p, sc["id"])   # reload the op's own writes
+            scenes = p.scenes()
+            sc = scenes[p.scene_index(scenes, sc["id"])]
             print(f"accepted {nid}")
             if tree.node(nid).get("ended"):
                 if ask("the model signalled scene end. mark scene done? [y/N] ").strip().lower() == "y":
@@ -688,6 +690,7 @@ def pick_candidates(p, tree, sc, scenes, cands, seen, gen):
                 print("no such candidate")
                 continue
             new, streamed = gen(len(ks))
+            tree = Tree(p, sc["id"])
             seen |= set(streamed)
             for k, nid in zip(ks, new):
                 print(f"[{k}] {cands[k - 1]} rerolled -> {nid} (old text kept as a branch)")
@@ -697,6 +700,7 @@ def pick_candidates(p, tree, sc, scenes, cands, seen, gen):
             continue
         if m_add:
             new, streamed = gen(max(1, int(m_add.group(1) or 1)))
+            tree = Tree(p, sc["id"])
             seen |= set(streamed)
             cands.extend(new)
             continue
@@ -714,15 +718,42 @@ def pick_candidates(p, tree, sc, scenes, cands, seen, gen):
         print("unknown choice")
 
 
+def _cli_draft_events(ev):
+    """Print one shared-operation event exactly as cmd_draft always did."""
+    t = ev.get("type")
+    if t == "stream_start":
+        print(col("--- streaming ---", "2"))
+    elif t == "delta":
+        print(ev.get("text", ""), end="", flush=True)
+    elif t == "stream_end":
+        print()
+    elif t == "progress":
+        print(ev.get("msg", ""))
+    elif t in ("candidate_done", "candidate_failed"):
+        print(ev.get("msg", ""), flush=True)
+    elif t == "note":
+        warn(ev.get("text", ""))
+
+
+def _op_fail(e, soft_ok=False):
+    """CLI adapter for shared-operation failures.
+
+    soft failures report like gen() always did; die-originated messages are
+    already on stderr, so the adapter exits without printing twice."""
+    if getattr(e, "soft", False) and soft_ok:
+        print(col(str(e), "31"))
+        return
+    if getattr(e, "from_die", False):
+        raise SystemExit(1)
+    die(str(e))
+
+
 def cmd_draft(p, args):
     scenes = p.scenes()
     if not scenes:
         die(f"no scenes (run: scenes {p.root})")
     preset = p.preset()
     rc = p.cfg["roles"]["writer"]
-    stale = [k for k in SAMPLING_KEYS if k in rc]
-    if stale:
-        warn("writer keys " + ", ".join(stale) + " in project.json are ignored: writer samplers come from the preset")
     if args.scene:
         idx = p.scene_index(scenes, args.scene)
     else:
@@ -730,25 +761,29 @@ def cmd_draft(p, args):
         if idx is None:
             die("all scenes are done (use --scene ID to reopen one)")
     sc = scenes[idx]
-    sums = p.summaries()["scenes"]
-    for s in scenes[:idx]:
-        if s.get("status") != "done":
-            warn(f"earlier scene {s['id']} is not marked done")
-        elif s["id"] not in sums:
-            warn(f"earlier scene {s['id']} has no summary/state update (run: update-state {p.root} --scene {s['id']})")
+    try:
+        info = dop.session_info(p.root, sc["id"])
+    except dop.OpError as e:
+        _op_fail(e)
+    for w in info["warnings"]:
+        warn(w)
     tree = Tree(p, sc["id"])
     lore = Lore(p, scenes)
     passage_words = int(rc.get("passage_words", 220))
     steer = tree.d.get("steer", "")
     if steer:
         print(f"restored steering note: {steer}")
-    api = None
-    _prompt, _params, _extra, ignored, _rep = build_writer_prompt(p, preset, lore, scenes, idx, tree, steer, passage_words)
+    _api_holder = []
+
+    def provider_factory(pp):
+        """One Api per session keeps the sampler fallback across candidates."""
+        if not _api_holder:
+            _api_holder.append(Api(pp))
+        return _api_holder[0]
+
     print(f"writer preset: {preset['preset'].get('name', p.preset_path().name)}  temp {preset['preset'].get('temp')}")
-    if ignored:
-        warn("preset samplers with no Featherless parameter (not sent): " + ", ".join(ignored))
-    if preset["preset"].get("temperature_last"):
-        warn("preset has temperature_last; Featherless doesn't expose sampler order, so the server's default order applies")
+    for w in info["sampler_warnings"]:
+        warn(w)
     print(col(format_card(sc), "36"))
     show_lorebooks(lore, sc)
     if tree.head:
@@ -798,22 +833,33 @@ def cmd_draft(p, args):
             elif cmd == "who":
                 names = [x.strip() for x in arg.split(",") if x.strip()]
                 if names:
-                    sc["characters"] = names
-                    p.save_scenes(scenes)
+                    try:
+                        dop.set_cast(p.root, sc["id"], names)
+                    except dop.OpError as e:
+                        _op_fail(e)
+                    scenes = p.scenes()
+                    sc = scenes[p.scene_index(scenes, sc["id"])]
                 print("present: " + (", ".join(sc.get("characters") or []) or "(none)"))
             elif cmd == "pov":
                 if arg:
-                    sc["pov"] = arg
-                    p.save_scenes(scenes)
+                    try:
+                        dop.set_pov(p.root, sc["id"], arg)
+                    except dop.OpError as e:
+                        _op_fail(e)
+                    scenes = p.scenes()
+                    sc = scenes[p.scene_index(scenes, sc["id"])]
                 print(f"pov: {sc.get('pov', '')}  -> {{{{char}}}} = {pov_name(sc)}")
             elif cmd == "lb":
                 lore.sync(scenes)
                 lb_command(lore, sc, arg)
             elif cmd in ("c", "cp"):
-                prompt, params, extra, _ig, rep = build_writer_prompt(p, preset, lore, scenes, idx, tree, steer, passage_words)
-                print_report(rep, params, extra)
+                try:
+                    prep = dop.prepare_report(p.root, sc["id"], steer=steer, passage_words=passage_words)
+                except dop.OpError as e:
+                    _op_fail(e)
+                print_report(prep["report"], prep["params"], prep["extra"])
                 if cmd == "cp":
-                    write_text(p.f("last_prompt.txt"), prompt)
+                    write_text(p.f("last_prompt.txt"), prep["prompt"])
                     print(f"wrote {p.f('last_prompt.txt')}")
             elif cmd == "g" or re.fullmatch(r"g\d+", cmd):
                 n = int(cmd[1:]) if len(cmd) > 1 else (int(arg) if arg.isdigit() else int(rc.get("swipes", 1)))
@@ -821,45 +867,28 @@ def cmd_draft(p, args):
                 head_at_start = tree.head
 
                 def gen(count, _head=head_at_start):
-                    """Generate count candidates after _head. One streams live; several run per max_parallel."""
-                    nonlocal api
-                    prompt, params, extra, _ig, rep = build_writer_prompt(p, preset, lore, scenes, idx, tree, steer, passage_words)
-                    for note in rep["notes"]:
-                        warn(note)
-                    if rep["over"]:
-                        print_report(rep, params, extra)
-                        return [], []
-                    api = api or Api(p)
-                    meta = {"scene": sc["id"], "head": _head, "lorebooks": lore.active(),
-                            "present": sc.get("characters") or [], "char": rep["char"], "steer": steer}
+                    """Generate count candidates after _head through the shared
+                    operation. One streams live; several run per max_parallel."""
                     try:
-                        if count == 1:
-                            print(col("--- streaming ---", "2"))
-                            text, finish, _ = api.complete("writer", prompt, params, extra,
-                                                           stream_cb=lambda t: print(t, end="", flush=True), meta=meta)
-                            print()
-                            results, live = [(text, finish, None)], True
-                        else:
-                            print(f"generating {count} candidates (max_parallel {p.cfg['max_parallel']})...")
-                            results = api.many(lambda: api.complete("writer", prompt, params, extra, meta=meta), count)
-                            live = False
-                    except (HttpErr, NoAnswerErr, httpx.HTTPError) as e:
-                        print(col(f"generation failed: {e}", "31"))
+                        r = dop.generate_candidates(
+                            p.root, sc["id"], count=count, parent=_head, steer=steer,
+                            passage_words=passage_words, provider_factory=provider_factory,
+                            events=_cli_draft_events)
+                    except dop.OpError as e:
+                        _op_fail(e, soft_ok=True)
                         return [], []
-                    ids = []
-                    for text, finish, _ in results:
-                        clean, ended, trimmed = clean_continuation(text, finish, rep["continuing"])
-                        if not clean.strip():
-                            continue
-                        ids.append(tree.add(
-                            _head, clean, source="model", sep="" if rep["continuing"] else "\n\n", model=rc["model"],
-                            steer=steer, ended=ended, trimmed=trimmed, finish=finish, lorebooks=lore.active(),
-                            present=sc.get("characters") or [], absent=lore.absent_mentions(sc, clean)))
-                    tree.save()
-                    return ids, (ids if live else [])
+                    if r.over:
+                        print_report(r.report, r.params, r.extra)
+                        return [], []
+                    return list(r.saved), (list(r.saved) if r.streamed else [])
 
                 cands, streamed = gen(n)
-                if pick_candidates(p, tree, sc, scenes, cands, set(streamed), gen) == "done":
+                tree = Tree(p, sc["id"])   # the operation saved candidates itself
+                outcome = pick_candidates(p, tree, sc, scenes, cands, set(streamed), gen)
+                tree = Tree(p, sc["id"])
+                scenes = p.scenes()
+                sc = scenes[p.scene_index(scenes, sc["id"])]
+                if outcome == "done":
                     sc["status"] = "done"
                     p.save_scenes(scenes)
                     print(f"scene {sc['id']} done. next step: update-state {p.root} --scene {sc['id']}")
@@ -867,36 +896,49 @@ def cmd_draft(p, args):
             elif cmd == "w":
                 txt = edit_saved(p, f"passage_{sc['id']}", "").strip()
                 if txt:
-                    tree.head = tree.add(tree.head, txt, source="user", sep="\n\n")
-                    tree.save()
-                    if sc["status"] == "planned":
-                        sc["status"] = "drafting"
-                        p.save_scenes(scenes)
-                    print(f"added {tree.head}")
+                    try:
+                        res = dop.append_manual(p.root, sc["id"], txt)
+                    except dop.OpError as e:
+                        _op_fail(e, soft_ok=True)
+                        res = None
+                    if res and res.get("added"):
+                        tree = Tree(p, sc["id"])
+                        scenes = p.scenes()
+                        sc = scenes[p.scene_index(scenes, sc["id"])]
+                        print(f"added {res['added']}")
             elif cmd == "e":
                 if not tree.head:
                     print("nothing to edit")
                     continue
                 n = tree.node(tree.head)
                 new = edit_saved(p, f"edit_{sc['id']}_{tree.head}", n["text"]).rstrip()
-                if n.get("sep") == "":
-                    new = keep_lead(n["text"], new)
-                if new.strip() and new != n["text"]:
-                    n["history"].append({"time": now(), "text": n["text"], "by": "user-edit"})
-                    n["text"] = new
-                    tree.save()
-                    print(word_diff(n["history"][-1]["text"], new))
+                try:
+                    res = dop.edit_head(p.root, sc["id"], new)
+                except dop.OpError as e:
+                    _op_fail(e, soft_ok=True)
+                    res = None
+                if res and res["changed"]:
+                    tree = Tree(p, sc["id"])
+                    print(word_diff(res["old"], res["new"]))
             elif cmd == "r":
                 if tree.head:
-                    tree.head = tree.node(tree.head)["parent"]
-                    tree.save()
-                    print(f"head -> {tree.head or '(scene start)'}")
+                    try:
+                        res = dop.rewind(p.root, sc["id"])
+                    except dop.OpError as e:
+                        _op_fail(e, soft_ok=True)
+                        res = None
+                    if res:
+                        tree = Tree(p, sc["id"])
+                        print(f"head -> {res['head'] or '(scene start)'}")
             elif cmd == "t":
                 show_tree(tree)
             elif cmd == "j":
                 if arg in tree.d["nodes"]:
-                    tree.head = arg
-                    tree.save()
+                    try:
+                        dop.jump(p.root, sc["id"], arg)
+                    except dop.OpError as e:
+                        _op_fail(e, soft_ok=True)
+                    tree = Tree(p, sc["id"])
                     print(f"head -> {arg}")
                 else:
                     print("no such node")
@@ -922,8 +964,10 @@ def cmd_draft(p, args):
                     print(col(f"last {n} chars (head {tree.head}):", "36"))
                     print(tail_trim_chars(n, tree.text(), marker="…"))
             elif cmd == "d":
-                sc["status"] = "done"
-                p.save_scenes(scenes)
+                try:
+                    dop.mark_done(p.root, sc["id"])
+                except dop.OpError as e:
+                    _op_fail(e)
                 print(f"scene {sc['id']} done. next step: update-state {p.root} --scene {sc['id']}")
                 return
             else:
@@ -935,70 +979,38 @@ def cmd_draft(p, args):
 
 
 def cmd_update_state(p, args):
-    scenes = p.scenes()
-    sums = p.summaries()
-    if args.scene:
-        idx = p.scene_index(scenes, args.scene)
-    else:
-        idx = next((i for i, s in enumerate(scenes) if s.get("status") == "done" and not s.get("state_updated")), None)
-        if idx is None:
-            die("no done scene is waiting for a state update (use --scene ID)")
-    sc = scenes[idx]
-    tree = Tree(p, sc["id"])
-    if not tree.head:
-        die(f"scene {sc['id']} has no text")
-    if sc.get("status") != "done":
-        warn(f"scene {sc['id']} is not marked done")
-    later = [s["id"] for s in scenes[idx + 1:] if s.get("state_updated")]
-    summary_only = args.summary_only
-    if later and not summary_only:
-        warn("state.md already includes later scenes (" + ", ".join(later) + "); "
-             "updating state from this scene would treat that as 'before'. Use --summary-only to refresh summaries only.")
+    """CLI adapter over the shared update-state operations: identical prompts,
+    warning order, ask points, parse and save order; printing/paging and the
+    external editor stay here."""
+    import longform_core.review_operations as ro
+
+    try:
+        prep = ro.update_state_prepare(p.root, args.scene, args.summary_only)
+    except ro.OpError as e:
+        _op_fail(e)
+    for w in prep.warnings:
+        warn(w)
+    if prep.later and not prep.summary_only:
+        warn(ro.LATER_WARNING.format(later=", ".join(prep.later)))
         if ask("continue anyway? [y/N] ").strip().lower() != "y":
             return
-    scene_text = tree.text()
-    bible = read_text(p.f("bible.md")).strip()
-    state = read_text(p.f("state.md")).strip()
-    cfg = p.cfg["summary"]
-    model = p.cfg["roles"]["summarizer"]["model"]
-    names = ["DETAILED SUMMARY", "BRIEF SUMMARY"] + ([] if summary_only else ["UPDATED STATE"])
-    instr = (
-        "Produce exactly these sections, each starting with its exact header line:\n"
-        "=== DETAILED SUMMARY ===\n"
-        f"(about {cfg['detailed_words']} words: what happens, in order, with concrete specifics: who did what, what was revealed, decisions made, how the scene ends)\n"
-        "=== BRIEF SUMMARY ===\n"
-        f"(about {cfg['brief_words']} words: key events and changes only)\n"
-    )
-    if not summary_only:
-        instr += (
-            "=== UPDATED STATE ===\n"
-            "(the full continuity state after this scene, in the same markdown structure as the state before it. "
-            "Keep every still-valid entry, update changed ones, add new ones; move finished threads to 'Resolved'. "
-            "Cover each character's location, condition, knowledge, goals and relationships; open threads and setups; "
-            "established facts and objects that must stay consistent.)\n"
-        )
-    instr += "Put all the sections between <record> and </record> tags, with nothing else inside them. Anything outside the tags is discarded."
-    user = (f"# Story bible\n{bible}\n\n# Scene card\n{format_card(sc)}\n\n"
-            + ("" if summary_only else f"# Continuity state BEFORE this scene\n{state}\n\n")
-            + f"# Full text of the scene\n{scene_text}\n\n{instr}")
-    msgs = [{"role": "system", "content": SUMMARIZER_SYSTEM}, {"role": "user", "content": user}]
-    ceil, _, src = p.ceiling(model)
-    need = p.est(model, SUMMARIZER_SYSTEM + user) + int(p.cfg["roles"]["summarizer"]["max_tokens"])
-    if need > ceil:
-        warn(f"request needs ~{need} tokens but ceiling is {ceil} ({src}); the call may fail")
-    api = Api(p)
+    for w in prep.call_warnings:
+        warn(w)
+    api = ro.provider_for(p.root, api_cls=Api)
+    finish, raw, secs = "stop", "", None
     while True:
-        print(f"summarizing {sc['id']}...")
-        text, finish, _ = api.chat("summarizer", msgs)
-        secs = parse_sections(extract_tagged(text, "record")[0], names)
+        print(f"summarizing {prep.scene_id}...")
+        res = ro.update_state_generate(p.root, prep, provider=api)
+        raw, finish = res["raw"], res["finish"]
+        secs = ro.update_state_parse_response(raw, prep)["secs"]
         while True:
             if secs is None:
                 warn(f"could not find all sections (finish_reason={finish})")
-                print(text)
+                print(raw)
                 c = ask("[e]dit raw / [r]egenerate / [q]uit: ").strip().lower()
                 if c.startswith("e"):
-                    text = edit_saved(p, f"state_raw_{sc['id']}", text)
-                    secs = parse_sections(text, names)
+                    raw = edit_saved(p, f"state_raw_{prep.scene_id}", raw)
+                    secs = ro.update_state_parse_text(raw, prep)["secs"]
                     continue
                 if c.startswith("r"):
                     break
@@ -1007,252 +1019,198 @@ def cmd_update_state(p, args):
             print(secs["DETAILED SUMMARY"])
             print(col("\n=== BRIEF SUMMARY ===", "36"))
             print(secs["BRIEF SUMMARY"])
-            if not summary_only:
+            if not prep.summary_only:
                 print(col("\n=== STATE DIFF ===", "36"))
-                print(line_diff(state, secs["UPDATED STATE"], "state.md", "updated"))
+                print(line_diff(prep.state_text, secs["UPDATED STATE"],
+                                "state.md", "updated"))
             c = ask("\n[a]ccept / [e]dit / [r]egenerate / [q]uit: ").strip().lower()
             if c.startswith("e"):
-                blob = "\n\n".join(f"=== {n} ===\n{secs[n]}" for n in names)
-                text = edit_saved(p, f"state_edit_{sc['id']}", blob)
-                secs = parse_sections(text, names)
+                blob = ro.edit_blob(prep, secs)
+                text = edit_saved(p, f"state_edit_{prep.scene_id}", blob)
+                secs = ro.update_state_parse_text(text, prep)["secs"]
                 continue
             if c.startswith("r"):
                 break
             if not c.startswith("a"):
                 return
-            if not summary_only:
-                shutil.copy2(p.f("state.md"), p.f("state_history", f"before_{sc['id']}_{stamp()}.md"))
-                write_text(p.f("state.md"), secs["UPDATED STATE"].strip() + "\n")
-                sc["state_updated"] = True
-            sums["scenes"][sc["id"]] = {
-                "detailed": secs["DETAILED SUMMARY"], "brief": secs["BRIEF SUMMARY"],
-                "updated": now(), "text_hash": text_hash(scene_text),
-            }
-            p.save_summaries(sums)
-            p.save_scenes(scenes)
-            print("saved summaries" + ("" if summary_only else " and state.md"))
+            try:
+                ro.update_state_accept(p.root, prep, secs,
+                                       baseline=prep.baseline)
+            except ro.OpError as e:
+                _op_fail(e, soft_ok=True)
+                return
+            print("saved summaries" + ("" if prep.summary_only
+                                       else " and state.md"))
             return
 
 
 def cmd_compress(p, args):
-    scenes = p.scenes()
-    lo, hi = p.scene_index(scenes, args.from_id), p.scene_index(scenes, args.to_id)
-    if hi < lo:
-        die("--to must not come before --from")
-    sums = p.summaries()
-    pos = {s["id"]: i for i, s in enumerate(scenes)}
-    for a in sums.get("arcs", []):
-        if a["from"] in pos and a["to"] in pos and not (pos[a["to"]] < lo or pos[a["from"]] > hi):
-            if not args.replace:
-                die(f"overlaps existing arc {a['from']}-{a['to']} (use --replace)")
-    rng = scenes[lo: hi + 1]
-    missing = [s["id"] for s in rng if s["id"] not in sums["scenes"]]
-    if missing:
-        die("no summaries for: " + ", ".join(missing))
-    body = "\n\n".join(f"### {s['id']}: {s.get('title', '')}\n{sums['scenes'][s['id']]['detailed']}" for s in rng)
-    aw = p.cfg["summary"]["arc_words"]
-    user = (f"# Scene summaries {rng[0]['id']}-{rng[-1]['id']}\n{body}\n\n"
-            f"Condense these into one continuous summary of about {aw} words. Keep every fact later scenes may depend on: "
-            "who knows what, promises and setups, injuries, objects, relationship changes, unresolved threads. " + tag_instr("summary"))
-    msgs = [{"role": "system", "content": SUMMARIZER_SYSTEM}, {"role": "user", "content": user}]
-    api = Api(p)
+    """CLI adapter over the shared compress operations: identical validation
+    order, prompt, warnings, ask points and save; the CLI's e means
+    edit-then-accept, which the GUI's separate Save/Acknowledge replaces."""
+    import longform_core.review_operations as ro
+
+    try:
+        prep = ro.compress_prepare(p.root, args.from_id, args.to_id,
+                                   replace=args.replace)
+    except ro.OpError as e:
+        _op_fail(e)
+    api = ro.provider_for(p.root, api_cls=Api)
     while True:
-        raw, _, _ = api.chat("summarizer", msgs)
-        text, ok = extract_tagged(raw, "summary")
-        if not ok:
+        res = ro.compress_generate(p.root, prep, provider=api)
+        text = res["text"]
+        if not res["ok"]:
             warn("no <summary> tags in the output; check it for stray text")
         print(text)
-        c = ask(f"\n({words(text)} words) [a]ccept / [e]dit / [r]egenerate / [q]uit: ").strip().lower()
+        c = ask(f"\n({words(text)} words) [a]ccept / [e]dit / [r]egenerate / "
+                "[q]uit: ").strip().lower()
         if c.startswith("e"):
-            text = edit_saved(p, f"arc_{rng[0]['id']}_{rng[-1]['id']}", text).strip()
+            text = edit_saved(p, f"arc_{prep.from_id}_{prep.to_id}",
+                              text).strip()
             c = "a"
         if c.startswith("r"):
             continue
         if not c.startswith("a"):
             return
-        arcs = [a for a in sums.get("arcs", [])
-                if not (a["from"] in pos and a["to"] in pos and not (pos[a["to"]] < lo or pos[a["from"]] > hi))]
-        arcs.append({"from": rng[0]["id"], "to": rng[-1]["id"], "text": text, "updated": now()})
-        sums["arcs"] = arcs
-        p.save_summaries(sums)
-        print(f"saved arc {rng[0]['id']}-{rng[-1]['id']}")
+        try:
+            ro.compress_accept(p.root, prep, text, baseline=prep.baseline)
+        except ro.OpError as e:
+            _op_fail(e, soft_ok=True)
+            return
+        print(f"saved arc {prep.from_id}-{prep.to_id}")
         return
 
 
 def cmd_critique(p, args):
-    scenes = p.scenes()
-    idx = p.scene_index(scenes, args.scene)
-    sc = scenes[idx]
-    tree = Tree(p, sc["id"])
-    if not tree.head:
-        die(f"scene {sc['id']} has no text")
-    model = p.cfg["roles"]["critic"]["model"]
-    summary, notes = layered_summary(p, scenes, idx, int(p.cfg["budget_tokens"]["summary"]), model)
-    for n in notes:
+    """CLI adapter over the shared critique operations: identical warnings,
+    request, tag warning order, backup, page and wrote-message."""
+    import longform_core.review_operations as ro
+
+    try:
+        prep = ro.critique_prepare(p.root, args.scene)
+    except ro.OpError as e:
+        _op_fail(e)
+    for n in prep.warnings:
         warn(n)
-    banned = ", ".join(f'"{b}"' for b in p.cfg["banned_phrases"])
-    user = (
-        f"# Story bible\n{read_text(p.f('bible.md')).strip()}\n\n"
-        + (f"# Story before this scene\n{summary}\n\n" if summary else "")
-        + f"# Current continuity state\n{read_text(p.f('state.md')).strip()}\n\n"
-        f"# Scene card\n{format_card(sc)}\n\n# Scene text\n{tree.text()}\n\n"
-        "Review the scene text. List every problem as a numbered item in this exact format:\n"
-        'N. [category] "exact quote from the text" - what is wrong - concrete fix\n'
-        "Categories: continuity (contradicts the summary, state or bible), cast (a character not listed as present "
-        "appears, speaks or acts), pov-tense, style-rule, cliche, repetition, pacing (relative to the scene card's "
-        "goal/conflict/outcome), dialogue, logic.\n"
-        f"Phrases the author has banned: {banned}.\n"
-        "After the list, one line: 'Scene card fulfilled: yes/partly/no - reason'. " + tag_instr("critique")
-    )
-    msgs = [{"role": "system", "content": CRITIC_SYSTEM}, {"role": "user", "content": user}]
-    print(f"critiquing {sc['id']}...")
-    raw, _, _ = Api(p).chat("critic", msgs)
-    text, ok = extract_tagged(raw, "critique")
-    if not ok:
+    print(f"critiquing {prep.scene_id}...")
+    api = ro.provider_for(p.root, api_cls=Api)
+    res = ro.critique_generate(p.root, prep, provider=api)
+    extracted = ro.critique_extract(res["raw"])
+    if not extracted["ok"]:
         warn("no <critique> tags in the output; check it for stray text")
-    out = p.f("critiques", f"{sc['id']}.md")
-    if out.exists():
-        shutil.copy2(out, p.f("critiques", f"{sc['id']}_prev_{stamp()}.md"))
-    write_text(out, f"# Critique {sc['id']} ({now()})\n\n{text}\n")
-    page(text)
-    print(f"wrote {out} (edit it to drop points you disagree with before running revise)")
+    try:
+        out = ro.critique_save(p.root, prep, extracted["text"],
+                               baseline=prep.baseline)
+    except ro.OpError as e:
+        _op_fail(e, soft_ok=True)
+        return
+    page(extracted["text"])
+    print(out["message"])
+
 
 def cmd_check(p, args):
-    scenes = p.scenes()
-    targets = [scenes[p.scene_index(scenes, args.scene)]] if args.scene else scenes
-    banned = [b for b in p.cfg["banned_phrases"] if b.strip()]
-    ng = p.cfg["ngram"]
-    n, min_count, top = int(ng["n"]), int(ng["min_count"]), int(ng["top"])
-    scene_texts = []
-    for s in targets:
-        tree = Tree(p, s["id"])
-        if not tree.head:
-            continue
-        scene_texts.append((s["id"], [(nid, tree.node(nid)["text"]) for nid in tree.chain()], tree.text()))
-    title = f"# Check {'scene ' + args.scene if args.scene else 'all scenes'} ({now()})"
-    report = check_report(scene_texts, banned, n, min_count, top, title)
-    out = p.f("checks", f"{args.scene or 'all'}.md")
-    write_text(out, report)
-    print(report)
-    print(f"wrote {out}")
+    """CLI adapter over the shared deterministic check: identical report
+    bytes and save; no provider instance is involved."""
+    import longform_core.review_operations as ro
+
+    try:
+        out = ro.check_report_for(p.root, args.scene)
+    except ro.OpError as e:
+        _op_fail(e)
+    print(out["report"])
+    try:
+        ro.check_save(p.root, out["name"], out["report"],
+                      baseline=out["baseline"])
+    except ro.OpError as e:
+        _op_fail(e, soft_ok=True)
+        return
+    print(f"wrote {out['path']}")
 
 
 def cmd_revise(p, args):
-    scenes = p.scenes()
-    idx = p.scene_index(scenes, args.scene)
-    sc = scenes[idx]
-    tree = Tree(p, sc["id"])
-    if not tree.head:
-        die(f"scene {sc['id']} has no text")
-    notes = []
-    for path in (p.f("critiques", f"{sc['id']}.md"), p.f("checks", f"{sc['id']}.md")):
-        if path.exists():
-            notes.append(read_text(path).strip())
-    if not notes:
-        die(f"no notes for {sc['id']}: run critique {p.root} --scene {sc['id']} and/or check {p.root} --scene {sc['id']} first")
-    notes_text = "\n\n".join(notes)
-    bible = read_text(p.f("bible.md")).strip()
-    api = Api(p)
-    chain = tree.chain()
-    changed = 0
-    for k, nid in enumerate(chain):
-        n = tree.node(nid)
-        prev_tail = tree.text(chain[k - 1])[-900:] if k > 0 else ""
-        cast = ", ".join(sc.get("characters") or [])
-        user = (
-            f"# Story bible (style rules apply)\n{bible}\n\n"
-            + (f"# Characters present in this scene\n{cast}\n\n" if cast else "")
-            + f"# Editor's notes for this scene\n{notes_text}\n\n"
-            + (f"# Text just before the passage (context only, do not output it)\n...{prev_tail}\n\n" if prev_tail else "")
-            + f"# Passage to revise\n{n['text'].strip()}\n\n"
-            "Fix only the listed problems that occur in this passage. If none occur in it, answer NO CHANGES. "
-            "Otherwise answer with the full revised passage. " + tag_instr("passage")
-        )
-        msgs = [{"role": "system", "content": EDITOR_SYSTEM}, {"role": "user", "content": user}]
+    """CLI adapter over the shared revision session: identical prompts,
+    diffs, ask points, in-place node edits and the normal-completion-only
+    stale warning; the external editor stays here."""
+    import longform_core.review_operations as ro
+
+    try:
+        session = ro.revise_prepare(p.root, args.scene)
+    except ro.OpError as e:
+        _op_fail(e)
+    api = ro.provider_for(p.root, api_cls=Api)
+    chain = session.chain
+    while session.k < len(chain):
+        psg = ro.revise_passage(p.root, session, session.k)
+        nid = psg["nid"]
         while True:
-            print(col(f"\n--- {nid} ({k + 1}/{len(chain)}) ---", "36"))
-            text, finish, _ = api.chat("editor", msgs, max_tokens=max(int(p.cfg["roles"]["editor"]["max_tokens"]), int(words(n["text"]) * 2)))
-            text, ok = extract_tagged(text, "passage")
-            if not ok and not text.upper().startswith("NO CHANGES"):
-                warn("no <passage> tags in the editor output; check it for stray text")
-            if text.upper().startswith("NO CHANGES") or text == n["text"].strip():
+            print(col(f"\n--- {nid} ({session.k + 1}/{len(chain)}) ---", "36"))
+            res = ro.revise_generate(p.root, session, session.k, provider=api)
+            text, finish = res["text"], res["finish"]
+            if not res["ok"] and not text.upper().startswith("NO CHANGES"):
+                warn("no <passage> tags in the editor output; check it for "
+                     "stray text")
+            if text.upper().startswith("NO CHANGES") or text == psg["original"]:
                 print("no changes")
+                session.k += 1
                 break
             if finish == "length":
                 warn("editor output hit max_tokens; it may be truncated")
-            print(word_diff(n["text"].strip(), text))
-            c = ask(f"\n({words(n['text'])} -> {words(text)} words) [a]ccept / [s]kip / [e]dit / [r]egenerate / [q]uit: ").strip().lower()
+            print(word_diff(psg["original"], text))
+            c = ask(f"\n({words(psg['original'])} -> {words(text)} words) "
+                    "[a]ccept / [s]kip / [e]dit / [r]egenerate / [q]uit: "
+                    ).strip().lower()
             if c.startswith("e"):
-                text = edit_saved(p, f"revise_{sc['id']}_{nid}", text).strip()
+                text = edit_saved(p, f"revise_{session.scene_id}_{nid}",
+                                  text).strip()
                 c = "a"
             if c.startswith("r"):
                 continue
             if c.startswith("a") and text:
-                if n.get("sep") == "":
-                    text = keep_lead(n["text"], text)
-                n["history"].append({"time": now(), "text": n["text"], "by": "revise"})
-                n["text"] = text
-                tree.save()
-                changed += 1
+                try:
+                    ro.revise_accept(p.root, session, session.k, psg, text)
+                except ro.OpError as e:
+                    _op_fail(e, soft_ok=True)
+                    return
             if c.startswith("q"):
-                print(f"revised {changed} passages")
+                print(f"revised {session.changed} passages")
                 return
+            session.k += 1
             break
-    print(f"revised {changed} passages")
-    rec = p.summaries()["scenes"].get(sc["id"])
-    if changed and rec:
-        warn(f"summary for {sc['id']} is now stale (run: update-state {p.root} --scene {sc['id']} --summary-only)")
+    print(f"revised {session.changed} passages")
+    rec = p.summaries()["scenes"].get(session.scene_id)
+    if session.changed and rec:
+        warn(f"summary for {session.scene_id} is now stale (run: update-state "
+             f"{p.root} --scene {session.scene_id} --summary-only)")
 
 
 def cmd_status(p, args):
-    scenes = p.scenes()
-    sums = p.summaries()["scenes"]
-    print(f"{p.cfg['title']}  ({p.root})")
-    for role, rc in p.cfg["roles"].items():
-        if role == "writer" and p.preset_path().exists():
-            pr = p.preset()
-            ceil, _, src = p.writer_ceiling(pr)
-            extra = f"  preset {pr['preset'].get('name', p.preset_path().name)} temp {pr['preset'].get('temp')}"
-        else:
-            ceil, _, src = p.ceiling(rc["model"])
-            extra = "  (preset missing: " + str(p.preset_path()) + ")" if role == "writer" else ""
-        print(f"  {role:<10} {rc['model']}  ceiling {ceil} ({src}){extra}")
-    lore = Lore(p, scenes)
+    """CLI adapter over the shared status facts; the legacy lorebook
+    discovery/registration stays at its original point (after the role
+    lines, before the lorebooks line)."""
+    import longform_core.review_operations as ro
+
+    facts = ro.status_facts(p.root)
+    print(f"{facts['title']}  ({facts['root']})")
+    for line in facts["role_lines"]:
+        print(f"  {line}")
+    lore = Lore(p, scenes=p.scenes())
     act = lore.active()
     print(f"  lorebooks on: {', '.join(act) if act else '(none)'}")
     print(f"\n{'id':<6}{'ch':<4}{'status':<10}{'words':>12}  {'summary':<8}{'crit':<5}title")
-    total = 0
-    for s in scenes:
-        tree = Tree(p, s["id"])
-        txt = tree.text() if tree.head else ""
-        w = words(txt)
-        total += w
-        rec = sums.get(s["id"])
-        summ = "-" if not rec else ("stale" if rec.get("text_hash") != text_hash(txt) else "ok")
-        crit = "yes" if p.f("critiques", f"{s['id']}.md").exists() else "-"
-        print(f"{s['id']:<6}{str(s.get('chapter', '?')):<4}{s.get('status', '?'):<10}{w:>6}/{s.get('target_words', 0):<5}  {summ:<8}{crit:<5}{s.get('title', '')}")
-    print(f"\ntotal {total} / {p.cfg['target_words']} words; arcs: {len(p.summaries().get('arcs', []))}")
+    for row in facts["rows"]:
+        print(row)
+    print(f"\ntotal {facts['total']} / {facts['target']} words; arcs: {facts['arcs']}")
 
 
 def cmd_export(p, args):
-    scenes = p.scenes()
-    out_path = Path(args.out).expanduser().resolve() if args.out else p.f("manuscript.md")
-    parts = [f"# {p.cfg['title']}"]
-    last_ch = None
-    total = 0
-    for s in scenes:
-        tree = Tree(p, s["id"])
-        if not tree.head:
-            continue
-        txt = tree.text()
-        total += words(txt)
-        ch = s.get("chapter")
-        if ch != last_ch:
-            parts.append(f"## Chapter {ch}")
-            last_ch = ch
-        elif len(parts) > 1 and not parts[-1].startswith("## "):
-            parts.append("* * *")
-        parts.append(txt)
-    write_text(out_path, "\n\n".join(parts) + "\n")
-    print(f"wrote {out_path} ({total} words)")
+    """CLI adapter over the shared manuscript composer: identical --out
+    resolution, bytes and wrote-message (the GUI adds the destination "
+    picker, overwrite confirmation and safety guards)."""
+    import longform_core.review_operations as ro
+
+    out_path = Path(args.out).expanduser().resolve() if args.out else \
+        p.f("manuscript.md")
+    comp = ro.compose_manuscript(p.root)
+    write_text(out_path, comp["text"])
+    print(f"wrote {out_path} ({comp['total']} words)")
 

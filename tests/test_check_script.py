@@ -16,7 +16,9 @@ EXPECTED_ORDER = [
     "uv run --script longform.py --help",
     "bash scripts/build-standalone.sh",
     "uv run --with pytest --with httpx pytest -q tests/test_standalone.py",
-    "uv run --with pytest --with httpx pytest -q tests --ignore=tests/test_standalone.py",
+    # the fake uv logs "$*" without shell quoting; the real command quotes the
+    # version range: uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests --ignore=tests/test_standalone.py
+    "uv run --with pytest --with httpx --with pyside6>=6.12.0,<6.13 pytest -q tests --ignore=tests/test_standalone.py",
 ]
 
 

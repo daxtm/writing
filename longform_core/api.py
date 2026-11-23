@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 
+from .cancel import Cancelled
 from .config import LOCK, RETRY_STATUS, SAMPLING_KEYS
 from .utils import col, die, now, warn
 
@@ -80,17 +81,27 @@ class Api:
         self.timeout = httpx.Timeout(float(p.cfg["request_timeout_s"]), connect=30.0)
         self.extra_ok = True
 
-    def get(self, path):
+    def get(self, path, token=None, on_retry_event=None):
+        """GET with optional cooperative cancellation and retry events.
+
+        `token` is checked before each attempt and interrupts retry backoff;
+        `on_retry_event(why, delay)` replaces the terminal retry line. Both
+        default to the unchanged CLI behavior."""
         def once():
             r = httpx.get(self.base + path, headers=self.headers, timeout=self.timeout)
             if r.status_code != 200:
                 raise HttpErr(r.status_code, r.text)
             return r.json()
-        return self._retry(once)
+        if on_retry_event is not None:
+            return self._retry(once, lambda why, delay: on_retry_event(why, delay),
+                               token=token)
+        return self._retry(once, self._on_retry, token=token)
 
-    def _retry(self, fn, on_retry=None):
+    def _retry(self, fn, on_retry=None, token=None):
         delay = 2.0
         for attempt in range(7):
+            if token:
+                token.check()
             try:
                 return fn()
             except HttpErr as e:
@@ -105,10 +116,14 @@ class Api:
                 on_retry(why, delay)
             else:
                 print(col(f"  [{why}; retrying in {delay:.0f}s]", "33"), flush=True)
-            time.sleep(delay)
+            # Interruptible backoff: a cancelled token wakes the wait immediately.
+            if token:
+                token.wait(delay)
+            else:
+                time.sleep(delay)
             delay = min(delay * 2, 30.0)
 
-    def _post(self, url, body, stream_cb, kind, progress=None, thinking=False):
+    def _post(self, url, body, stream_cb, kind, progress=None, thinking=False, token=None):
         """Always streams, so long generations never sit silent past the read timeout and one bad chunk
         can't sink a whole reply. kind 'chat' reads delta content (+ reasoning fields), 'text' reads choice text.
         Returns (content, finish_reason, usage, reasoning, bad_chunks)."""
@@ -119,6 +134,8 @@ class Api:
                 r.read()
                 raise HttpErr(r.status_code, r.text)
             for line in r.iter_lines():
+                if token:
+                    token.check()
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
@@ -168,9 +185,14 @@ class Api:
     def _on_retry(why, delay):
         print(col(f"\n  [{why}; retrying in {delay:.0f}s]", "33"), flush=True)
 
-    def chat(self, role, messages, max_tokens=None, stream_cb=None, progress=True):
+    def chat(self, role, messages, max_tokens=None, stream_cb=None, progress=True,
+             token=None, on_retry_event=None):
         """Returns (answer, finish_reason, usage). Thinking never reaches the answer: it is split off
-        by the reasoning field or </think>, and an unfinished thought raises NoAnswerErr."""
+        by the reasoning field or </think>, and an unfinished thought raises NoAnswerErr.
+
+        `token` adds cooperative cancellation checks around the request;
+        `on_retry_event(why, delay)` replaces the terminal retry line. Both
+        default to the unchanged CLI behavior."""
         rc = self.p.cfg["roles"][role]
         body = {"model": rc["model"], "messages": messages}
         for k in SAMPLING_KEYS:
@@ -189,10 +211,14 @@ class Api:
         thinking_on = bool(kwargs.get("enable_thinking", kwargs.get("thinking", think is None)))
         t0 = time.time()
         prog = Progress(f"{role} ({rc['model']})") if progress and stream_cb is None else None
+        if on_retry_event is not None:
+            retry_cb = lambda why, delay: on_retry_event(why, delay)
+        else:
+            retry_cb = self._on_retry
         try:
             content, finish, usage, reasoning, bad = self._retry(
-                lambda: self._post(self.base + "/chat/completions", body, stream_cb, "chat", prog, thinking_on),
-                self._on_retry)
+                lambda: self._post(self.base + "/chat/completions", body, stream_cb, "chat", prog, thinking_on, token=token),
+                retry_cb, token=token)
         finally:
             if prog:
                 prog.done()
@@ -218,9 +244,15 @@ class Api:
             warn(f"{role} answer hit max_tokens {body.get('max_tokens', '?')}; it may be cut off")
         return answer, finish, usage
 
-    def complete(self, role, prompt, params, extra=None, stream_cb=None, meta=None):
+    def complete(self, role, prompt, params, extra=None, stream_cb=None, meta=None,
+                 token=None, on_retry_event=None):
         """Text completion. `extra` holds params Featherless doesn't document (DRY); if the
-        server rejects them they are dropped for the rest of the session, with a warning."""
+        server rejects them they are dropped for the rest of the session, with a warning.
+
+        `token` adds cooperative cancellation checks before each attempt and at
+        stream chunks; `on_retry_event` (used by the GUI) is called before a
+        retry so a streamed preview can reset instead of concatenating failed
+        attempt fragments. Both default to the unchanged CLI behavior."""
         rc = self.p.cfg["roles"][role]
         body = {"model": rc["model"], "prompt": prompt, **params}
         sent_extra = bool(extra) and self.extra_ok
@@ -228,8 +260,19 @@ class Api:
             body.update(extra)
         url = self.base + "/completions"
         t0 = time.time()
+
+        def attempt(tok=None):
+            return self._post(url, body, stream_cb, "text", token=tok)
+
+        def retriable(fn):
+            if on_retry_event is not None:
+                # GUI: a retried stream attempt resets the preview instead of
+                # concatenating failed-attempt fragments with the response.
+                return self._retry(fn, lambda why, delay: on_retry_event("reset"), token=token)
+            return self._retry(fn, self._on_retry, token=token)
+
         try:
-            text, finish, usage, _, bad = self._retry(lambda: self._post(url, body, stream_cb, "text"), self._on_retry)
+            text, finish, usage, _, bad = retriable(attempt)
         except HttpErr as e:
             if sent_extra and e.status in (400, 422) and any(k.split("_")[0] in str(e).lower() for k in extra):
                 with LOCK:
@@ -238,7 +281,7 @@ class Api:
                         warn("server rejected " + ", ".join(extra) + f" ({e}); sending without them for this session")
                 body = {k: v for k, v in body.items() if k not in extra}
                 sent_extra = False
-                text, finish, usage, _, bad = self._retry(lambda: self._post(url, body, stream_cb, "text"), self._on_retry)
+                text, finish, usage, _, bad = retriable(attempt)
             else:
                 raise
         stream_notes = self._report_stream_problems(role, finish, bad)
@@ -252,21 +295,52 @@ class Api:
         })
         return text, finish, usage
 
-    def many(self, fn, n):
+    def many(self, fn, n, token=None, on_event=None):
+        """n parallel calls of fn(); completed results in completion order.
+
+        `on_event` replaces the terminal progress prints with dicts ({"type":
+        "candidate_done"/"candidate_failed", "k", "n", ...}); a cancelled token
+        is never swallowed as an ordinary candidate failure."""
         workers = max(1, min(n, int(self.p.cfg["max_parallel"])))
         results = []
+        if token:
+            token.check()
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(fn) for _ in range(n)]
+            futs = []
+            for _ in range(n):
+                if token:
+                    token.check()
+                futs.append(ex.submit(fn))
+            was_cancelled = False
             for k, fut in enumerate(as_completed(futs), 1):
                 try:
                     results.append(fut.result())
-                    print(col(f"  candidate {k}/{n} done", "2"), flush=True)
+                    self._candidate_event(on_event, f"  candidate {k}/{n} done", k, n, "candidate_done", "2")
+                except Cancelled:
+                    was_cancelled = True
                 except Exception as e:  # noqa: BLE001
-                    print(col(f"  candidate {k}/{n} failed: {type(e).__name__}: {e}", "31"), flush=True)
-                    self.p.log_call({"time": now(), "candidate_failed": f"{type(e).__name__}: {e}"})
+                    why = f"{type(e).__name__}: {e}"
+                    self._candidate_event(on_event, f"  candidate {k}/{n} failed: {why}", k, n,
+                                          "candidate_failed", "31", why=why)
+                    self.p.log_call({"time": now(), "candidate_failed": why})
+            for f in futs:  # never wait on queued work after a Stop
+                f.cancel()
+        if was_cancelled or (token and token.cancelled):
+            raise Cancelled("stopped")
         return results
 
-    def chat_many(self, role, messages, n, max_tokens=None):
+    @staticmethod
+    def _candidate_event(on_event, msg, k, n, kind, color, **extra):
+        if on_event:
+            on_event(dict({"type": kind, "k": k, "n": n, "msg": col(msg, color)}, **extra))
+        else:
+            print(col(msg, color), flush=True)
+
+    def chat_many(self, role, messages, n, max_tokens=None, token=None, on_event=None):
+        """n planner-style calls; optional token/on_event pass through to many()
+        and each chat (defaults keep the unchanged CLI output)."""
         one_at_a_time = max(1, min(n, int(self.p.cfg["max_parallel"]))) == 1
-        return self.many(lambda: self.chat(role, messages, max_tokens, progress=one_at_a_time), n)
+        return self.many(
+            lambda: self.chat(role, messages, max_tokens, progress=one_at_a_time, token=token),
+            n, token=token, on_event=on_event)
 

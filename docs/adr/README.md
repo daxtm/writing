@@ -10,11 +10,13 @@ except to mark it superseded by a newer ADR.
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted | 2026-11-23 |
 | [0002](0002-single-file-cli.md) | Keep the single-file CLI through the prototype | Superseded by ADR-0003 | 2026-11-23 |
 | [0003](0003-split-into-package.md) | Split the CLI into a package now | Accepted | 2026-11-23 |
+| [0004](0004-local-web-reader.md) | Use a read-only standard-library local web reader | Superseded by ADR-0005 | 2026-11-23 |
+| [0005](0005-desktop-gui.md) | Use Tkinter and ttk for the native read-only desktop reader | Superseded by ADR-0006 | 2026-11-23 |
 | [0006](0006-wayland-writing-workspace.md) | Use Qt Widgets for the Wayland writing workspace | Accepted | 2026-11-23 |
 | [0007](0007-shared-writing-operations.md) | Share writing operations between CLI and an asynchronous GUI | Accepted | 2026-11-23 |
 | [0008](0008-standalone-native-executable.md) | Distribute a frozen native executable alongside the source launcher | Accepted | 2026-11-23 |
 | [0009](0009-single-cli-gui-executable.md) | Bundle CLI and Qt workspace in the same executable | Accepted | 2026-11-23 |
 
-Numbers 0004 and 0005 are allocated to the browser/desktop-reader decisions on
-the unmerged `feat/reader-gui` branch. Preserve those records when integrating
-it; 0006 replaces 0005's presentation choice for the expanded workspace.
+ADR-0004/0005 are the reader-baseline decisions integrated from the
+`feat/reader-gui` branch; ADR-0006 supersedes 0005's Tk presentation choice for
+the expanded workspace.
