@@ -1184,54 +1184,33 @@ def cmd_revise(p, args):
 
 
 def cmd_status(p, args):
-    scenes = p.scenes()
-    sums = p.summaries()["scenes"]
-    print(f"{p.cfg['title']}  ({p.root})")
-    for role, rc in p.cfg["roles"].items():
-        if role == "writer" and p.preset_path().exists():
-            pr = p.preset()
-            ceil, _, src = p.writer_ceiling(pr)
-            extra = f"  preset {pr['preset'].get('name', p.preset_path().name)} temp {pr['preset'].get('temp')}"
-        else:
-            ceil, _, src = p.ceiling(rc["model"])
-            extra = "  (preset missing: " + str(p.preset_path()) + ")" if role == "writer" else ""
-        print(f"  {role:<10} {rc['model']}  ceiling {ceil} ({src}){extra}")
-    lore = Lore(p, scenes)
+    """CLI adapter over the shared status facts; the legacy lorebook
+    discovery/registration stays at its original point (after the role
+    lines, before the lorebooks line)."""
+    import longform_core.review_operations as ro
+
+    facts = ro.status_facts(p.root)
+    print(f"{facts['title']}  ({facts['root']})")
+    for line in facts["role_lines"]:
+        print(f"  {line}")
+    lore = Lore(p, scenes=p.scenes())
     act = lore.active()
     print(f"  lorebooks on: {', '.join(act) if act else '(none)'}")
     print(f"\n{'id':<6}{'ch':<4}{'status':<10}{'words':>12}  {'summary':<8}{'crit':<5}title")
-    total = 0
-    for s in scenes:
-        tree = Tree(p, s["id"])
-        txt = tree.text() if tree.head else ""
-        w = words(txt)
-        total += w
-        rec = sums.get(s["id"])
-        summ = "-" if not rec else ("stale" if rec.get("text_hash") != text_hash(txt) else "ok")
-        crit = "yes" if p.f("critiques", f"{s['id']}.md").exists() else "-"
-        print(f"{s['id']:<6}{str(s.get('chapter', '?')):<4}{s.get('status', '?'):<10}{w:>6}/{s.get('target_words', 0):<5}  {summ:<8}{crit:<5}{s.get('title', '')}")
-    print(f"\ntotal {total} / {p.cfg['target_words']} words; arcs: {len(p.summaries().get('arcs', []))}")
+    for row in facts["rows"]:
+        print(row)
+    print(f"\ntotal {facts['total']} / {facts['target']} words; arcs: {facts['arcs']}")
 
 
 def cmd_export(p, args):
-    scenes = p.scenes()
-    out_path = Path(args.out).expanduser().resolve() if args.out else p.f("manuscript.md")
-    parts = [f"# {p.cfg['title']}"]
-    last_ch = None
-    total = 0
-    for s in scenes:
-        tree = Tree(p, s["id"])
-        if not tree.head:
-            continue
-        txt = tree.text()
-        total += words(txt)
-        ch = s.get("chapter")
-        if ch != last_ch:
-            parts.append(f"## Chapter {ch}")
-            last_ch = ch
-        elif len(parts) > 1 and not parts[-1].startswith("## "):
-            parts.append("* * *")
-        parts.append(txt)
-    write_text(out_path, "\n\n".join(parts) + "\n")
-    print(f"wrote {out_path} ({total} words)")
+    """CLI adapter over the shared manuscript composer: identical --out
+    resolution, bytes and wrote-message (the GUI adds the destination "
+    picker, overwrite confirmation and safety guards)."""
+    import longform_core.review_operations as ro
+
+    out_path = Path(args.out).expanduser().resolve() if args.out else \
+        p.f("manuscript.md")
+    comp = ro.compose_manuscript(p.root)
+    write_text(out_path, comp["text"])
+    print(f"wrote {out_path} ({comp['total']} words)")
 

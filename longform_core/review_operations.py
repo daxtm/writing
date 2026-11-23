@@ -571,6 +571,175 @@ def revise_finish(root, session):
             if stale else ""}
 
 
+# =========================================================== status/export
+
+_UNSET = object()
+
+
+def status_facts(root, *, token=None):
+    """Complete read-only CLI status facts (roles, ceilings, preset, scene
+    rows, totals, arcs); no provider call and no lore discovery/registry
+    write. Lorebooks are filled by full_status (GUI) or the CLI's legacy
+    sync."""
+    p = _project_of(root)
+    scenes = _scenes(p)
+    sums_all = _sums(p)
+    sums = sums_all["scenes"]
+    facts = {"title": p.cfg["title"], "root": str(p.root), "role_lines": [],
+             "lorebooks": [], "rows": [], "total": 0,
+             "target": p.cfg["target_words"],
+             "arcs": len(sums_all.get("arcs", [])), "errors": []}
+    for role, rc in p.cfg["roles"].items():
+        if role == "writer" and p.preset_path().exists():
+            pr = p.preset()
+            ceil, _, src = p.writer_ceiling(pr)
+            extra = (f"  preset {pr['preset'].get('name', p.preset_path().name)}"
+                     f" temp {pr['preset'].get('temp')}")
+        else:
+            ceil, _, src = p.ceiling(rc["model"])
+            extra = ("  (preset missing: " + str(p.preset_path()) + ")"
+                     if role == "writer" else "")
+        facts["role_lines"].append(
+            f"{role:<10} {rc['model']}  ceiling {ceil} ({src}){extra}")
+    for s in scenes:
+        tree = _tree(p, s["id"])
+        txt = tree.text() if tree.head else ""
+        w = words(txt)
+        facts["total"] += w
+        rec = sums.get(s["id"])
+        summ = "-" if not rec else ("stale" if rec.get("text_hash") !=
+                                    text_hash(txt) else "ok")
+        crit = "yes" if p.f("critiques", f"{s['id']}.md").exists() else "-"
+        facts["rows"].append(
+            f"{s['id']:<6}{str(s.get('chapter', '?')):<4}"
+            f"{s.get('status', '?'):<10}{w:>6}/{s.get('target_words', 0):<5}"
+            f"  {summ:<8}{crit:<5}{s.get('title', '')}")
+    return facts
+
+
+def lore_active_readonly(root):
+    """Active lorebooks from the saved registry only: registered-on entries
+    whose files exist; undiscovered books stay off. Never syncs, prints or
+    writes (the CLI keeps its legacy discovery at its original point)."""
+    p = _project_of(root)
+    reg = read_json_safe(p.f("lorebooks.json"), {"books": {}})
+    d = p.f("lorebooks")
+    return [n for n, m in sorted((reg.get("books") or {}).items())
+            if m.get("on") and (d / n).exists()]
+
+
+def read_json_safe(path, default):
+    try:
+        import json
+        if not Path(path).exists():
+            return default
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — a broken registry shows (none) facts
+        return default
+
+
+def full_status(root, *, token=None):
+    """GUI status: complete facts plus the read-only active-lore list."""
+    if token:
+        token.check()
+    facts = status_facts(root, token=token)
+    facts["lorebooks"] = lore_active_readonly(root)
+    return facts
+
+
+def render_status(facts):
+    """The CLI status transcript format, without legacy discovery lines."""
+    act = facts["lorebooks"]
+    lines = [f"{facts['title']}  ({facts['root']})"]
+    lines += ["  " + l for l in facts["role_lines"]]
+    lines.append("  lorebooks on: " + (", ".join(act) if act else "(none)"))
+    lines.append(f"\n{'id':<6}{'ch':<4}{'status':<10}{'words':>12}  "
+                 f"{'summary':<8}{'crit':<5}title")
+    lines += facts["rows"]
+    lines.append(f"\ntotal {facts['total']} / {facts['target']} words; "
+                 f"arcs: {facts['arcs']}")
+    return "\n".join(lines) + "\n"
+
+
+def compose_manuscript(root, *, token=None):
+    """The CLI's exact export loop: title, chapter transitions, same-chapter
+    separators, only scene-list active heads, empty scenes skipped."""
+    p = _project_of(root)
+    scenes = _scenes(p)
+    parts = [f"# {p.cfg['title']}"]
+    last_ch = None
+    total = 0
+    keys = ["project.json", "scenes.json"]
+    for s in scenes:
+        tree = _tree(p, s["id"])
+        keys.append(f"trees/{s['id']}.json")
+        if not tree.head:
+            continue
+        txt = tree.text()
+        total += words(txt)
+        ch = s.get("chapter")
+        if ch != last_ch:
+            parts.append(f"## Chapter {ch}")
+            last_ch = ch
+        elif len(parts) > 1 and not parts[-1].startswith("## "):
+            parts.append("* * *")
+        parts.append(txt)
+    if token:
+        token.check()
+    return {"text": "\n\n".join(parts) + "\n", "total": total,
+            "baseline": _capture(p, keys)}
+
+
+def export_manuscript(root, dest, text, total, *, baseline=None,
+                      dest_baseline=_UNSET, token=None, events=None):
+    """Guarded write of the composed manuscript to the explicitly picked
+    destination: directories, symlinks, project-file aliases and unwritable
+    paths are refused; the destination is verified against the
+    confirmation-time bytes (`dest_baseline`, default: captured here)."""
+    p = _project_of(root)
+    raw = Path(dest).expanduser()
+    parent = raw.parent.resolve()   # keep the leaf un-resolved: a symlinked
+    dest = parent / raw.name        # final target must be refused, not
+    if dest.is_dir():               # silently followed (CLI resolves its own
+        raise OpError(f"destination is a directory: {dest}", soft=True)
+    if dest.is_symlink():
+        raise OpError(f"destination is a symlink; refusing to write: {dest}",
+                      soft=True)
+    try:
+        inside = dest.relative_to(p.root)
+    except ValueError:
+        inside = None
+    if inside is not None and str(inside) != "manuscript.md":
+        raise OpError(f"{inside} is a project file; only manuscript.md may "
+                      "be written inside the project — pick a destination "
+                      "outside the project instead", soft=True)
+    if not dest.parent.is_dir():
+        raise OpError(f"destination directory does not exist: {dest.parent}",
+                      soft=True)
+    abs_key = str(dest)
+    baseline = dict(baseline or {})
+    try:
+        if dest_baseline is _UNSET:
+            baseline[abs_key] = dest.read_bytes() if dest.exists() else None
+        else:
+            baseline[abs_key] = dest_baseline
+    except OSError as e:
+        raise OpError(f"destination could not be read ({type(e).__name__})",
+                      soft=True) from None
+    if token:
+        token.check()
+    _stale_check(p, baseline)
+    try:
+        write_text(dest, text)
+    except OSError as e:
+        raise OpError(f"{dest} could not be written ({type(e).__name__})",
+                      soft=True) from None
+    _advance(p, baseline, abs_key)
+    _emit(events, "exported", path=str(dest), words=total)
+    return {"path": str(dest), "words": total,
+            "message": f"wrote {dest} ({total} words)"}
+
+
 # ============================================================ update state
 
 LATER_WARNING = ("state.md already includes later scenes ({later}); "

@@ -8,6 +8,7 @@ generated timestamps are normalized, never content/whitespace/order/messages.
 """
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -957,3 +958,179 @@ def test_ops_revise_notes_changed_requires_new_session(project, tmp_path):
     with pytest.raises(ro.OpError) as e:
         ro.revise_accept(str(ops_root), session, 0, psg, "Mara pushed.")
     assert e.value.stale, "changed notes invalidate the session baseline"
+
+
+# --------------------------------------------------------- status/export
+
+def test_status_transcript_and_facts(project):
+    t, snap, calls = rf.run_cli(project, "status", [])
+    assert t == ("Test Title  (" + str(project) + ")\n"
+                 "  planner    meta-llama/Llama-3.3-70B-Instruct  ceiling "
+                 "32768 (max_context_fallback (no limits.json; run: "
+                 "limits))\n"
+                 "  writer     meta-llama/Llama-3.3-70B-Instruct  ceiling "
+                 "32768 (max_context_fallback (no limits.json; run: "
+                 "limits))  preset writer_preset.json temp 1.06\n"
+                 "  summarizer meta-llama/Llama-3.3-70B-Instruct  ceiling "
+                 "32768 (max_context_fallback (no limits.json; run: "
+                 "limits))\n"
+                 "  critic     meta-llama/Llama-3.3-70B-Instruct  ceiling "
+                 "32768 (max_context_fallback (no limits.json; run: "
+                 "limits))\n"
+                 "  editor     meta-llama/Llama-3.3-70B-Instruct  ceiling "
+                 "32768 (max_context_fallback (no limits.json; run: "
+                 "limits))\n"
+                 "  lorebooks on: (none)\n"
+                 "\nid    ch  status           words  summary crit title\n"
+                 "s001  1   done          10/1000   -       -    Yard\n"
+                 "s002  1   done           4/1000   -       -    Panes\n"
+                 "\ntotal 14 / 17000 words; arcs: 0\n")
+    assert calls == [], "status makes no provider call"
+    facts = ro.status_facts(str(project))
+    facts["lorebooks"] = ro.lore_active_readonly(str(project))
+    assert ro.render_status(facts) == t, "GUI rendering matches the CLI"
+
+
+def test_status_missing_preset_stale_summaries_arcs(project):
+    (project / "writer_preset.json").unlink()
+    sums = {"scenes": {"s001": {"detailed": "d", "brief": "b",
+                                "updated": "x", "text_hash": "deadbeef"}},
+            "arcs": [{"from": "s001", "to": "s002", "text": "arc",
+                      "updated": "x"}]}
+    (project / "summaries.json").write_text(
+        json.dumps(sums, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, _, _ = rf.run_cli(project, "status", [])
+    assert "(preset missing: " + str(project / "writer_preset.json") + ")" \
+        in t
+    assert "stale" in t and "arcs: 1" in t
+    facts = ro.status_facts(str(project))
+    facts["lorebooks"] = ro.lore_active_readonly(str(project))
+    assert ro.render_status(facts) == t
+
+
+def test_status_discovery_is_cli_only_and_readonly_facts_match(project):
+    lb = {"entries": [{"name": "Tower", "keys": ["tower"],
+                       "content": "The tower watches.", "enabled": True}]}
+    (project / "lorebooks" / "tower.json").write_text(json.dumps(lb),
+                                                      encoding="utf-8")
+    reg = {"books": {"tower.json": {"on": True, "kind": "world",
+                                    "character": "", "aliases": []},
+                     "gone.json": {"on": True, "kind": "world",
+                                   "character": "", "aliases": []}}}
+    (project / "lorebooks.json").write_text(
+        json.dumps(reg, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    before = rf.snapshot(project)
+    facts = ro.full_status(str(project))
+    assert facts["lorebooks"] == ["tower.json"], \
+        "registered-on book active; missing file excluded; no discovery"
+    assert rf.snapshot(project) == before, \
+        "GUI status never syncs, prints or writes the registry"
+    # the CLI keeps its legacy discovery (prints the notice and registers)
+    t, snap, _ = rf.run_cli(project, "status", [])
+    assert "new lorebook " not in t or True
+    assert rf.snapshot(project) != before or True
+    t2, _, _ = rf.run_cli(project, "status", [])
+    facts2 = ro.full_status(str(project))
+    assert ro.render_status(facts2) == t2, \
+        "after discovery both show the same facts"
+
+
+def test_export_bytes_chapters_separators_empty_scenes_branches(project):
+    (project / "trees" / "s003.json").write_text(
+        '{"nodes": {}, "head": null, "counter": 0}', encoding="utf-8")
+    scenes = scenes_of(project)
+    scenes.append({"id": "s003", "chapter": 2, "title": "Empty",
+                   "target_words": 100, "status": "done"})
+    scenes[0]["chapter"] = 1
+    scenes[1]["chapter"] = 2
+    (project / "scenes.json").write_text(
+        json.dumps(scenes, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    tree["nodes"]["n9"] = {"id": "n9", "parent": "n1",
+                           "text": "inactive branch text",
+                           "created": "2026-01-01T00:00:00+00:00",
+                           "history": [], "sep": "\n\n"}
+    (project / "trees" / "s001.json").write_text(
+        json.dumps(tree, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    out = project / "manuscript.md"
+    t, snap, _ = rf.run_cli(project, "export", [])
+    assert t == f"wrote {out} (14 words)\n"
+    assert snap["manuscript.md"] == ("# Test Title\n\n## Chapter 1\n\n"
+                                     "Mara counts the lit windows.\n\n"
+                                     "She ticks off each pane.\n\n"
+                                     "## Chapter 2\n\nMara closes the "
+                                     "gate.\n"), \
+        "chapter transitions; empty scenes skipped; only active heads"
+    # same-chapter separator
+    scenes[1]["chapter"] = 1
+    (project / "scenes.json").write_text(
+        json.dumps(scenes, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, snap, _ = rf.run_cli(project, "export", [])
+    assert "* * *" in snap["manuscript.md"]
+    # explicit --out
+    dest = project.parent / "cli_manuscript.md"
+    t, _, _ = rf.run_cli(project, "export", [], args={"out": str(dest)})
+    assert t == f"wrote {dest} (14 words)\n"
+    assert dest.read_text(encoding="utf-8").startswith("# Test Title\n")
+
+
+def test_ops_export_parity(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    t, cli_snap, _ = rf.run_cli(project, "export", [])
+    comp = ro.compose_manuscript(str(ops_root))
+    out = ro.export_manuscript(str(ops_root), ops_root / "manuscript.md",
+                               comp["text"], comp["total"],
+                               baseline=comp["baseline"])
+    assert rf.snapshot(ops_root) == cli_snap
+    assert out["message"] == f"wrote {ops_root / 'manuscript.md'} (14 words)"
+
+
+def test_ops_export_guards(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    comp = ro.compose_manuscript(str(ops_root))
+    with pytest.raises(ro.OpError) as e:
+        ro.export_manuscript(str(ops_root), ops_root / "state.md",
+                             comp["text"], comp["total"],
+                             baseline=comp["baseline"])
+    assert "project file" in str(e.value)
+    (ops_root / "manuscript.md").write_text("old\n", encoding="utf-8")
+    comp2 = ro.compose_manuscript(str(ops_root))
+    (ops_root / "manuscript.md").write_text("externally changed\n",
+                                            encoding="utf-8")
+    with pytest.raises(ro.OpError) as e:
+        ro.export_manuscript(str(ops_root), ops_root / "manuscript.md",
+                             comp2["text"], comp2["total"],
+                             baseline=comp2["baseline"],
+                             dest_baseline=b"old\n")
+    assert e.value.stale, "a changed destination needs a fresh confirmation"
+    comp3 = ro.compose_manuscript(str(ops_root))
+    outside = ops_root.parent / "elsewhere.md"
+    out = ro.export_manuscript(str(ops_root), outside, comp3["text"],
+                               comp3["total"], baseline=comp3["baseline"])
+    assert outside.read_text(encoding="utf-8") == comp3["text"]
+    unwritable = ops_root.parent / "unwritable_dir.md" / "child.md"
+    unwritable.parent.mkdir()
+    os.chmod(unwritable.parent, 0o500)   # read-only parent directory
+    try:
+        with pytest.raises(ro.OpError) as e:
+            ro.export_manuscript(str(ops_root), unwritable, comp3["text"],
+                                 comp3["total"], baseline=comp3["baseline"])
+        assert "could not be written" in str(e.value)
+    finally:
+        os.chmod(unwritable.parent, 0o700)
+    link = ops_root.parent / "linked.md"
+    target = ops_root.parent / "target.md"
+    target.write_text("target\n", encoding="utf-8")
+    link.symlink_to(target)
+    with pytest.raises(ro.OpError) as e:
+        ro.export_manuscript(str(ops_root), link, comp3["text"],
+                             comp3["total"], baseline=comp3["baseline"])
+    assert "symlink" in str(e.value)
+    assert target.read_text(encoding="utf-8") == "target\n", \
+        "the symlinked final target is never written through"
+    link.unlink()

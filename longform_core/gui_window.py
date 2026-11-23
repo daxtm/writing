@@ -121,6 +121,7 @@ class MainWindow(QMainWindow):
         self._report_rows = []       # last report list paths
         self._revision = None        # shared revise session + active passage
         self._rev_editing = False
+        self._status_facts = None    # last read-only status overview
         self._plan = plan.project_overview(self._root)
 
         self.snap = None              # last valid Snapshot
@@ -2203,13 +2204,125 @@ class MainWindow(QMainWindow):
         self.revise_quit_btn.setEnabled(has and not busy)
 
     def _build_status_tab(self):
+        """Read-only full status and destination-picked export; nothing
+        mutates the project."""
         box = QWidget()
         l = QVBoxLayout(box)
         l.setContentsMargins(0, 0, 0, 0)
-        l.addWidget(QLabel("Full read-only status and destination export are "
-                           "added by the status/export feature commit."))
-        l.addStretch(1)
+        btns = QHBoxLayout()
+        self.status_btn = QPushButton("Refresh status")
+        self.status_btn.setToolTip(
+            "Read-only overview matching the CLI status facts: role models "
+            "and ceilings, preset, active lorebooks, scene chapters/status/"
+            "words/summary freshness, totals and arcs; no provider call and "
+            "no registry write")
+        self.status_btn.clicked.connect(self.status_refresh)
+        btns.addWidget(self.status_btn)
+        self.export_btn = QPushButton("Export manuscript…")
+        self.export_btn.setToolTip(
+            "Pick a destination (default: manuscript.md in the project), "
+            "confirm an overwrite explicitly, and write the CLI's exact "
+            "Markdown; the resolved path and word count are reported")
+        self.export_btn.clicked.connect(self.export_manuscript)
+        btns.addWidget(self.export_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        self.status_label = QLabel("Status — press Refresh status to read "
+                                   "the saved facts.")
+        self.status_label.setWordWrap(True)
+        l.addWidget(self.status_label)
+        self.status_view = QPlainTextEdit()
+        self.status_view.setReadOnly(True)
+        self.status_view.setPlaceholderText(
+            "Project identity, roles and ceilings, active lorebooks, scene "
+            "rows and totals appear here; viewing writes nothing.")
+        l.addWidget(self.status_view, 1)
         return box
+
+    # ---------------------------------------------------- status/export ops
+
+    def status_refresh(self):
+        """Read-only overview on the worker (fresh facts, never mutating)."""
+        if self._busy:
+            self._status("An operation is running; status is paused until "
+                         "it settles.", error=True)
+            return
+
+        def fn(sink, token):
+            return ro.full_status(self._root, token=token)
+
+        self._dispatch(fn, kind="status_overview")
+
+    def export_manuscript(self):
+        """Destination-picked export: confirm an existing destination
+        explicitly, then compose and write through the shared guarded op."""
+        if self._busy:
+            self._status("An operation is running; export is paused until "
+                         "it settles.", error=True)
+            return
+        if not self._resolve_review_dirty("exporting") or \
+                not self._resolve_report_dirty("exporting") or \
+                not self._resolve_rev_dirty("exporting"):
+            return
+        default = str(self._root / "manuscript.md")
+        picked, _flt = self._save_picker("Export: choose the manuscript "
+                                         "destination", default)
+        if not picked:
+            self._status("Export cancelled; nothing was written.")
+            return
+        dest = Path(picked).expanduser()
+        parent = dest.parent.resolve()  # keep the leaf un-resolved: a
+        dest = parent / dest.name       # symlinked final target is refused
+        if dest.is_dir():
+            self._status(f"destination is a directory: {dest}", error=True)
+            return
+        if dest.is_symlink():
+            self._status(f"destination is a symlink; refusing to write: "
+                         f"{dest}", error=True)
+            return
+        try:
+            dest_bytes = dest.read_bytes() if dest.exists() else None
+        except OSError as e:
+            self._status(f"destination could not be read "
+                         f"({type(e).__name__})", error=True)
+            return
+        if dest_bytes is not None:
+            pick = self._choice(
+                "Overwrite destination?",
+                f"{dest}\n\nexists. Overwrite it with the exported "
+                "manuscript? (The write is verified against these bytes "
+                "again before it happens.)",
+                ["Overwrite", "Cancel"])
+            if pick != "Overwrite":
+                self._status("Export cancelled; the destination is "
+                             "unchanged.")
+                return
+
+        def fn(sink, token):
+            comp = ro.compose_manuscript(self._root, token=token)
+            return ro.export_manuscript(self._root, str(dest), comp["text"],
+                                        comp["total"],
+                                        baseline=comp["baseline"],
+                                        dest_baseline=dest_bytes,
+                                        token=token, events=sink)
+
+        self._dispatch(fn, kind="export_write")
+
+    def _update_status_view(self):
+        facts = self._status_facts
+        if facts is None:
+            self.status_label.setText(
+                "Status — press Refresh status to read the saved facts.")
+        else:
+            self.status_view.setPlainText(ro.render_status(facts))
+            self.status_label.setText(
+                "Status facts are read-only: no provider call, no "
+                "lorebook discovery or registry write.")
+        self._update_status_ui()
+
+    def _update_status_ui(self):
+        self.status_btn.setEnabled(not self._busy)
+        self.export_btn.setEnabled(not self._busy)
 
     def _combo(self):
         from PySide6.QtWidgets import QComboBox
@@ -3389,6 +3502,7 @@ class MainWindow(QMainWindow):
         self._report_rows = []
         self._revision = None
         self._rev_editing = False
+        self._status_facts = None
         self._cont = None
         self._cont_editing = None
         self._bind_steering(None)
@@ -3760,6 +3874,7 @@ class MainWindow(QMainWindow):
         self._update_continuity_ui()
         self._update_review_ui()
         self._update_revise_ui()
+        self._update_status_ui()
 
     def _update_draft_actions(self):
         """Generate/Stop/Accept availability with recovery guidance."""
@@ -3895,6 +4010,15 @@ class MainWindow(QMainWindow):
                              error=True)
             self._update_steering_ui()
         elif outcome == "cancelled":
+            if self._op_kind == "status_overview":
+                self._update_steering_ui()
+                self._status("Stopped; the status view is unchanged "
+                             "(read-only facts, nothing was written).")
+                return
+            if self._op_kind == "export_write":
+                self._update_steering_ui()
+                self._status("Stopped; nothing was written.")
+                return
             if self._op_kind in ("continuity_generate", "continuity_input",
                                  "continuity_accept"):
                 self._update_steering_ui()
@@ -4358,6 +4482,13 @@ class MainWindow(QMainWindow):
                          + (f"; previous critique backed up to "
                             f"{value['backup']}" if value.get("backup")
                             else ""))
+        elif kind == "status_overview" and isinstance(value, dict):
+            self._status_facts = value
+            self._update_status_view()
+        elif kind == "export_write" and isinstance(value, dict):
+            self._status(value.get("message")
+                         or f"wrote {value['path']} "
+                            f"({value.get('words', 0)} words)")
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
@@ -4846,6 +4977,7 @@ class MainWindow(QMainWindow):
         self._update_outline_tab()
         self._update_scenes_tab()
         self._update_review_view()
+        self._update_status_view()
         self._update_steering_ui()
 
     def _reconcile_selection(self):

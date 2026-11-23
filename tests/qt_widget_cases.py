@@ -3012,7 +3012,9 @@ def case_review_journey(root):
         assert sums["scenes"]["s001"]["text_hash"]
         backups = list((gui / "state_history").glob("before_s001_*.md"))
         assert len(backups) == 1 and \
-            backups[0].read_text(encoding="utf-8") == "Mara is at the yard.\n"
+            backups[0].read_text(encoding="utf-8") == "Mara is at the yard.", \
+            "the pre-update state.md is backed up byte-identical (no " \
+            "newline is added: the fixture's saved state has none)"
         assert (gui / "state.md").read_text(encoding="utf-8") == \
             "Mara is inside the yard.\n"
 
@@ -3049,7 +3051,9 @@ def case_review_journey(root):
         assert sums["arcs"][0]["text"] == "Mara opened the gate."
         assert sums["scenes"]["s001"]["detailed"], "scene summaries kept"
 
-        # --- reports: critique and check, saved explicitly
+        # --- reports: critique and check, saved explicitly (s001 again;
+        # summary-only left s002 selected, and the CLI fixes ran on s001)
+        win.select_item("manuscript", "s001", None)
         win.tabs.setCurrentIndex(gw.REVIEW)
         win.critique_btn.click()
         assert _pump(a, lambda: not win._busy)
@@ -3079,7 +3083,9 @@ def case_review_journey(root):
         assert len(prevs) == 1 and "vary the verb" in \
             prevs[0].read_text(encoding="utf-8")
 
-        # --- revision: accept the first passage, skip the second
+        # --- revision: accept the first passage; the second response is
+        # "NO CHANGES", so the session completes exactly like the CLI's
+        # default-answer run (revised 1, n2 untouched)
         win.tabs.setCurrentIndex(gw.REVISION)
         win.select_item("manuscript", "s001", None)
         win.revise_btn.click()
@@ -3087,12 +3093,10 @@ def case_review_journey(root):
         assert "Mara counts the lit windows." in win.revise_view.toPlainText()
         assert "Mara pushed the gate open." in win.revise_view.toPlainText()
         win.revise_accept_btn.click()
-        assert _pump(a, lambda: not win._busy), "accept + next passage"
-        assert "She ticks off each pane." in win.revise_view.toPlainText()
-        win.revise_skip_btn.click()
-        assert _pump(a, lambda: not win._busy), "session completes"
-        assert "revised 1 passages" in win.revise_label.text()
-        assert "stale" in win.revise_label.text().lower()
+        assert _pump(a, lambda: not win._busy), "accept + no-change advance"
+        assert "revised 1 passages" in win.status.text(), \
+            "a no-change second passage completes the session like the CLI"
+        assert win._revision is None, "the session closed after the advance"
         t = json.loads((gui / "trees" / "s001.json").read_text())
         assert t["nodes"]["n1"]["text"] == "Mara pushed the gate open."
         assert t["nodes"]["n1"]["history"][-1]["by"] == "revise"
@@ -3151,6 +3155,129 @@ def case_review_journey(root):
         builtins.input = saved_input
 
 
+def case_review_status_export(root):
+    """Status tab and destination-picked export (task 1.6): read-only facts
+    matching the CLI transcript, refreshed views, picker cancel, overwrite
+    confirm/decline, symlink/project-file/unwritable refusals. No terminal
+    helper and no provider call runs."""
+    import os
+    import longform_core.gui_window as gw
+    a = app()
+    import review_fixtures as rf
+
+    project = _review_project(root, "p")
+    cli = root / "cli"
+    import shutil
+    shutil.copytree(project, cli)
+    cli_status, _, _ = rf.run_cli(cli, "status", [])
+    manuscript = root / "manuscript.md"
+    cli_export, _, _ = rf.run_cli(cli, "export", [], args={"out":
+                                                           str(manuscript)})
+    want_manuscript = manuscript.read_text(encoding="utf-8")
+
+    picked = {"path": ""}
+    win = gw.MainWindow(
+        str(project),
+        choice=_scripted_choice(["Cancel", "Overwrite", "Overwrite",
+                                 "Cancel"]),
+        provider_factory=lambda _p: ReviewChatFake([]),
+        save_picker=lambda title, default: (picked["path"], ""))
+    win.show()
+    win.tabs.setCurrentIndex(gw.STATUS)
+
+    # fresh facts render and match the CLI status transcript
+    win.status_btn.click()
+    assert _pump(a, lambda: not win._busy), "status settles"
+    got = win.status_view.toPlainText().replace(str(project), "(ROOT)")
+    assert rf.normalize(got) == rf.normalize(cli_status.replace(
+        str(cli), "(ROOT)")), "status facts match the CLI calculations"
+    assert "(none)" in got, "read-only active-lore list with no registry"
+    assert win.status_btn.isEnabled() and win.export_btn.isEnabled()
+
+    # picker cancel: nothing written, no dialog
+    before = {f.relative_to(project): f.stat().st_mtime_ns
+              for f in project.rglob("*") if f.is_file()}
+    picked["path"] = ""
+    win.export_btn.click()
+    assert "Export cancelled; nothing was written." in win.status.text()
+    assert {f.relative_to(project): f.stat().st_mtime_ns
+            for f in project.rglob("*") if f.is_file()} == before
+
+    # existing destination, decline: destination unchanged
+    dest = root / "declined.md"
+    dest.write_text("old bytes\n", encoding="utf-8")
+    picked["path"] = str(dest)
+    win.export_btn.click()
+    assert "Export cancelled; the destination is unchanged." in \
+        win.status.text()
+    assert dest.read_text(encoding="utf-8") == "old bytes\n"
+
+    # existing destination, confirm: exact CLI bytes are written
+    picked["path"] = str(dest)
+    win.export_btn.click()
+    assert _pump(a, lambda: not win._busy), "export settles"
+    assert dest.read_text(encoding="utf-8") == want_manuscript, \
+        "export matches the CLI's exact markdown"
+    assert "wrote " in win.status.text() and \
+        str(dest) in win.status.text() and "words" in win.status.text()
+
+    # a destination that changed after confirmation is refused by the shared
+    # guarded write (covered headless in test_ops_export_guards, dest_baseline)
+
+    # project-file alias refused (only manuscript.md may be written inside)
+    picked["path"] = str(project / "state.md")
+    win.export_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "project file" in win.status.text()
+    assert (project / "state.md").read_text(
+        encoding="utf-8") == "Mara is at the yard."
+
+    # symlink destination refused without writing through the link
+    link = root / "linked.md"
+    target = root / "outside_target.md"
+    target.write_text("target\n", encoding="utf-8")
+    link.symlink_to(target)
+    picked["path"] = str(link)
+    win.export_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "symlink" in win.status.text()
+    assert target.read_text(encoding="utf-8") == "target\n"
+
+    # unwritable destination refused with the CLI's wording
+    ro_dir = root / "unwritable.md"
+    ro_dir.mkdir()
+    os.chmod(ro_dir, 0o500)
+    try:
+        picked["path"] = str(ro_dir / "child.md")
+        win.export_btn.click()
+        assert _pump(a, lambda: not win._busy)
+        assert "could not be written" in win.status.text()
+    finally:
+        os.chmod(ro_dir, 0o700)
+
+    # stale status facts refresh on request: a saved critique flips its row
+    (project / "critiques" / "s001.md").write_text("# Critique\n",
+                                                   encoding="utf-8")
+    win.status_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    got2 = win.status_view.toPlainText()
+    assert "yes" in got2, "crit column updates after the refresh"
+    assert "Mara counts the lit windows." not in got2, \
+        "the status view lists facts, never prose"
+
+    # dirty report edits are resolved before export runs
+    win.tabs.setCurrentIndex(gw.REVIEW)
+    win.refresh_btn.click()
+    win.report_list.setCurrentRow(0)
+    win.report_edit_btn.click()
+    win.report_edit.setPlainText("edited note")
+    win.tabs.setCurrentIndex(gw.STATUS)
+    picked["path"] = ""
+    win.export_btn.click()
+    assert "Cancelled; the edit is kept" in win.status.text(), \
+        "export pauses on unsaved report edits"
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -3186,6 +3313,7 @@ CASES = {
     "case_review_compress": case_review_compress,
     "case_review_reports": case_review_reports,
     "case_review_revise": case_review_revise,
+    "case_review_status_export": case_review_status_export,
     "case_review_journey": case_review_journey,
 }
 
