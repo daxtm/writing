@@ -22,8 +22,9 @@ may use network; test execution must not.
 
 ## Planning baseline
 
-This extends the completed foundation below; the GUI milestones are new,
-unimplemented plans, not OpenSpec changes. No change artifacts are created here.
+This extends the completed foundation below; the GUI milestones remain
+unimplemented plans. Only M1's first change has been selected for proposal:
+`openspec/changes/gui-wayland-shell/`; subsequent items have no change artifacts.
 `origin/main` currently has the CLI but no `gui` command. The separate
 `feat/reader-gui` branch contains the Tkinter/ttk reader, UI-independent
 `reader_model` snapshots, and ADR-0004/0005; it is not yet on main.
@@ -40,7 +41,7 @@ read-only reader supplies editable, asynchronous workflow interactions.
 
 ## GUI milestone 1 — Walking skeleton: steer, generate, accept on Wayland
 
-- [ ] gui-wayland-shell — Replace the pending Tk presentation with a PySide6/Qt Widgets workspace while retaining safe reader snapshots, all-branch navigation, notes, refresh, and the `gui DIR` entry point.
+- [ ] gui-wayland-shell — Replace the pending Tk presentation with a native Wayland Qt Widgets reading shell: safe snapshots, all-branch/notes navigation, state-preserving refresh, and persistent steering Save/Clear; no generation/acceptance/worker yet.
 - [ ] gui-steered-drafting — Extract shared draft operations and connect scene selection, saved steering, one-candidate generation, preview, acceptance, and cooperative stop to a responsive background worker.
 
 Depend on the reader baseline above; `gui-steered-drafting` depends on
@@ -148,9 +149,10 @@ headless success proves it. No separate hardening/polish milestone is planned.
 
 - Which compositor/distribution and monitor scaling form the owner's primary
   acceptance setup? Native Wayland is the target, not merely an XWayland window.
-- Which compatible PySide6 release and Linux runtime libraries work in the
-  actual uv environment? Verify/pin the tested dependency range in
-  `gui-wayland-shell`; bundled Qt binaries alone do not establish that result.
+- Runtime feasibility is verified: uv resolved PySide6 6.12.0 and a minimal
+  explicit Wayland app reported `wayland`, 1920x1080, DPR 1.0, without XWayland.
+  `gui-wayland-shell` proposes `pyside6>=6.12.0,<6.13` in the launcher/check
+  environment; actual workspace/compositor/scaling acceptance remains separate.
 - Any visual reference or preferred reading font? Until supplied, use the
   system palette, restrained controls, and adjustable prose typography above.
 

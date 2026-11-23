@@ -18,16 +18,28 @@ branch is already integrated.
 ## Planned desktop workspace
 `docs/ROADMAP.md` extends the completed CLI foundation with three GUI milestones:
 Wayland steer/generate/accept, setup/planning and draft controls, then continuity/
-review/revision/export. These are plans, not implemented commands or OpenSpec changes.
+review/revision/export. These are plans, not implemented commands.
+`openspec/changes/gui-wayland-shell/` is the selected M1 first-change proposal:
+Qt shell/reading and persistent steering only. Generation, acceptance, and the
+background worker remain for `gui-steered-drafting`; do not create it yet.
 ADR-0006 selects PySide6/Qt Widgets for the expanded native Wayland workspace;
 ADR-0007 selects incremental shared operations and one background GUI worker.
 Reuse existing commands/core behavior and the pending reader's safe snapshots,
 not terminal automation or a second writing engine. Keep CLI prompts/files
-compatible. Verify the actual uv/Qt/Wayland runtime before claiming support.
+compatible. The owner verified a minimal uv PySide6 6.12.0 app with explicit
+`QT_QPA_PLATFORM=wayland` reporting `wayland`, 1920x1080, DPR 1.0, not XWayland.
+This is runtime feasibility, not acceptance of the planned workspace.
+The shell plans `pyside6>=6.12.0,<6.13` in the launcher and existing check
+environment: increased clean-checkout downloads/disk use includes CLI-only uv
+users. GUI imports stay lazy, so `--help` still needs no display.
 The implementation must add offline operation/button-flow tests to
 `scripts/check.sh`; model tests stay headless, Qt widget tests use offscreen
 execution, and real Wayland desktop acceptance is separate. Do not weaken the
 existing network guard or claim headless tests establish compositor support.
+After implementation, demo with
+`QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR`.
+Until then the Checks and Layout sections above/below describe current code;
+the build must update them when Qt modules and coverage actually land.
 
 ## Layout
 - `longform.py`: thin PEP 723 launcher; re-exports the package's public names so `import longform` keeps working.
