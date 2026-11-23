@@ -11,7 +11,8 @@ from .api import Api, HttpErr, NoAnswerErr
 from .checks import check_report
 from .config import (BIBLE_TEMPLATE, CRITIC_SYSTEM, DEFAULT_CONFIG, EDITOR_SYSTEM, PLANNER_SYSTEM, SAMPLING_KEYS, STATE_TEMPLATE, SUMMARIZER_SYSTEM)
 from .lore import is_present, Lore, pov_name
-from .prompt import build_writer_prompt, clean_continuation, format_card, layered_summary, print_report
+from .prompt import (build_writer_prompt, clean_continuation, format_card, layered_summary, print_report,
+                     tail_trim_chars)
 from .tree import Tree
 from .utils import (ask, col, die, edit_saved, extract_tagged, keep_lead, line_diff, now, page, parse_sections, read_json, read_text, save_input, slug, stamp, tag_instr, text_hash, warn, word_diff, words, write_json, write_text)
 
@@ -505,6 +506,8 @@ editing and branches:
   j ID         jump head to node ID (switches branch)
   x ID         delete leaf node ID
   v            view scene text so far (with node markers)
+  v ID         view one node's full text and metadata
+  tail [N]     show the last N characters of the current scene (default 600)
 info:
   card         show the scene card
   c            show context budget, samplers and injected lore for the next call
@@ -600,8 +603,7 @@ def lb_command(lore, sc, arg):
     print("lb usage: lb | lb N [N ...] | lb all on|off | lb N char NAME | lb N alias A, B | lb N world")
 
 
-def show_candidate(tree, k, nid, with_text):
-    n = tree.node(nid)
+def node_flags(n):
     flags = []
     if n.get("ended"):
         flags.append("signals SCENE END")
@@ -609,6 +611,32 @@ def show_candidate(tree, k, nid, with_text):
         flags.append("trimmed at length cutoff")
     if n.get("absent"):
         flags.append(col("mentions absent: " + ", ".join(n["absent"]), "33"))
+    return flags
+
+
+def node_header(nid, n):
+    meta = [f"{words(n['text'])} words"]
+    if n.get("source"):
+        meta.append(str(n["source"]))
+    if n.get("model"):
+        meta.append(str(n["model"]))
+    if n.get("parent"):
+        meta.append(f"parent {n['parent']}")
+    flags = node_flags(n)
+    return f"{nid}  " + "  ".join(meta) + ("  " + "; ".join(flags) if flags else "")
+
+
+def show_node(tree, nid):
+    n = tree.node(nid)
+    print(col(f"===== {node_header(nid, n)}", "36"))
+    page(n["text"].strip())
+    if n.get("steer"):
+        print("steer used: " + n["steer"])
+
+
+def show_candidate(tree, k, nid, with_text):
+    n = tree.node(nid)
+    flags = node_flags(n)
     print(col(f"\n===== [{k}] {nid}  {words(n['text'])} words", "36") + ("  " + "; ".join(flags) if flags else ""))
     if with_text:
         print(n["text"].strip())
@@ -722,6 +750,16 @@ def cmd_draft(p, args):
         warn("preset has temperature_last; Featherless doesn't expose sampler order, so the server's default order applies")
     print(col(format_card(sc), "36"))
     show_lorebooks(lore, sc)
+    if tree.head:
+        n = tree.node(tree.head)
+        print(col(f"resume {node_header(tree.head, n)}", "36"))
+        print("  ends: " + tail_trim_chars(500, n["text"], marker="…").replace("\n", "\n  "))
+        if n.get("steer"):
+            print("  steer used: " + n["steer"])
+        siblings = [x for x in tree.children(n.get("parent")) if x != tree.head]
+        if siblings:
+            more = ", ".join(siblings[:8]) + (", ..." if len(siblings) > 8 else "")
+            print(f"  {len(siblings)} other branch(es): {more}  (v ID to read one)")
     print("type ? for commands")
     while True:
         sw = words(tree.text()) if tree.head else 0
@@ -861,10 +899,22 @@ def cmd_draft(p, args):
                     print("deleted" if tree.delete(arg) else "node has children; not deleted")
                     tree.save()
             elif cmd == "v":
-                if tree.head:
+                if arg:
+                    if arg in tree.d["nodes"]:
+                        show_node(tree, arg)
+                    else:
+                        print("no such node")
+                elif tree.head:
                     page("\n\n".join(f"--- {i} ---\n{tree.node(i)['text'].strip()}" for i in tree.chain()))
                 else:
                     print("(empty)")
+            elif cmd == "tail":
+                if not tree.head:
+                    print("(empty)")
+                else:
+                    n = int(arg) if arg.isdigit() and int(arg) > 0 else 600
+                    print(col(f"last {n} chars (head {tree.head}):", "36"))
+                    print(tail_trim_chars(n, tree.text(), marker="…"))
             elif cmd == "d":
                 sc["status"] = "done"
                 p.save_scenes(scenes)
