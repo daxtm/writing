@@ -113,6 +113,23 @@ def test_steer_with_previous_scene_matches_fixture(project, expected):
     run_case(project, expected, "steer", 1, "Add rain.", 180, "s002")
 
 
+def test_passage_length_caps_max_tokens(project):
+    preset = {**PRESET, "preset": {"genamt": 3000}}
+    tree = longform.Tree(project, "s001")
+    _, params, _, _, report = longform.build_writer_prompt(
+        project, preset, FakeLore(), SCENES, 0, tree, "", 650)
+    assert params["max_tokens"] == 1040
+    assert any("capped to 1040" in note for note in report["notes"])
+
+
+def test_passage_length_never_raises_a_lower_genamt(project):
+    preset = {**PRESET, "preset": {"genamt": 100}}
+    tree = longform.Tree(project, "s001")
+    _, params, _, _, _ = longform.build_writer_prompt(
+        project, preset, FakeLore(), SCENES, 0, tree, "", 650)
+    assert params["max_tokens"] == 100
+
+
 # --------------------------------------------------------------------------- compose_writer_prompt
 
 

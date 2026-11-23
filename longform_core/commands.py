@@ -487,7 +487,7 @@ def cmd_scenes(p, args):
 DRAFT_HELP = """generation:
   g [N]        generate N candidate passages (default: writer.swipes; N=1 streams live)
   s TEXT       set steering note (persists until changed); 's -' clears it
-  l N          set target passage length in words for this session
+  l N          set target passage length in words for this session (also caps max_tokens)
 scene cast:
   who A, B     set the characters physically present in this scene (saved to scenes.json)
   pov NAME     set the POV character ({{char}}) for this scene (saved to scenes.json)
