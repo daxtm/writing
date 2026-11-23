@@ -115,6 +115,9 @@ class MainWindow(QMainWindow):
         self._batch = None            # {"scene","parent","saved","streamed"}
         self._preview_text = ""
         self._op_scene = None
+        self._op_kind = "generate"
+        self._op_rows = None
+        self._view_override = None    # (label, text) shown until cleared
         try:
             self._session = dop.session_info(self._root)
         except dop.OpError as e:
@@ -247,7 +250,48 @@ class MainWindow(QMainWindow):
                                    "head; other candidates stay saved branches")
         self.accept_btn.clicked.connect(self.accept_candidate)
         tbtns.addWidget(self.accept_btn)
+        self.view_btn = QPushButton("View")
+        self.view_btn.setToolTip("Show the selected saved candidate's full "
+                                 "text; nothing is accepted")
+        self.view_btn.clicked.connect(self.view_candidate)
+        tbtns.addWidget(self.view_btn)
+        self.reroll_btn = QPushButton("Reroll selected")
+        self.reroll_btn.setToolTip("Regenerate the selected slots as siblings "
+                                   "of the batch's captured head; originals "
+                                   "stay saved as branches")
+        self.reroll_btn.clicked.connect(self.reroll_selected)
+        tbtns.addWidget(self.reroll_btn)
+        self.reroll_all_btn = QPushButton("Reroll all")
+        self.reroll_all_btn.clicked.connect(self.reroll_all)
+        tbtns.addWidget(self.reroll_all_btn)
+        tbtns.addWidget(QLabel("Add"))
+        self.add_spin = QSpinBox()
+        self.add_spin.setRange(1, 99)
+        self.add_spin.setValue(1)
+        tbtns.addWidget(self.add_spin)
+        self.add_btn = QPushButton("Add N")
+        self.add_btn.setToolTip("Append N more candidates to this batch; they "
+                                "share the batch's captured head")
+        self.add_btn.clicked.connect(self.add_candidates)
+        tbtns.addWidget(self.add_btn)
+        self.delete_btn = QPushButton("Delete leaf")
+        self.delete_btn.setToolTip("Delete the selected candidate only if it "
+                                   "is a leaf; never deletes saved prose with "
+                                   "children")
+        self.delete_btn.clicked.connect(self.delete_candidate)
+        tbtns.addWidget(self.delete_btn)
         tbtns.addStretch(1)
+        self.keep_btn = QPushButton("Keep branches (close tray)")
+        self.keep_btn.setToolTip("Close the tray; every saved candidate stays "
+                                 "in the branch tree and the head is unchanged")
+        self.keep_btn.clicked.connect(lambda: self.close_tray("Keep branches"))
+        tbtns.addWidget(self.keep_btn)
+        self.discard_btn = QPushButton("Discard preview (close tray)")
+        self.discard_btn.setToolTip(
+            "Non-destructive, like Keep branches: it only closes the tray — "
+            "deleting prose requires the separately labelled Delete leaf")
+        self.discard_btn.clicked.connect(lambda: self.close_tray("Discard preview"))
+        tbtns.addWidget(self.discard_btn)
         l.addLayout(tbtns)
         return box
 
@@ -446,6 +490,7 @@ class MainWindow(QMainWindow):
             self._bind_steering(scene_id)
         self._sel_data = data
         self._missing_node = None
+        self._view_override = None   # selection navigation clears view-only text
         self._update_panes()
 
     def _leave_scene(self):
@@ -555,15 +600,21 @@ class MainWindow(QMainWindow):
             + (("; unavailable: " + "; ".join(missing)) if missing else ""))
         self.stop_btn.setEnabled(self._busy)
         has_batch = bool(self._batch and self._batch.get("saved"))
-        self.accept_btn.setEnabled(has_batch and not self._busy)
+        for b in (self.accept_btn, self.view_btn, self.reroll_btn,
+                  self.reroll_all_btn, self.add_btn, self.delete_btn,
+                  self.keep_btn, self.discard_btn):
+            b.setEnabled(has_batch and not self._busy)
 
     # -------------------------------------------------------------- worker
 
-    def _dispatch(self, fn):
+    def _dispatch(self, fn, kind="generate", rows=None):
         """Start one operation on the worker thread; refuses when busy."""
         if self._busy:
             return False
         self._op_id += 1
+        self._op_kind = kind
+        self._op_rows = rows
+        self._view_override = None
         op_id = self._op_id
         self._token = CancellationToken()
         thread = OpThread(op_id, lambda sink: fn(sink, self._token), parent=self)
@@ -613,13 +664,15 @@ class MainWindow(QMainWindow):
         self._thread = None
         if outcome == "ok":
             self._on_op_ok(value)
-        self._update_steering_ui()
-        if outcome == "cancelled":
+            self._update_steering_ui()
+        elif outcome == "cancelled":
+            self._update_steering_ui()
             self._preview_text = ""
             self.preview.setPlainText("")
             self._status("Stopped; nothing was saved. Head and saved "
                          "branches are unchanged.")
         else:
+            self._update_steering_ui()
             self._status(str(value), error=True)
             if getattr(value, "stale", False):
                 self._status(str(value) + " — Reload (Refresh) or retry.",
@@ -627,18 +680,33 @@ class MainWindow(QMainWindow):
 
     def _on_op_ok(self, value):
         if isinstance(value, dop.GenerateResult):
-            self._batch = {"scene": self._op_scene, "parent": value.parent,
-                           "saved": list(value.saved),
-                           "streamed": value.streamed}
-            self.tray.clear()
-            for k, nid in enumerate(value.saved, 1):
-                self.tray.addItem(QListWidgetItem(f"[{k}] {nid}"))
+            note = None
+            if self._op_kind in ("reroll", "add") and self._batch:
+                note = self._merge_batch(value)
+            else:
+                self._batch = {"scene": self._op_scene, "parent": value.parent,
+                               "saved": list(value.saved),
+                               "streamed": value.streamed}
+            self._rebuild_tray()
             if value.over:
                 self._status("Generation refused: the prompt is over the "
                              "context ceiling (trim bible/state/lore or lower "
                              "budgets in project.json). No provider call ran.",
                              error=True)
+            elif self._op_kind == "reroll":
+                self.refresh(force=True)
+                msg = (f"Rerolled {len(value.saved)} slot(s); originals stay "
+                       "saved as branches and the head is unchanged.")
+                if note:
+                    msg = f"warning: {note}"
+                self._status(msg)
+            elif self._op_kind == "add":
+                self.refresh(force=True)
+                self._status(
+                    f"Added {len(value.saved)} candidate(s) to the batch; "
+                    "head is unchanged.")
             elif value.saved:
+                self.refresh(force=True)
                 self._status(
                     f"{len(value.saved)} candidate(s) saved as branches for "
                     f"{self._op_scene}; head is unchanged. Select one and "
@@ -657,6 +725,126 @@ class MainWindow(QMainWindow):
                 msg += (" — the model signalled scene end; Mark done is "
                         "available in the Scene tab")
             self._status(msg)
+        elif isinstance(value, dict) and "deleted" in value:
+            nid = value["deleted"]
+            if self._batch and nid in self._batch["saved"]:
+                self._batch["saved"].remove(nid)
+                if not self._batch["saved"]:
+                    self._batch = None
+            self._rebuild_tray()
+            self.refresh(force=True)
+            self._status(f"deleted {nid}" +
+                         (f"; head moved to {value['head']}" if value.get("head") is not None else ""))
+
+    def _merge_batch(self, value):
+        """Reroll replaces only returned slots; add appends returned slots."""
+        new = list(value.saved)
+        if self._op_kind == "add":
+            self._batch["saved"].extend(new)
+            return None
+        rows = self._op_rows or []
+        for i, nid in zip(rows, new):
+            self._batch["saved"][i] = nid
+        if len(new) < len(rows):
+            return (f"only {len(new)} of {len(rows)} rerolls came back; "
+                    "the rest keep their old text")
+        return None
+
+    def _rebuild_tray(self):
+        self.tray.clear()
+        batch = self._batch or {}
+        for k, nid in enumerate(batch.get("saved", []), 1):
+            self.tray.addItem(QListWidgetItem(f"[{k}] {nid}"))
+
+    def _tray_selected(self):
+        row = self.tray.currentRow()
+        batch = self._batch or {}
+        saved = batch.get("saved", [])
+        if 0 <= row < len(saved):
+            return row
+        return None
+
+    def view_candidate(self):
+        """Show the selected candidate's full text; never accepts."""
+        row = self._tray_selected()
+        if row is None:
+            self._status("Select a candidate in the tray to view it.")
+            return
+        nid = self._batch["saved"][row]
+        view = self.snap.trees.get(self._batch["scene"]) if self.snap else None
+        info = view.nodes.get(nid) if view else None
+        if info is None:
+            self.refresh(force=True)
+            view = self.snap.trees.get(self._batch["scene"]) if self.snap else None
+            info = view.nodes.get(nid) if view else None
+        if info is None:
+            self._status(f"candidate {nid} is not in the saved tree yet; "
+                         "press Refresh and try again", error=True)
+            return
+        self._view_override = (f"candidate {nid} (view only — not accepted)",
+                               info.text)
+        self._update_panes()
+        self._status(f"Viewing candidate {nid} (not accepted; head unchanged)")
+
+    def _generate_slots(self, count, rows=None, kind="reroll"):
+        """Reroll/add: siblings of the batch's captured parent, not the
+        currently viewed node."""
+        if self._busy or not self._batch:
+            return
+        self._op_scene = self._batch["scene"]
+
+        def fn(sink, token):
+            return dop.generate_candidates(
+                self._root, self._batch["scene"], count=count,
+                parent=self._batch["parent"],
+                provider_factory=self._provider_factory, token=token,
+                events=sink)
+
+        self._dispatch(fn, kind=kind, rows=rows)
+
+    def reroll_selected(self):
+        rows = [self._tray_selected()] if self._tray_selected() is not None else []
+        if not rows:
+            self._status("Select a candidate in the tray to reroll it.")
+            return
+        self._generate_slots(len(rows), rows=rows, kind="reroll")
+
+    def reroll_all(self):
+        if not self._batch:
+            return
+        rows = list(range(len(self._batch["saved"])))
+        self._generate_slots(len(rows), rows=rows, kind="reroll")
+
+    def add_candidates(self):
+        self._generate_slots(self.add_spin.value(), kind="add")
+
+    def delete_candidate(self):
+        """Separately labelled Delete leaf: eligible leaves only."""
+        if self._busy:
+            return
+        row = self._tray_selected()
+        if row is None:
+            self._status("Select a candidate in the tray to delete it.")
+            return
+        nid = self._batch["saved"][row]
+        self._op_scene = self._batch["scene"]
+
+        def fn(sink, token):
+            return dop.delete_leaf(self._root, self._batch["scene"], nid,
+                                   token=token, events=sink)
+
+        self._dispatch(fn, kind="delete")
+
+    def close_tray(self, label):
+        """Keep branches / Discard preview: non-destructive tray close."""
+        self._batch = None
+        self._rebuild_tray()
+        self._preview_text = ""
+        self.preview.setPlainText("")
+        self._view_override = None
+        self._update_panes()
+        self._status(f"{label}: tray closed; saved candidates remain in the "
+                     "branch tree and the head is unchanged")
 
     # ------------------------------------------------------- draft actions
 
@@ -717,6 +905,8 @@ class MainWindow(QMainWindow):
         kind, tree_id, node_id = self._sel_data or (None, None, None)
         if self.snap is None:
             return ""
+        if self._view_override is not None:
+            return self._view_override[1]
         if self._missing_node is not None:
             return (f"[node {self._missing_node} is no longer present in the "
                     "saved project. Select another item.]")

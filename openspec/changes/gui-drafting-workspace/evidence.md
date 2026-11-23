@@ -80,3 +80,23 @@ AttributeError: 'NoneType' object has no attribute 'set'
   closes; `case_draft_stale_refusal` proves stale refusal with recovery
   guidance, dirty local text retained and no partial commit.
 - Full suite: 234 passed.
+
+## 1.4 — candidate tray controls
+
+- Ops parity first (`tests/test_draft_parity.py`, +2 tests, baselines held
+  pre-change): CLI `r 1` keeps the original node as a branch, adds the reroll
+  as a sibling of the batch's captured parent and matches the shared
+  operation's prompt/meta byte-for-byte; `d K` deletion and
+  `draft_operations.delete_leaf` produce identical trees, nonleaf deletion is
+  refused and a deleted head leaf moves head to its parent.
+- Offscreen `case_draft_candidate_tray` written first; red run:
+```
+AttributeError: 'MainWindow' object has no attribute 'view_btn'
+```
+- After implementing View/Reroll selected/Reroll all/Add N/Delete leaf/Keep
+  branches/Discard preview (plus slot-merge and shortfall reporting): the case
+  passes — View shows saved text without accepting, reroll replaces only
+  returned slots (unmatched slots keep originals, "1 of 2" shortfall shown),
+  Add extends the batch parent, Delete leaf removes only the leaf, both tray
+  closes are non-destructive and the saved nodes/head survive reopen.
+- Full suite: 236 passed.

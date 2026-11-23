@@ -305,6 +305,23 @@ def accept_candidate(root, scene_id, nid, *, token=None, events=None):
             "status": sc["status"], "status_changed": status_changed}
 
 
+def delete_leaf(root, scene_id, nid, *, token=None, events=None):
+    """Delete an eligible leaf (a deleted head leaf moves head to its parent);
+    a node with children is refused without tree changes."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    tree = _tree(p, scene_id)
+    if nid not in tree.d["nodes"]:
+        raise OpError(f"no such node: {nid}")
+    baseline = _capture(p, baseline_keys(p, [scene_id]))
+    if token:
+        token.check()
+    if not tree.delete(nid):
+        raise OpError(f"node {nid} has children; not deleted", soft=True)
+    _save_tree(tree, p, scene_id, baseline)
+    _emit(events, "deleted", nid=nid)
+    return {"deleted": nid, "head": tree.head}
+
+
 # ------------------------------------------------------ session/inspection
 
 def session_info(root, scene_id=None):

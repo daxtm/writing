@@ -609,18 +609,25 @@ PRESET = {
 class FakeProvider:
     """Provider seam for widget cases: same complete/many surface as Api."""
 
-    def __init__(self, chunks=("First chunk. ", "Second chunk.")):
+    def __init__(self, chunks=("First chunk. ", "Second chunk."), responses=None):
         self.chunks = list(chunks)
+        self.responses = list(responses) if responses is not None else None
         self.calls = []
         self.started = 0
         self.gate = None          # threading.Event: block between chunks when set
         self.fail_after = None    # raise after this many chunks were delivered
+        self.fail_on = set()      # call indexes (0-based) that raise
 
     def complete(self, role, prompt, params, extra=None, stream_cb=None,
                  meta=None, token=None, **kw):
         self.calls.append({"role": role, "prompt": prompt, "params": params,
                            "extra": extra, "meta": meta})
         self.started += 1
+        if self.responses is not None:
+            i = len(self.calls) - 1
+            if i in self.fail_on:
+                raise RuntimeError(f"fake provider failed call {i}")
+            return self.responses[i], "stop", {}
         out = []
         for i, ch in enumerate(self.chunks):
             if self.gate is not None and i > 0 and not self.gate.wait(10):
@@ -868,12 +875,99 @@ def case_draft_stale_refusal(root):
     assert not win.isVisible()
 
 
+def case_draft_candidate_tray(root):
+    """Tray controls: View, Reroll selected/all (fewer results keep slots),
+    Add N, Delete leaf, Keep branches/Discard preview — all non-destructive."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(root)
+    fake = FakeProvider(responses=["CAND A.", "CAND B.", "CAND R.",
+                                   "CAND R2.", "CAND SPARE.", "CAND ADD.",
+                                   "CAND LAST."])
+    win = gw.MainWindow(str(project), choice=_no_dialogs("tray"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.count_spin.setValue(2)
+    win.generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._batch["saved"] == ["n2", "n3"]
+    assert win._batch["parent"] == "n1"
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["head"] == "n1"
+
+    # View shows the saved text without accepting anything
+    win.tray.setCurrentRow(0)
+    win.view_btn.click()
+    assert "CAND A." in win.reading.toPlainText(), "completed response is viewable"
+    assert json.loads((project / "trees" / "s001.json").read_text())["head"] == "n1"
+
+    # Reroll selected: slot replaced, original kept as a branch
+    win.reroll_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._batch["saved"] == ["n4", "n3"]
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["nodes"]["n2"]["text"] == "CAND A.", "original reroll target kept"
+    assert t["nodes"]["n4"]["parent"] == "n1" == t["nodes"]["n3"]["parent"]
+    assert t["head"] == "n1"
+
+    # Reroll all with one failure: unmatched slot keeps its original text
+    fake.fail_on = {len(fake.calls) - 1 + 1}   # the second reroll-all call fails
+    win.reroll_all_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._batch["saved"][0] == "n5"
+    assert win._batch["saved"][1] == "n3", "unmatched slot keeps its original"
+    assert "1 of 2" in win.status.text(), "the author sees the shortfall"
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["nodes"]["n3"]["text"] == "CAND B."
+
+    # Add N extends the tray; all share the batch parent
+    win.add_spin.setValue(1)
+    win.add_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._batch["saved"] == ["n5", "n3", "n6"]
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["nodes"]["n6"]["parent"] == "n1"
+
+    # Delete leaf removes only the leaf; tray shrinks
+    win.tray.setCurrentRow(2)
+    win.delete_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert "n6" not in t["nodes"] and "n5" in t["nodes"]
+
+    # Keep branches closes the tray without deleting saved nodes or moving head
+    win.keep_btn.click()
+    assert win._batch is None and win.tray.count() == 0
+    assert "branches" in win.status.text().lower()
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["head"] == "n1" and {"n2", "n3", "n4", "n5"} <= set(t["nodes"])
+    win.close()
+
+    # Discard preview is the same non-destructive close (explicitly labelled)
+    win2 = gw.MainWindow(str(project), choice=_no_dialogs("discard"),
+                         provider_factory=lambda _p: fake)
+    win2.show()
+    win2.select_item("manuscript", "s001", None)
+    win2.count_spin.setValue(1)
+    win2.generate_btn.click()
+    assert _pump(a, lambda: not win2._busy)
+    head_before = win2._batch["parent"]
+    win2.discard_btn.click()
+    assert win2._batch is None
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["head"] == head_before, "discard never moves the head"
+    assert t["nodes"]["n7"]["text"] == "CAND LAST.", "saved node survives"
+    win2.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
     "case_draft_midstream_failure": case_draft_midstream_failure,
     "case_draft_stop_and_close": case_draft_stop_and_close,
     "case_draft_stale_refusal": case_draft_stale_refusal,
+    "case_draft_candidate_tray": case_draft_candidate_tray,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,

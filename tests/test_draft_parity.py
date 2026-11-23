@@ -110,10 +110,10 @@ def run_cli(root, script, monkeypatch, capsys, scene=None, responses=None):
     return capsys.readouterr().out
 
 
-def run_ops(root, responses, count=1, events=None):
+def run_ops(root, responses, count=1, events=None, parent=None):
     FakeProvider.instances = []
     FakeProvider.script = list(responses or [])
-    return dop.generate_candidates(root, "s001", count=count, steer="",
+    return dop.generate_candidates(root, "s001", count=count, steer="", parent=parent,
                                    provider_factory=lambda p: FakeProvider(p),
                                    events=events)
 
@@ -251,6 +251,71 @@ def test_generation_failure_is_soft(tmp_path, monkeypatch, capsys):
         run_ops(root, [HttpErr(500, "boom")])
     assert e.value.soft and not e.value.stale
     assert _norm_tree(root) == tree
+
+
+def test_reroll_keeps_originals_and_matches_shared_operation(tmp_path, monkeypatch, capsys):
+    """`r 1` replaces the slot, keeps the original as a branch and matches ops."""
+    root = build(tmp_path / "p")
+    out = run_cli(root, ["g\n", "r 1\n", "\n", "q\n"], monkeypatch, capsys,
+                  responses=[BATCH_A, BATCH_B, REBUT])
+    tree = _norm_tree(root)
+    assert tree["head"] == "n1", "reroll never moves the head"
+    assert "BATCH A text." in tree["nodes"]["n2"]["text"], "original kept as branch"
+    assert tree["nodes"]["n4"]["text"] == REBUT, "new sibling of the batch parent"
+    assert "[1] n2 rerolled -> n4 (old text kept as a branch)" in out
+    # all candidates (old and new) share the batch's captured parent
+    assert tree["nodes"]["n4"]["parent"] == "n1" == tree["nodes"]["n2"]["parent"]
+
+    root2 = build(tmp_path / "p2")
+    res = run_ops(root2, [BATCH_A, BATCH_B], count=2)
+    first = [dict(c) for c in FakeProvider.instances[0].calls]
+    run_ops(root2, [REBUT], count=1, parent=res.parent)
+    ops_calls = first + [dict(c) for c in FakeProvider.instances[0].calls]
+
+    root3 = build(tmp_path / "p3")
+    run_cli(root3, ["g\n", "r 1\n", "\n", "q\n"], monkeypatch, capsys,
+            responses=[BATCH_A, BATCH_B, REBUT])
+    assert FakeProvider.instances[0].calls == ops_calls, \
+        "reroll prompt/meta matches the batch parent capture"
+    assert _norm_tree(root2) == _norm_tree(root3) == tree
+
+
+def test_delete_leaf_rules(tmp_path, monkeypatch, capsys):
+    """Leaf deletion works (a head leaf moves head to parent); nonleaf refused."""
+    root2 = build(tmp_path / "p2")
+    run_cli(root2, ["g\n", "d 2\n", "\n", "q\n"], monkeypatch, capsys,
+            responses=[BATCH_A, BATCH_B])
+    tree = _norm_tree(root2)
+    assert "n3" not in tree["nodes"], "deleted leaf removed"
+    assert "n2" in tree["nodes"], "kept candidate untouched"
+    assert tree["head"] == "n1"
+
+    # op parity: same deletion on a fresh project
+    root3 = build(tmp_path / "p3")
+    res = run_ops(root3, [BATCH_A, BATCH_B], count=2)
+    dop.delete_leaf(root3, "s001", res.saved[1])
+    assert _norm_tree(root3) == tree
+
+    # nonleaf refusal: delete a node with children
+    root4 = build(tmp_path / "p4")
+    t = json.loads((root4 / "trees" / "s001.json").read_text(encoding="utf-8"))
+    t["nodes"]["n2"] = {"id": "n2", "parent": "n1", "text": "parent passage",
+                        "created": "x", "history": [], "sep": "\n\n"}
+    t["nodes"]["n3"] = {"id": "n3", "parent": "n2", "text": "child",
+                        "created": "x", "history": [], "sep": "\n\n"}
+    t["head"] = "n3"
+    t["counter"] = 3
+    (root4 / "trees" / "s001.json").write_text(json.dumps(t), encoding="utf-8")
+    with pytest.raises(dop.OpError) as e:
+        dop.delete_leaf(root4, "s001", "n2")
+    assert "has children" in str(e.value)
+    after = json.loads((root4 / "trees" / "s001.json").read_text(encoding="utf-8"))
+    assert set(after["nodes"]) == {"n1", "n2", "n3"}
+
+    # a deleted head leaf moves the head to its parent
+    dop.delete_leaf(root4, "s001", "n3")
+    after = json.loads((root4 / "trees" / "s001.json").read_text(encoding="utf-8"))
+    assert after["head"] == "n2"
 
 
 def test_accept_matches_shared_operation(tmp_path, monkeypatch, capsys):
