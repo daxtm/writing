@@ -15,12 +15,21 @@ use even for CLI-only users, as accepted in ADR-0006; GUI imports stay lazy, so 
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
 GUI demo: `QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR` opens one native Wayland window
-(reading all saved branches/notes, per-scene steering Save/Clear; no generation yet). `gui` refuses any
-explicit platform except `wayland`, never falls back to XWayland, and prints recovery guidance when
-Wayland is unavailable. Model/CLI tests run headless; Qt widget tests run offscreen in a subprocess
-(`tests/qt_widget_cases.py`, never skipped); real Wayland acceptance is a separate desktop step and was
-recorded for `gui-wayland-shell` (KWin 6.8.3, PySide6 6.12.0, DPR 1.0; interactive scaling/theme checks
-still pending with the owner).
+(the complete draft loop: reading all saved branches/notes, per-scene steering Save/Clear, Generate with
+count/swipes and streaming preview, candidate tray Accept/Reroll selected/all/Add N/View/Delete leaf/
+Keep branches/Discard, built-in New passage/Edit head editors with diff/history, Rewind/Use as head/
+Delete leaf/marked manuscript/Tail N, Scene tab card/POV/cast/session length/Mark done/Next unfinished,
+Context tab budget/samplers/injected-lore/exact prompt/Save last_prompt.txt, Lore tab toggles/classify/
+aliases/import). Generation runs through `longform_core.draft_operations` (Qt-independent, ADR-0007) on
+one background worker (`longform_core.draft_worker`); the CLI `draft` loop is an adapter over the same
+operations with frozen prompts/transcripts (`tests/test_draft_parity.py`). Stop is cooperative at
+request/chunk/save boundaries, close offers Stop-and-wait/Keep open, stale sources refuse writes.
+`gui` refuses any explicit platform except `wayland`, never falls back to XWayland, and prints recovery
+guidance when Wayland is unavailable. Model/CLI tests run headless; Qt widget tests run offscreen in a
+subprocess (`tests/qt_widget_cases.py`, never skipped; 23 cases). Real Wayland acceptance for the
+drafting loop (generation/Stop/close, picker, keyboard, scaling/theme) is recorded as PENDING in
+`openspec/changes/gui-drafting-workspace/evidence.md` and remains a separate owner desktop step; the
+shell's pre-drafting smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0) predates generation.
 
 ## Planned desktop workspace
 `docs/ROADMAP.md` requires every CLI/TUI feature in the GUI, start to finish;
@@ -30,9 +39,14 @@ no individual change completes the workspace. Three changes remain in order:
 is implemented on `feat/gui-wayland-shell`: the `gui` command opens the Qt
 Widgets reading/steering shell over `longform_core.reader_model` snapshots with
 per-scene steering via `longform_core.scene_steering`; the implemented shell is
-unshipped. `openspec/changes/gui-drafting-workspace/` is now proposed for the
-entire draft loop, consolidating the former `gui-steered-drafting` and
-`gui-draft-controls`. Do not create the setup/planning or review changes yet.
+unshipped. `openspec/changes/gui-drafting-workspace/` is now implemented on
+`feat/gui-wayland-shell`: the complete draft loop through shared operations
+(`longform_core.draft_operations`), one worker (`longform_core.draft_worker`),
+cooperative Stop, stale-write refusal, and CLI adapters with byte-identical
+transcripts; real Wayland acceptance for drafting remains pending
+(`evidence.md`). Planning (`gui-project-planning`) and
+continuity/review/export (`gui-continuity-review-export`) remain future
+changes — do not create or implement them yet.
 Full completion requires setup through export, all draft actions, offline
 CLI/GUI parity and separate real Wayland acceptance; this plan does not authorize shipping.
 ADR-0004/0005 (integrated from the reader baseline; 0005 superseded by ADR-0006)

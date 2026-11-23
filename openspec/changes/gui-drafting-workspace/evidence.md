@@ -147,7 +147,7 @@ AttributeError: 'MainWindow' object has no attribute 'view_btn'  (editor/branch 
   node warnings. A settlement-slot bug found by the case (KeyError on missing
   "scene" key wedging buttons) is fixed in the ops results and the done
   handler is now exception-guarded.
-- Full suite: 240 passed.
+- Full suite: 244 passed.
 
 ## 1.7 — lore listing, classification and import
 
@@ -172,3 +172,43 @@ AttributeError: module 'longform_core.gui_window' has no attribute 'LORE'
   the registry and destination untouched, and a cancelled picker writes
   nothing. Toggled-on lore reaches the inspected prompt without any call.
 - Full suite: 244 passed.
+
+## 1.8 — full offline check integration and counts
+
+- `./scripts/check.sh` runs the whole suite through its existing pytest
+  discovery (no second runner added): syntax, CLI `--help` smoke, then
+  `uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q
+  tests`. Final run: exit 0, **244 passed**, no network access, no skipped Qt
+  coverage, no weakened guards (conftest strips credentials and fails closed
+  on sockets; the widget subprocess inherits the same fail-closed sitecustomize).
+- Coverage added by this change: 13 CLI/operation parity tests
+  (tests/test_draft_parity.py), 4 lore registry/prompt/import tests
+  (tests/test_lore_ops.py), 8 deterministic cancellation/stale barrier tests
+  (tests/test_cancel_and_stale.py), and 23 offscreen Qt widget cases in
+  tests/qt_widget_cases.py launched headless-offscreen by the existing
+  tests/test_qt_cases.py subprocess wrapper (9 pre-existing reading/steering
+  cases + 14 new draft-loop cases). Draft help (DRAFT_HELP in the reading
+  pane) and Leave draft/re-enter with dirty-editor resolution landed in this
+  task as the remaining 1.5 items.
+- Per-task red-to-green evidence: sections 1.1–1.7 above; each red run is the
+  recorded failure before that task's implementation, with no skip/xfail used
+  anywhere.
+
+## Real Wayland acceptance — PENDING (not run)
+
+No compositor session is available in this implementation environment, so
+**no** native Wayland acceptance was performed for the drafting workspace.
+The shell's earlier real-Wayland smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0,
+persisted steering, clean close) predates generation and does NOT cover it.
+The following remain a required separate owner desktop step, per the change
+design ("offscreen success does not establish compositor support"):
+
+- generation/progressive output/Stop/close-during-work on real Wayland,
+- file-picker import dialog, keyboard/clipboard in the editors,
+- 100%/200% scaling, fractional/mixed-monitor behavior, light/dark themes.
+
+Offscreen cases in this change do not claim or substitute for any of these.
+`gui` still refuses any explicit platform except `wayland` and never falls
+back to XWayland; that policy is unchanged and untested against a real
+compositor here.
+

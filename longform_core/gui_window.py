@@ -120,6 +120,7 @@ class MainWindow(QMainWindow):
         self._op_kind = "generate"
         self._op_rows = None
         self._view_override = None    # (label, text) shown until cleared
+        self._draft_left = False
         self._scene_edit_dirty = {}   # scene -> user edited pov/cast fields
         self._editor_target = None
         try:
@@ -237,6 +238,38 @@ class MainWindow(QMainWindow):
 
         self.status = QLabel("")
         self.statusBar().addWidget(self.status, 1)
+
+    def show_help(self):
+        """Draft action help in the reading pane (CLI ?); no terminal."""
+        from .commands import DRAFT_HELP
+        self._view_override = ("draft help", DRAFT_HELP)
+        self._update_panes()
+
+    def leave_draft(self):
+        """Leave/re-enter the draft session; saved prose stays readable and
+        unsaved editors are resolved explicitly."""
+        if self._draft_left:
+            self._draft_left = False
+            self._update_steering_ui()
+            self._status("Draft session active again.")
+            return
+        if self._scene_sel is not None and self.dirty():
+            pick = self._choice(
+                "Unsaved steering",
+                f"Steering for {self._scene_sel} has unsaved changes. Save "
+                "before leaving the draft loop?",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self._persist(self.steer_editor.toPlainText()):
+                    return
+            elif pick != "Discard":
+                return
+        self._draft_left = True
+        self._view_override = None
+        self._update_panes()
+        self._update_steering_ui()
+        self._status("Left the draft loop; saved prose, branches and notes "
+                     "stay readable. Leave draft again to re-enter.")
 
     def _build_scene_tab(self):
         """Scene controls: card, POV/cast, session length, status/warnings,
@@ -425,6 +458,26 @@ class MainWindow(QMainWindow):
         ebtns.addWidget(self.editor_cancel_btn)
         ebtns.addStretch(1)
         l.addLayout(ebtns)
+        hbtns = QHBoxLayout()
+        self.help_btn = QPushButton("Draft help")
+        self.help_btn.setToolTip("Show the draft and candidate actions in the "
+                                 "reading pane (CLI ? help)")
+        self.help_btn.clicked.connect(self.show_help)
+        hbtns.addWidget(self.help_btn)
+        self.leave_btn = QPushButton("Leave draft")
+        self.leave_btn.setToolTip(
+            "Leave the active draft session without closing the reader; "
+            "unsaved editors are resolved explicitly")
+        self.leave_btn.clicked.connect(self.leave_draft)
+        hbtns.addWidget(self.leave_btn)
+        hbtns.addStretch(1)
+        l.addLayout(hbtns)
+        self.help_label = QLabel(
+            "Tray actions: Accept selected / View / Reroll selected / Reroll "
+            "all / Add N / Delete leaf / Keep branches or Discard preview — "
+            "nothing is accepted or deleted implicitly.")
+        self.help_label.setWordWrap(True)
+        l.addWidget(self.help_label)
         self.editor_label = QLabel("Editor (no external editor is started)")
         l.addWidget(self.editor_label)
         self.editor = QPlainTextEdit()
@@ -1096,12 +1149,15 @@ class MainWindow(QMainWindow):
                 "select one in the sidebar.")
         else:
             self.generate_note.setText("")
-        can_generate = bool(scene_ok and not missing and not self._busy)
+        can_generate = bool(scene_ok and not missing and not self._busy
+                            and not self._draft_left)
         self.generate_btn.setEnabled(can_generate)
         self.generate_btn.setToolTip(
             "Generate saves your current steering first, then asks the "
             "provider for candidate passages as siblings of the active head"
-            + (("; unavailable: " + "; ".join(missing)) if missing else ""))
+            + (("; unavailable: " + "; ".join(missing)) if missing else "")
+            + ("; you left the draft loop (Leave draft again to re-enter)"
+               if self._draft_left else ""))
         self.stop_btn.setEnabled(self._busy)
         has_batch = bool(self._batch and self._batch.get("saved"))
         for b in (self.accept_btn, self.view_btn, self.reroll_btn,

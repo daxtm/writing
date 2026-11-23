@@ -5,14 +5,12 @@ import re
 import shutil
 from pathlib import Path
 
-import httpx
-
 from . import draft_operations as dop
-from .api import Api, HttpErr, NoAnswerErr
+from .api import Api, HttpErr
 from .checks import check_report
-from .config import (BIBLE_TEMPLATE, CRITIC_SYSTEM, DEFAULT_CONFIG, EDITOR_SYSTEM, PLANNER_SYSTEM, SAMPLING_KEYS, STATE_TEMPLATE, SUMMARIZER_SYSTEM)
+from .config import (BIBLE_TEMPLATE, CRITIC_SYSTEM, DEFAULT_CONFIG, EDITOR_SYSTEM, PLANNER_SYSTEM, STATE_TEMPLATE, SUMMARIZER_SYSTEM)
 from .lore import is_present, Lore, pov_name
-from .prompt import (build_writer_prompt, clean_continuation, format_card, layered_summary, print_report,
+from .prompt import (format_card, layered_summary, print_report,
                      tail_trim_chars)
 from .tree import Tree
 from .utils import (ask, col, die, edit_saved, extract_tagged, keep_lead, line_diff, now, page, parse_sections, read_json, read_text, save_input, slug, stamp, tag_instr, text_hash, warn, word_diff, words, write_json, write_text)

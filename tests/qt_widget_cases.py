@@ -1273,6 +1273,40 @@ def case_draft_lore(root):
     win.close()
 
 
+def case_draft_help_and_leave(root):
+    """Draft help documents the loop without a terminal; Leave draft resolves
+    dirty editors explicitly and keeps saved prose readable."""
+    import longform_core.gui_window as gw
+    from longform_core.commands import DRAFT_HELP
+    a = app()
+    project = _draft_project(root, name="p", scenes=[
+        _scene("s001", pov="Mara", characters=["Mara"])])
+    win = gw.MainWindow(str(project), choice=_no_dialogs("help"))
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.tabs.setCurrentIndex(gw.DRAFT)
+    win.help_btn.click()
+    assert "generate N candidate passages" in win.reading.toPlainText(), \
+        "draft help is shown in the window (DRAFT_HELP content)"
+    assert win.help_label.text(), "candidate actions are described"
+
+    # Leave draft with unsaved steering resolves it explicitly
+    win.steer_editor.setPlainText("unsaved before leaving")
+    win._choice = lambda t, x, o: "Discard"
+    win.leave_btn.click()
+    assert not win.generate_btn.isEnabled(), "drafting controls are left"
+    assert "left the draft loop" in win.status.text().lower()
+    assert (project / "trees" / "s001.json").read_text().count('"steer"') == 0, \
+        "Discard writes nothing"
+    assert "Mara counts the lit windows." in win.reading.toPlainText(), \
+        "the reader stays open with saved prose"
+    win._choice = _no_dialogs("reenter")
+    win.leave_btn.click()
+    assert win.generate_btn.isEnabled(), "re-entering restores drafting"
+    win.steer_editor.setPlainText("")   # leave clean; no dialog on close
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -1283,6 +1317,7 @@ CASES = {
     "case_draft_scene_context": case_draft_scene_context,
     "case_draft_edit_and_branches": case_draft_edit_and_branches,
     "case_draft_lore": case_draft_lore,
+    "case_draft_help_and_leave": case_draft_help_and_leave,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,

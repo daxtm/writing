@@ -45,7 +45,7 @@ worker throughout the sequence.
 ## GUI milestone 1 — Walking skeleton and complete drafting workspace
 
 - [x] gui-wayland-shell — Native Wayland Qt reading shell: safe snapshots, all saved branches/notes, state-preserving refresh and persistent steering Save/Clear; implemented, unshipped, no generation yet.
-- [ ] gui-drafting-workspace — Complete the draft loop: shared operations, one worker, Generate/swipes/reroll/add/progressive display, Accept/keep/discard/delete, Stop/safe close/stale protection, length/POV/cast/card/context/exact prompt, manual edit/history/rewind/jump/tree/tail, lore management/import and scene done.
+- [x] gui-drafting-workspace — Complete the draft loop: shared operations, one worker, Generate/swipes/reroll/add/progressive display, Accept/keep/discard/delete, Stop/safe close/stale protection, length/POV/cast/card/context/exact prompt, manual edit/history/rewind/jump/tree/tail, lore management/import and scene done.
 
 This consolidates the former `gui-steered-drafting` and `gui-draft-controls`;
 neither is a separate future change. The shell is the walking-skeleton baseline,
