@@ -18,7 +18,9 @@ from .api import Api, HttpErr
 from .cancel import Cancelled
 from .config import BIBLE_TEMPLATE, DEFAULT_CONFIG, STATE_TEMPLATE
 from .draft_operations import (_advance, _capture, _emit, _project_of,
-                               _provider, _read_bytes, _stale_check, OpError)
+                               _provider, _read_bytes, _scenes_or_error,
+                               _stale_check, OpError)
+from .reader_model import _no_symlink_below
 from .project import Project
 from .utils import (FatalError, deep_merge, now, read_text, save_input, stamp,
                     write_text)
@@ -162,6 +164,265 @@ def import_preset(root, src, *, token=None, events=None):
     _emit(events, "preset_imported", name="writer_preset.json")
     return {"imported": "writer_preset.json", "bytes": len(data),
             "replaced": False}
+
+
+# ----------------------------------------------------------------- bible
+
+def _dry_lore_names(p, scenes):
+    """Character lorebook names without any registry write (safe read-only
+    discovery matching what Lore.sync would classify)."""
+    names = []
+    d = p.f("lorebooks")
+    if not d.is_dir() or d.is_symlink():
+        return names
+    try:
+        files = sorted(x for x in d.iterdir()
+                       if x.suffix.lower() in (".json", ".png"))
+    except OSError:
+        return names
+    reg = {"books": {}}
+    if p.f("lorebooks.json").is_file() and not p.f("lorebooks.json").is_symlink():
+        try:
+            raw = json.loads(p.f("lorebooks.json").read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and isinstance(raw.get("books"), dict):
+                reg = raw
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            reg = {"books": {}}
+    known = [c for s in scenes for c in (s.get("characters") or [])]
+    from .lore import parse_book_data
+    for path in files:
+        meta = reg["books"].get(path.name)
+        if isinstance(meta, dict):
+            if meta.get("kind") == "character":
+                names.append(meta.get("character") or path.stem)
+            continue
+        try:
+            if path.suffix.lower() == ".png":
+                from .lore import read_card_png
+                data = read_card_png(path)
+                card_name, _entries = parse_book_data(data, path.stem) \
+                    if data is not None else (None, [])
+            else:
+                d2 = json.loads(path.read_text(encoding="utf-8"))
+                card_name, _entries = parse_book_data(d2, path.stem)
+        except Exception:  # noqa: BLE001 — an unreadable book is skipped
+            continue
+        if card_name:
+            names.append(card_name)
+            continue
+        stem = re.sub(r"[^a-z0-9]+", " ", path.stem.lower()).split()
+        for name in known:
+            toks = name.lower().split()
+            if stem and toks and stem[0] == toks[0]:
+                names.append(name)
+                break
+    return names
+
+
+def _split_safe(p):
+    """(pre, secs) of bible.md or the template; an unparsable bible is an
+    error outcome, never a reset."""
+    path = p.f("bible.md")
+    text = read_text(path) or BIBLE_TEMPLATE
+    from .commands import split_bible
+    pre, secs = split_bible(text)
+    return path, text, pre, secs
+
+
+def bible_overview(root):
+    """Read-only section list, current bodies and the writer-token budget."""
+    p = _project_of(root)
+    scenes = _scenes_or_error(p)
+    path, text, pre, secs = _split_safe(p)
+    out = {"has_sections": bool(secs), "sections": [], "error": None,
+           "chars": _dry_lore_names(p, scenes), "bible_path": "bible.md"}
+    if not secs:
+        out["error"] = "bible.md has no '## ' sections to work through"
+        return out
+    from .commands import is_placeholder
+    for heading, body in secs:
+        out["sections"].append({
+            "heading": heading,
+            "body": body,
+            "placeholder": is_placeholder(body),
+            "current": "(empty / template placeholder)" if is_placeholder(body)
+            else body.strip(),
+        })
+    model = p.cfg["roles"]["writer"]["model"]
+    out["tokens"] = p.est(model, text)
+    out["budget"] = int(p.cfg["budget_tokens"]["bible"])
+    out["over_budget"] = out["tokens"] > out["budget"]
+    return out
+
+
+def bible_form_state(root, heading):
+    """The fixed form for one section (saved answers if present) plus the
+    current section text; read-only, no session side effects."""
+    p = _project_of(root)
+    _scenes_or_error(p)
+    path, _text, _pre, secs = _split_safe(p)
+    from .commands import bible_form, is_placeholder
+    if not secs:
+        raise OpError("bible.md has no '## ' sections to work through")
+    if heading not in [h for h, _b in secs]:
+        raise OpError(f"no such bible section: {heading}")
+    body = dict(secs)[heading]
+    akind = f"bible_answers_{_slug(heading)}"
+    saved = p.f("inputs", f"{akind}.md")
+    if saved.is_symlink():
+        raise OpError(f"inputs/{akind}.md is a symlink; refusing to read it "
+                      "as answers")
+    if saved.exists():
+        form = read_text(saved)
+        loaded = True
+    else:
+        form = bible_form(heading, _dry_lore_names(p, _scenes_or_error(p)))
+        loaded = False
+    return {"heading": heading, "form": form, "saved_form": loaded,
+            "current": ("(empty / template placeholder)"
+                        if is_placeholder(body) else body.strip()),
+            "form_path": f"inputs/{akind}.md"}
+
+
+def _slug(heading):
+    from .utils import slug
+    return slug(heading)
+
+
+def begin_bible_session(root, *, token=None, events=None):
+    """Back up the existing bible once, as cmd_bible does when answering
+    starts; viewing alone never copies anything."""
+    p = _project_of(root)
+    path = p.f("bible.md")
+    backup = None
+    if path.exists():
+        if not _no_symlink_below(p.root, "bible_history"):
+            raise OpError("bible_history/ is a symlink; refusing to back up")
+        if path.is_symlink():
+            raise OpError("bible.md is a symlink; refusing to back it up")
+        p.f("bible_history").mkdir(exist_ok=True)
+        base = f"bible_{stamp()}"
+        dest = p.f("bible_history", base + ".md")
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = p.f("bible_history", f"{base}_{n}.md")
+        import shutil
+        try:
+            shutil.copy2(path, dest)
+        except OSError as e:
+            raise OpError(f"the bible backup could not be written "
+                          f"({type(e).__name__})") from None
+        backup = f"bible_history/{dest.name}"
+    _emit(events, "bible_session_started", backup=backup)
+    return {"backup": backup}
+
+
+def _bible_write(p, heading, section, baseline, *, token=None):
+    """Shared acceptance boundary: stale/unsafe checks, then a single-section
+    replacement through the captured preamble/order."""
+    if not isinstance(baseline, dict) or "bible.md" not in baseline or \
+            "secs" not in baseline or "pre" not in baseline:
+        raise OpError("no captured bible baseline; reload the bible before "
+                      "saving")
+    if not _no_symlink_below(p.root, "bible.md"):
+        raise OpError("bible.md is a symlink; refusing to write")
+    secs = baseline["secs"]
+    if heading not in [h for h, _b in secs]:
+        raise OpError(f"no such bible section: {heading}")
+    if token:
+        token.check()
+    _stale_check(p, {"bible.md": baseline["bible.md"]})
+    new_secs = [(h, section if h == heading else b) for h, b in secs]
+    from .commands import join_bible
+    write_text(p.f("bible.md"), join_bible(baseline["pre"], new_secs))
+    return new_secs
+
+
+def _capture_bible_baseline(p):
+    path, _text, pre, secs = _split_safe(p)
+    return {"bible.md": _read_bytes(path, "bible.md"), "pre": pre,
+            "secs": [(h, b) for h, b in secs]}
+
+
+def bible_baseline(root):
+    """Opaque bible edit baseline: exact bible.md bytes plus the captured
+    preamble/ordered sections carried through preview to Accept."""
+    p = _project_of(root)
+    return _capture_bible_baseline(p)
+
+
+def save_bible_answers(root, heading, form, *, token=None, events=None):
+    """Persist the exact form and input history, then preview the composed
+    section without changing bible.md."""
+    p = _project_of(root)
+    _scenes_or_error(p)
+    akind = f"bible_answers_{_slug(heading)}"
+    if not _no_symlink_below(p.root, "inputs", f"{akind}.md"):
+        raise OpError(f"inputs/{akind}.md is a symlink; refusing to save")
+    if token:
+        token.check()
+    from .commands import compose_section
+    from .utils import save_input
+    save_input(p.root, akind, form)
+    section = compose_section(heading, form)
+    _emit(events, "bible_answers_saved", heading=heading)
+    return {"heading": heading, "preview": section,
+            "words": _words(section), "form_path": f"inputs/{akind}.md"}
+
+
+def accept_bible_section(root, heading, section, baseline, *, token=None,
+                         events=None):
+    """Explicit acceptance: replace only the chosen section of the captured
+    bible (preamble, order and other sections preserved under existing join
+    normalization). The unaccepted preview never touches bible.md."""
+    p = _project_of(root)
+    new_secs = _bible_write(p, heading, section, baseline, token=token)
+    _emit(events, "bible_section_accepted", heading=heading)
+    return {"heading": heading, "words": _words(section),
+            "backup": "bible_history (captured at session begin)"}
+
+
+def edit_bible_section(root, heading, new_body, baseline, *, token=None,
+                       events=None):
+    """Direct freeform section-text edit through the same backed-up
+    boundary; custom headings and preamble are never relabeled or dropped."""
+    p = _project_of(root)
+    new_secs = _bible_write(p, heading, (new_body or "").strip("\n"),
+                            baseline, token=token)
+    _emit(events, "bible_section_edited", heading=heading)
+    return {"heading": heading, "words": _words(new_body or "")}
+
+
+def _words(text):
+    from .utils import words
+    return words(text or "")
+
+
+def bible_history(root):
+    """Read-only history listing: bible snapshots and saved answer inputs."""
+    p = _project_of(root)
+    out = {"bibles": [], "answers": [], "errors": []}
+    for sub, key, ext in (("bible_history", "bibles", ".md"),
+                          (("inputs", "history"), "answers", ".md")):
+        d = p.f(*((sub,) if isinstance(sub, str) else sub))
+        if not d.is_dir() or d.is_symlink():
+            continue
+        try:
+            names = sorted(x.name for x in d.iterdir()
+                           if x.name.endswith(ext) and x.is_file())
+        except OSError as e:
+            out["errors"].append(f"{key} could not be listed")
+            continue
+        for name in names:
+            if not _no_symlink_below(p.root,
+                                     *((sub,) if isinstance(sub, str) else sub),
+                                     name):
+                out["errors"].append(f"{name} is a symlink and was skipped")
+                continue
+            out[key].append({"name": name,
+                             "text": read_text(d / name)})
+    return out
 
 
 # ------------------------------------------------------------------ open

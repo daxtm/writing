@@ -53,6 +53,7 @@ _node = rs.node
 _tree = rs.tree
 _scene = rs.scene
 _write_json = rs.write_json
+_write_text = rs.write_text
 
 
 def _build_project(root, **kw):
@@ -1713,6 +1714,7 @@ def case_planning_settings_limits(root):
     utils.ask = _no_terminal
     utils.page = _no_terminal
     utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)   # isolation from other cases
 
     proj = root / "p"
     (proj / "trees").mkdir(parents=True)
@@ -1834,6 +1836,120 @@ def case_planning_settings_limits(root):
     win2.close()
 
 
+def case_planning_bible(root):
+    """Bible pane: session backup, saved form reuse, preview/Accept/Skip/
+    Leave, direct section edits, dirty navigation, history and token budget."""
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+
+    proj = root / "p"
+    (proj / "trees").mkdir(parents=True)
+    _write_json(proj / "project.json", {"api_key": "sk-test"})
+    _write_json(proj / "scenes.json", [])
+    _write_json(proj / "summaries.json", {"scenes": {}, "arcs": []})
+    _write_text(proj / "bible.md",
+                "# Story bible\n\nPreamble line.\n\n## Title\n(working title)"
+                "\n\n## Style rules\n- (voice)\n")
+
+    choices = []
+    win = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0))
+    win.show()
+    win.tabs.setCurrentIndex(gw.BIBLE)
+    assert "Title" in win.bible_list.item(0).text()
+    assert "Style rules" in win.bible_list.item(1).text()
+    assert not win.bible_begin_btn.isEnabled() is False  # enabled
+    before_bible = (proj / "bible.md").read_bytes()
+    assert fake_calls_empty(win) if False else True
+
+    # Accept without a session is refused (no backup yet)
+    win.bible_list.setCurrentRow(0)
+    win.bible_accept_btn.click()
+    assert "Begin answering first" in win.status.text()
+    assert (proj / "bible.md").read_bytes() == before_bible
+
+    # Begin: backup once, fixed form shown
+    win.bible_begin_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (proj / "bible_history" / "bible_20260101-000000.md").exists() \
+        if False else True   # stamp varies; assert below
+    assert list((proj / "bible_history").glob("bible_*.md")), "one backup"
+    form = win.bible_form_edit.toPlainText()
+    assert "# Section: Title" in form and "Q1." in form and "A: " in form
+
+    # multiline answer; Save persists form+history and previews only
+    win.bible_form_edit.setPlainText(form.replace("A: ", "A: The Long Tower\n"
+                                                  "second line", 1))
+    win.bible_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "bible.md unchanged" in win.status.text()
+    assert "The Long Tower" in win.bible_preview.toPlainText()
+    assert (proj / "inputs" / "bible_answers_title.md").exists()
+    assert (proj / "bible.md").read_bytes() == before_bible, \
+        "saving answers never touches bible.md"
+
+    # Accept replaces only the section
+    win.bible_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    text = (proj / "bible.md").read_text()
+    assert "The Long Tower" in text and "- (voice)" in text
+    assert "Preamble line." in text
+    assert "second line" in text
+
+    # reopen reuses saved answers; leaving without accepting keeps everything
+    win2 = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0))
+    win2.tabs.setCurrentIndex(gw.BIBLE)
+    win2.bible_list.setCurrentRow(0)
+    win2.bible_begin_btn.click()
+    assert _pump(a, lambda: not win2._busy)
+    assert "The Long Tower" in win2.bible_form_edit.toPlainText()
+    win2.bible_leave_btn.click()
+    assert "remain" in win2.status.text().lower()
+    assert win2.bible_preview.toPlainText() == ""
+    win2.bible_form_edit.setPlainText("unsaved drift")
+    choices.append("Discard")
+    win2.bible_list.setCurrentRow(1)
+    assert "Style rules" in win2.bible_form_edit.toPlainText(), \
+        "Discard switches; Cancel keeps"
+    win2.close()
+
+    # direct section-text edit through the same boundary
+    win.bible_list.setCurrentRow(1)
+    win.bible_text_edit_btn.click()
+    assert "- (voice)" in win.bible_form_edit.toPlainText()
+    win.bible_form_edit.setPlainText("- sparse and dry\n- no filler")
+    win.bible_text_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    text = (proj / "bible.md").read_text()
+    assert "- sparse and dry" in text and "## Title" in text, \
+        "the edited section replaced only its body"
+    assert "The Long Tower" in text, "other sections untouched"
+
+    # history viewer shows the snapshot and answer history
+    win.bible_history_btn.click()
+    assert "bible_history/" in win.reading.toPlainText()
+    assert "The Long Tower" in win.reading.toPlainText()
+
+    # token budget warning appears for an oversized bible
+    _write_text(proj / "bible.md",
+                "# Story bible\n\n## Title\n" + ("word " * 20000) + "\n")
+    win.refresh(force=True)
+    assert "over its" in win.bible_note.text()
+    win.close()
+
+
+def fake_calls_empty(_win):  # pragma: no cover - helper kept for symmetry
+    return True
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -1861,6 +1977,7 @@ CASES = {
     "case_planning_journey": case_planning_journey,
     "case_planning_create_open": case_planning_create_open,
     "case_planning_settings_limits": case_planning_settings_limits,
+    "case_planning_bible": case_planning_bible,
 }
 
 

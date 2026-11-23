@@ -30,6 +30,8 @@ def fixed_stamp(monkeypatch):
     monkeypatch.setattr(commands, "stamp", lambda: "20260101-000000")
     monkeypatch.setattr(plan, "stamp", lambda: "20260101-000000")
     monkeypatch.setattr(plan, "now", lambda: "2026-01-01T00:00:00+00:00")
+    import longform_core.utils as utils
+    monkeypatch.setattr(utils, "stamp", lambda: "20260101-000000")
 
 
 @pytest.fixture
@@ -492,3 +494,295 @@ def test_fetch_limits_view_is_sanitized(tmp_path):
     saved = json.loads((root / "limits.json").read_text())
     assert saved["models"]["meta-llama/Llama-3.3-70B-Instruct"]["raw"] == leaky, \
         "saved limits.json keeps the CLI shape unchanged"
+
+
+# ----------------------------------------------------------------- bible
+
+def bible_project(root):
+    init_p(root)
+    (root / "bible.md").write_text(
+        "# Story bible\n\nPreamble line.\n\n## Title\n(working title)\n\n"
+        "## Style rules\n- (voice)\n", encoding="utf-8")
+    return root
+
+
+def fill_title(form):
+    return form.replace("A: ", "A: The Long Tower", 1)
+
+
+def test_bible_cli_parity_files_and_history(tmp_path, monkeypatch, capsys):
+    import longform_core.commands as commands
+    from longform_core.project import Project
+    a, b = bible_project(tmp_path / "cli"), bible_project(tmp_path / "gui")
+
+    answers = iter(["", "a", "q"])
+    monkeypatch.setattr(commands, "ask", lambda *a2, **k: next(answers))
+    from longform_core.utils import save_input as _real_save_input
+
+    def scripted_edit(p, kind, initial):
+        text = fill_title(initial)
+        _real_save_input(p.root, kind, text)
+        return text
+
+    monkeypatch.setattr(commands, "edit_saved", scripted_edit)
+    commands.cmd_bible(Project(a), None)
+    out = capsys.readouterr().out
+
+    plan.begin_bible_session(b)
+    base = plan.bible_baseline(b)
+    st = plan.bible_form_state(b, "Title")
+    saved = plan.save_bible_answers(b, "Title", fill_title(st["form"]))
+    plan.accept_bible_section(b, "Title", saved["preview"], base)
+
+    for rel in ("bible.md", "inputs/bible_answers_title.md",
+                "inputs/history/bible_answers_title_20260101-000000.md",
+                "bible_history/bible_20260101-000000.md"):
+        assert (a / rel).read_bytes() == (b / rel).read_bytes(), rel
+    assert "The Long Tower" in (b / "bible.md").read_text()
+    assert "Preamble line." in (b / "bible.md").read_text(), \
+        "preamble and section order preserved"
+    assert "## Style rules" in (b / "bible.md").read_text()
+    assert "The Long Tower" in out and "saved Title to" in out
+
+
+def test_bible_cli_transcript_frozen(tmp_path, monkeypatch, capsys):
+    """The pre-extraction CLI transcript is characterization-frozen."""
+    import longform_core.commands as commands
+    from longform_core.project import Project
+    a = bible_project(tmp_path / "cli")
+    answers = iter(["", "a", "q"])
+    monkeypatch.setattr(commands, "ask", lambda *a2, **k: next(answers))
+    from longform_core.utils import save_input as _real_save_input
+
+    def scripted_edit2(p, kind, initial):
+        text = fill_title(initial)
+        _real_save_input(p.root, kind, text)
+        return text
+
+    monkeypatch.setattr(commands, "edit_saved", scripted_edit2)
+    commands.cmd_bible(Project(a), None)
+    out = capsys.readouterr().out
+    assert out == (
+        "2 sections. Answer each section's questions in $EDITOR; your answers "
+        "go into the bible as written.\n"
+        "\n=== [1/2] Title ===\n"
+        "current:\n(empty / template placeholder)\n\n"
+        "\n--- Title (3 words) ---\n"
+        "The Long Tower\n"
+        f"saved Title to {a}/bible.md\n"
+        "\n=== [2/2] Style rules ===\n"
+        "current:\n(empty / template placeholder)\n\n"
+        "\nbible: " + str(a / "bible.md") + "  ~24 tokens (budget 1800)\n")
+
+
+def test_bible_overview_sections_and_budget(tmp_path):
+    root = bible_project(tmp_path / "p")
+    over = plan.bible_overview(root)
+    assert [s["heading"] for s in over["sections"]] == ["Title", "Style rules"]
+    assert over["sections"][0]["placeholder"] is True
+    assert over["budget"] == 1800 and not over["over_budget"]
+
+
+def test_bible_overview_no_sections_reports_not_reset(tmp_path):
+    root = init_p(tmp_path / "p")
+    (root / "bible.md").write_text("just prose, no sections\n",
+                                   encoding="utf-8")
+    over = plan.bible_overview(root)
+    assert not over["has_sections"]
+    assert "no '## ' sections" in over["error"]
+    assert (root / "bible.md").read_text() == "just prose, no sections\n"
+
+
+def test_bible_overview_budget_warning(tmp_path):
+    root = bible_project(tmp_path / "p")
+    (root / "bible.md").write_text(
+        "# Story bible\n\n## Title\n" + ("word " * 20000) + "\n",
+        encoding="utf-8")
+    over = plan.bible_overview(root)
+    assert over["over_budget"] and over["tokens"] > over["budget"]
+
+
+def test_bible_form_state_uses_saved_answers_and_char_names(tmp_path):
+    root = bible_project(tmp_path / "p")
+    (root / "bible.md").write_text(
+        "# Story bible\n\n## Characters\n### NAME\n- Role:\n",
+        encoding="utf-8")
+    lb = root / "lorebooks"
+    lb.mkdir(exist_ok=True)
+    (lb / "mara.json").write_text(json.dumps(
+        {"name": "Mara Voss", "description": "a harbour thief"}),
+        encoding="utf-8")
+    st = plan.bible_form_state(root, "Characters")
+    assert "Character: Mara Voss  (from your lorebooks; keep this exact name)" \
+        in st["form"], "lore-derived character names appear in the form"
+    assert "Character: \n" in st["form"], "blank extra character kept"
+    assert "Other characters not in your lorebooks" in st["form"]
+    assert st["saved_form"] is False
+    (root / "inputs").mkdir()
+    (root / "inputs" / "bible_answers_characters.md").write_text(
+        "SAVED FORM", encoding="utf-8")
+    st = plan.bible_form_state(root, "Characters")
+    assert st["form"] == "SAVED FORM" and st["saved_form"] is True
+
+
+def test_bible_form_state_custom_section_uses_generic_question(tmp_path):
+    root = bible_project(tmp_path / "p")
+    (root / "bible.md").write_text(
+        "# Story bible\n\n## Timeline notes\nexisting text\n",
+        encoding="utf-8")
+    st = plan.bible_form_state(root, "Timeline notes")
+    assert "What should this section say?" in st["form"]
+    assert st["current"] == "existing text"
+
+
+def test_bible_session_backup_once_and_reopen(tmp_path):
+    root = bible_project(tmp_path / "p")
+    plan.begin_bible_session(root)
+    assert (root / "bible_history" / "bible_20260101-000000.md").exists()
+    # a later session backs up again with a distinct name
+    plan.begin_bible_session(root)
+    names = sorted(x.name for x in (root / "bible_history").iterdir())
+    assert names[1] == "bible_20260101-000000_2.md"
+    # a fresh project's template bible is backed up too
+    fresh = init_p(tmp_path / "f")
+    out = plan.begin_bible_session(fresh)
+    assert out["backup"] == "bible_history/bible_20260101-000000.md"
+    assert (fresh / "bible_history" / "bible_20260101-000000.md").exists()
+
+
+def test_bible_save_persists_form_history_and_preview_not_bible(tmp_path):
+    root = bible_project(tmp_path / "p")
+    st = plan.bible_form_state(root, "Style rules")
+    form = st["form"].replace("A: ", "A: sparse and dry\nA2 kept", 1)
+    out = plan.save_bible_answers(root, "Style rules", form)
+    assert out["preview"] and "sparse and dry" in out["preview"]
+    assert (root / "inputs" / "bible_answers_style-rules.md").read_text() \
+        == form
+    assert "sparse and dry" not in (root / "bible.md").read_text(), \
+        "saving answers alone never replaces bible.md"
+    hist = list((root / "inputs" / "history").glob("*.md"))
+    assert len(hist) == 1 and hist[0].read_text() == form
+
+
+def test_bible_accept_replaces_only_the_chosen_section(tmp_path):
+    root = bible_project(tmp_path / "p")
+    base = plan.bible_baseline(root)
+    st = plan.bible_form_state(root, "Title")
+    saved = plan.save_bible_answers(root, "Title", fill_title(st["form"]))
+    plan.accept_bible_section(root, "Title", saved["preview"], base)
+    text = (root / "bible.md").read_text()
+    assert "The Long Tower" in text and "- (voice)" in text, \
+        "other sections keep their content"
+
+
+def test_bible_multiline_answers_and_custom_preamble_preserved(tmp_path):
+    root = bible_project(tmp_path / "p")
+    (root / "bible.md").write_text(
+        "CUSTOM PREAMBLE\n\n## Title\n(working title)\n\n## Avoid\n- (tropes)\n",
+        encoding="utf-8")
+    base = plan.bible_baseline(root)
+    st = plan.bible_form_state(root, "Avoid")
+    form = st["form"].replace("A: ", "A: first line\nsecond line", 1)
+    out = plan.save_bible_answers(root, "Avoid", form)
+    plan.accept_bible_section(root, "Avoid", out["preview"], base)
+    text = (root / "bible.md").read_text()
+    assert text.startswith("CUSTOM PREAMBLE\n"), "custom preamble preserved"
+    assert "second line" in text
+    # multiline answers render as the CLI compose_section does
+    assert "- Tropes:\n  first line\n  second line" in text
+
+
+def test_bible_reopen_saved_answers_then_skip(tmp_path):
+    root = bible_project(tmp_path / "p")
+    st = plan.bible_form_state(root, "Title")
+    saved = plan.save_bible_answers(root, "Title", fill_title(st["form"]))
+    st2 = plan.bible_form_state(root, "Title")
+    assert st2["form"] == fill_title(st["form"]), "saved form is reused"
+    before = (root / "bible.md").read_bytes()
+    base = plan.bible_baseline(root)
+    plan.accept_bible_section(root, "Title", saved["preview"], base)
+    # a later leave/skip without acceptance keeps the accepted state
+    base2 = plan.bible_baseline(root)
+    st3 = plan.bible_form_state(root, "Style rules")
+    plan.save_bible_answers(root, "Style rules", st3["form"])
+    assert (root / "bible.md").read_text() == \
+        (root / "bible.md").read_text(), "no write happened on skip"
+    assert "The Long Tower" in (root / "bible.md").read_text()
+
+
+def test_bible_accept_stale_refusal(tmp_path):
+    root = bible_project(tmp_path / "p")
+    base = plan.bible_baseline(root)
+    (root / "bible.md").write_text("external change, no sections\n",
+                                   encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.accept_bible_section(root, "Title", "new", base)
+    assert getattr(e.value, "stale", False)
+    assert (root / "bible.md").read_text() == "external change, no sections\n"
+
+
+def test_bible_accept_unsafe_destination(tmp_path):
+    real = tmp_path / "real.md"
+    real.write_text("keep", encoding="utf-8")
+    root = bible_project(tmp_path / "p")
+    (root / "bible.md").unlink()
+    (root / "bible.md").symlink_to(real)
+    base = plan.bible_baseline(root)
+    with pytest.raises(OpError) as e:
+        plan.accept_bible_section(root, "Title", "new", base)
+    assert "symlink" in str(e.value)
+    assert real.read_text() == "keep"
+
+
+def test_bible_direct_section_edit(tmp_path):
+    root = bible_project(tmp_path / "p")
+    base = plan.bible_baseline(root)
+    plan.edit_bible_section(root, "Style rules", "- sparse and dry\n- no filler",
+                            base)
+    text = (root / "bible.md").read_text()
+    assert "## Title" in text and "## Style rules" in text
+    assert "- sparse and dry" in text and "(working title)" in text
+    # custom sections and headings survive; heading is never relabeled
+    (root / "bible.md").write_text(
+        "# Story bible\n\n## Timeline notes\nold\n", encoding="utf-8")
+    base2 = plan.bible_baseline(root)
+    plan.edit_bible_section(root, "Timeline notes", "new timeline", base2)
+    text = (root / "bible.md").read_text()
+    assert "## Timeline notes" in text and "new timeline" in text
+
+
+def test_bible_direct_edit_stale_refusal(tmp_path):
+    root = bible_project(tmp_path / "p")
+    base = plan.bible_baseline(root)
+    (root / "bible.md").write_text("changed externally\n", encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.edit_bible_section(root, "Title", "x", base)
+    assert getattr(e.value, "stale", False)
+
+
+def test_bible_history_listing(tmp_path):
+    root = bible_project(tmp_path / "p")
+    plan.begin_bible_session(root)
+    st = plan.bible_form_state(root, "Title")
+    plan.save_bible_answers(root, "Title", fill_title(st["form"]))
+    hist = plan.bible_history(root)
+    assert [b["name"] for b in hist["bibles"]] == \
+        ["bible_20260101-000000.md"]
+    assert [a["name"] for a in hist["answers"]] == \
+        ["bible_answers_title_20260101-000000.md"]
+    assert "The Long Tower" in hist["answers"][0]["text"]
+
+
+def test_bible_ops_missing_project(tmp_path):
+    with pytest.raises(OpError):
+        plan.bible_overview(tmp_path / "nope")
+    with pytest.raises(OpError):
+        plan.bible_form_state(tmp_path / "nope", "Title")
+
+
+def test_bible_unknown_heading(tmp_path):
+    root = bible_project(tmp_path / "p")
+    base = plan.bible_baseline(root)
+    with pytest.raises(OpError) as e:
+        plan.accept_bible_section(root, "Nope", "x", base)
+    assert "no such bible section" in str(e.value)

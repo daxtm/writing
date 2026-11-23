@@ -38,7 +38,8 @@ REFRESH_MS = 2000
 
 # Tabs
 MANUSCRIPT, BRANCHES, DRAFT, SCENE, CONTEXT, LORE, NOTES = 0, 1, 2, 3, 4, 5, 6
-SETUP = 7
+SETUP, BIBLE = 7, 8
+OUTLINE, SCENES = 9, 10
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -135,6 +136,15 @@ class MainWindow(QMainWindow):
         self._import_src = None       # picked preset source bytes identity
         self._settings_touched = {}   # field path -> user edited
         self._settings_state = {}     # last loaded shared settings state
+        self._bible_overview = None   # cached read-only section list
+        self._bible_heading = None
+        self._bible_session = False
+        self._bible_mode = "form"     # "form" or "text"
+        self._bible_form_loaded = None
+        self._bible_text_loaded = None
+        self._bible_baseline = None   # captured pre/secs + bible.md bytes
+        self._bible_preview_section = None
+        self._bible_preview_is_current = True
         try:
             self._session = dop.session_info(self._root)
         except dop.OpError as e:
@@ -217,6 +227,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_lore_tab(), "Lore")
         self.tabs.addTab(self._build_notes_tab(), "Notes")
         self.tabs.addTab(self._build_setup_tab(), "Setup")
+        self.tabs.addTab(self._build_bible_tab(), "Bible")
         right_l.addWidget(self.tabs, 1)
 
         steer_box = QGroupBox("Steering")
@@ -882,6 +893,334 @@ class MainWindow(QMainWindow):
         notes_split.setStretchFactor(1, 2)
         return notes_split
 
+    def _build_bible_tab(self):
+        """Bible pane: fixed section questions with multiline forms, saved
+        answers, preview, Accept/Skip/Leave, direct section editing and
+        history — the CLI bible session without a terminal or $EDITOR."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.addWidget(QLabel("Sections (## headings of bible.md)"))
+        self.bible_list = QListWidget()
+        self.bible_list.currentRowChanged.connect(self._on_bible_selected)
+        l.addWidget(self.bible_list, 2)
+        self.bible_editor_label = QLabel(
+            "Answer form (multiline; Enter inserts a newline; lines starting "
+            "with # are ignored)")
+        l.addWidget(self.bible_editor_label)
+        self.bible_form_edit = QPlainTextEdit()
+        self.bible_form_edit.setPlaceholderText(
+            "The fixed CLI question form appears here once you begin "
+            "answering; saved answers are reused on reopen")
+        l.addWidget(self.bible_form_edit, 3)
+        btns = QHBoxLayout()
+        self.bible_begin_btn = QPushButton("Begin answering")
+        self.bible_begin_btn.setToolTip("Start a session: backs up the "
+                                        "existing bible once "
+                                        "(bible_history/bible_<stamp>.md), "
+                                        "like the CLI session start")
+        self.bible_begin_btn.clicked.connect(self.bible_begin)
+        btns.addWidget(self.bible_begin_btn)
+        self.bible_save_btn = QPushButton("Save answers")
+        self.bible_save_btn.setToolTip("Persist the exact form and input "
+                                       "history, then preview the composed "
+                                       "section — bible.md is not changed")
+        self.bible_save_btn.clicked.connect(self.bible_save)
+        btns.addWidget(self.bible_save_btn)
+        self.bible_accept_btn = QPushButton("Accept section")
+        self.bible_accept_btn.setToolTip("Replace only this section in "
+                                         "bible.md (preamble, section order "
+                                         "and other sections preserved)")
+        self.bible_accept_btn.clicked.connect(self.bible_accept)
+        btns.addWidget(self.bible_accept_btn)
+        self.bible_edit_btn = QPushButton("Edit answers")
+        self.bible_edit_btn.clicked.connect(self.bible_edit_answers)
+        btns.addWidget(self.bible_edit_btn)
+        self.bible_skip_btn = QPushButton("Skip section")
+        self.bible_skip_btn.setToolTip("Leave this section unchanged; saved "
+                                       "answers remain")
+        self.bible_skip_btn.clicked.connect(self.bible_skip)
+        btns.addWidget(self.bible_skip_btn)
+        self.bible_leave_btn = QPushButton("Leave session")
+        self.bible_leave_btn.setToolTip("End the session; previously saved "
+                                        "answers and accepted sections "
+                                        "remain")
+        self.bible_leave_btn.clicked.connect(self.bible_leave)
+        btns.addWidget(self.bible_leave_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        btns2 = QHBoxLayout()
+        self.bible_text_edit_btn = QPushButton("Edit section text")
+        self.bible_text_edit_btn.setToolTip("Directly edit the section body "
+                                            "(freeform text and custom "
+                                            "headings; never relabels or "
+                                            "drops content)")
+        self.bible_text_edit_btn.clicked.connect(self.bible_edit_text)
+        btns2.addWidget(self.bible_text_edit_btn)
+        self.bible_text_save_btn = QPushButton("Save section text")
+        self.bible_text_save_btn.clicked.connect(self.bible_save_text)
+        btns2.addWidget(self.bible_text_save_btn)
+        self.bible_text_cancel_btn = QPushButton("Cancel text edit")
+        self.bible_text_cancel_btn.clicked.connect(self.bible_cancel_text)
+        btns2.addWidget(self.bible_text_cancel_btn)
+        self.bible_history_btn = QPushButton("History")
+        self.bible_history_btn.setToolTip("Read saved bible snapshots and "
+                                          "answer-history files; no restore "
+                                          "protocol")
+        self.bible_history_btn.clicked.connect(self.bible_history_view)
+        btns2.addWidget(self.bible_history_btn)
+        btns2.addStretch(1)
+        l.addLayout(btns2)
+        self.bible_preview = QPlainTextEdit()
+        self.bible_preview.setReadOnly(True)
+        self.bible_preview.setPlaceholderText(
+            "The composed section preview appears here after Save answers; "
+            "it replaces the section only on explicit Accept")
+        l.addWidget(self.bible_preview, 2)
+        self.bible_note = QLabel("")
+        self.bible_note.setWordWrap(True)
+        l.addWidget(self.bible_note)
+        return box
+
+    # ----------------------------------------------------------------- bible
+
+    def _refresh_bible_overview(self):
+        try:
+            self._bible_overview = plan.bible_overview(self._root)
+        except dop.OpError as e:
+            self._bible_overview = {"has_sections": False, "sections": [],
+                                    "error": str(e), "chars": [],
+                                    "bible_path": "bible.md"}
+        self._rebuild_bible_list()
+
+    def _rebuild_bible_list(self):
+        over = self._bible_overview or {}
+        current = self._bible_heading
+        self.bible_list.blockSignals(True)
+        self.bible_list.clear()
+        for s in over.get("sections", []):
+            mark = " (placeholder)" if s["placeholder"] else ""
+            self.bible_list.addItem(QListWidgetItem(s["heading"] + mark))
+        if current is not None:
+            for i, s in enumerate(over.get("sections", [])):
+                if s["heading"] == current:
+                    self.bible_list.setCurrentRow(i)
+                    break
+        self.bible_list.blockSignals(False)
+        self._update_bible_note()
+
+    def _update_bible_note(self):
+        over = self._bible_overview or {}
+        bits = []
+        if over.get("error"):
+            bits.append("bible unavailable: " + over["error"])
+        if over.get("over_budget"):
+            bits.append(f"bible is ~{over.get('tokens')} tokens, over its "
+                        f"{over.get('budget')} budget: shorten the longest "
+                        "sections or move detail into lorebooks")
+        elif over.get("sections"):
+            bits.append(f"~{over.get('tokens')} tokens (budget "
+                        f"{over.get('budget')})")
+        if self._bible_session:
+            bits.append("session active; the existing bible is backed up")
+        self.bible_note.setText("; ".join(bits))
+
+    def _update_bible_tab(self):
+        if self._bible_overview is None:
+            self._refresh_bible_overview()
+
+    def _on_bible_selected(self, row):
+        over = self._bible_overview or {}
+        if not (0 <= row < len(over.get("sections", []))):
+            return
+        heading = over["sections"][row]["heading"]
+        if self._bible_dirty() and heading != self._bible_heading:
+            pick = self._choice(
+                "Unsaved bible form",
+                f"The {self._bible_heading or 'section'} form has unsaved "
+                "changes. Save before switching?",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self.bible_save():
+                    return
+            elif pick != "Discard":
+                return
+        self._bible_heading = heading
+        self._load_bible_form()
+
+    def _load_bible_form(self):
+        try:
+            st = plan.bible_form_state(self._root, self._bible_heading)
+        except dop.OpError as e:
+            self.bible_note.setText(f"(form unavailable: {e})")
+            return
+        self._bible_form_loaded = st["form"]
+        self._bible_mode = "form"
+        self.bible_form_edit.setPlainText(st["form"])
+        self.bible_editor_label.setText(
+            f"Answer form for {self._bible_heading}" +
+            (" (saved answers reused)" if st["saved_form"] else "") +
+            "; current section text is in the preview pane below")
+        self.bible_preview.setPlainText(st["current"] or "(empty)")
+
+    def _bible_dirty(self):
+        return (self._bible_mode == "form" and self._bible_heading is not None
+                and self.bible_form_edit.toPlainText() !=
+                (self._bible_form_loaded or "")) or \
+            (self._bible_mode == "text" and self.bible_form_edit.toPlainText()
+             != (self._bible_text_loaded or ""))
+
+    def bible_begin(self):
+        """Explicit session start: backs up the existing bible once."""
+        if self._busy:
+            return
+        over = self._bible_overview or {}
+        if not over.get("has_sections"):
+            self._status(over.get("error") or "no bible sections", error=True)
+            return
+        root = plan.canonical_root(self._root)
+
+        def fn(sink, token):
+            out = plan.begin_bible_session(root, token=token, events=sink)
+            out["baseline"] = plan.bible_baseline(root)
+            return out
+
+        self._dispatch(fn, kind="bible_begin")
+
+    def bible_save(self):
+        """Save answers (form + history) and preview; bible.md unchanged."""
+        if self._busy or self._bible_heading is None:
+            if self._bible_heading is None:
+                self._status("Select a bible section first.")
+            return False
+        form = self.bible_form_edit.toPlainText()
+        root = plan.canonical_root(self._root)
+        heading = self._bible_heading
+
+        def fn(sink, token):
+            return plan.save_bible_answers(root, heading, form, token=token,
+                                           events=sink)
+
+        self._dispatch(fn, kind="bible_save")
+        return True
+
+    def bible_accept(self):
+        """Explicit Accept: replace only this section of the captured bible."""
+        if self._busy or self._bible_heading is None:
+            return
+        if not self._bible_session:
+            self._status("Begin answering first: a session backs up the "
+                         "existing bible before any section is replaced.",
+                         error=True)
+            return
+        if not self.bible_preview.toPlainText().strip() or \
+                self._bible_preview_is_current:
+            self._status("Save answers first; the preview is what Accept "
+                         "writes.", error=True)
+            return
+        section = self._bible_preview_section
+        if section is None:
+            self._status("Save answers first.", error=True)
+            return
+        if self._bible_dirty():
+            self._status("The form has unsaved changes; Save answers before "
+                         "accepting.", error=True)
+            return
+        base = self._bible_baseline
+        heading = self._bible_heading
+        root = plan.canonical_root(self._root)
+
+        def fn(sink, token):
+            return plan.accept_bible_section(root, heading, section,
+                                             baseline=dict(base), token=token,
+                                             events=sink)
+
+        self._dispatch(fn, kind="bible_accept")
+
+    def bible_edit_answers(self):
+        """Return from the preview to the (saved) answer form."""
+        if self._bible_heading is None:
+            return
+        self._bible_mode = "form"
+        self._load_bible_form()
+
+    def bible_skip(self):
+        """Skip: nothing is written; saved answers stay."""
+        self._bible_preview_section = None
+        self.bible_preview.setPlainText("")
+        self._status(f"Skipped {self._bible_heading}; saved answers and "
+                     "accepted sections remain.")
+
+    def bible_leave(self):
+        """Leave the session: unaccepted previews are not committed."""
+        self._bible_session = False
+        self._bible_baseline = None
+        self._bible_preview_section = None
+        self.bible_preview.setPlainText("")
+        self._status("Left the bible session; previously saved answers and "
+                     "accepted sections remain.")
+
+    def bible_edit_text(self):
+        """Direct freeform section-text editing (built-in editor)."""
+        over = self._bible_overview or {}
+        sec = next((s for s in over.get("sections", [])
+                    if s["heading"] == self._bible_heading), None)
+        if sec is None:
+            self._status("Select a bible section first.")
+            return
+        self._bible_mode = "text"
+        self._bible_text_loaded = sec["body"]
+        self.bible_form_edit.setPlainText(sec["body"])
+        self.bible_editor_label.setText(
+            f"Section text for {self._bible_heading} (freeform; custom "
+            "headings and preamble are never relabeled or dropped)")
+
+    def bible_save_text(self):
+        if self._busy or self._bible_mode != "text":
+            if self._bible_mode != "text":
+                self._status("Open Edit section text first.")
+            return
+        body = self.bible_form_edit.toPlainText()
+        heading = self._bible_heading
+        root = plan.canonical_root(self._root)
+        base = self._bible_baseline or self._refresh_bible_baseline()
+
+        def fn(sink, token):
+            return plan.edit_bible_section(root, heading, body,
+                                           baseline=dict(base), token=token,
+                                           events=sink)
+
+        self._dispatch(fn, kind="bible_text_save")
+
+    def bible_cancel_text(self):
+        if self._bible_mode == "text":
+            self._load_bible_form()
+
+    def _refresh_bible_baseline(self):
+        try:
+            self._bible_baseline = plan.bible_baseline(self._root)
+        except dop.OpError:
+            self._bible_baseline = None
+        return self._bible_baseline
+
+    def bible_history_view(self):
+        """Read-only history viewer in the reading pane."""
+        try:
+            hist = plan.bible_history(self._root)
+        except dop.OpError as e:
+            self._status(str(e), error=True)
+            return
+        lines = []
+        for b in hist["bibles"]:
+            lines.append(f"=== bible_history/{b['name']} ===\n{b['text']}")
+        for a in hist["answers"]:
+            lines.append(f"=== {a['name']} ===\n{a['text']}")
+        for e in hist["errors"]:
+            lines.append("warning: " + e)
+        self._view_override = ("bible history",
+                               "\n\n".join(lines) or "(no history files)")
+        self._update_panes()
+
     def _build_setup_tab(self):
         """Setup pane: project state, preset import; settings arrive with the
         settings task. Create/Open stay on the top bar for every state."""
@@ -1160,13 +1499,19 @@ class MainWindow(QMainWindow):
         return True
 
     def _planning_dirty(self):
-        return self.settings_dirty()
+        return self.settings_dirty() or self._bible_dirty()
 
     def _save_planning_dirty(self):
+        if self._bible_dirty():
+            return self.bible_save()
         return self.save_settings()
 
     def _discard_planning_dirty(self):
         self._settings_touched = {}
+        if self._bible_mode == "form":
+            self.bible_form_edit.setPlainText(self._bible_form_loaded or "")
+        else:
+            self.bible_form_edit.setPlainText(self._bible_text_loaded or "")
 
     def _run_pending_action(self):
         """Continue a Create/Open deferred behind a dirty-form Save."""
@@ -1259,6 +1604,13 @@ class MainWindow(QMainWindow):
         self._draft_left = False
         self._stale_config = False
         self._plan = plan.project_overview(self._root)
+        self._bible_overview = None
+        self._bible_session = False
+        self._bible_heading = None
+        self._bible_baseline = None
+        self._bible_preview_section = None
+        self._bible_form_loaded = None
+        self._bible_text_loaded = None
         self._bind_steering(None)
         self.refresh(force=True)
         self._autoselect()
@@ -1426,6 +1778,7 @@ class MainWindow(QMainWindow):
         """Reload the snapshot; preserve selection, tab, scroll, focus, dirty."""
         if force:
             self._plan = plan.project_overview(self._root)
+            self._refresh_bible_overview()
         self._update_setup_tab()
         try:
             res = self._load(self._root, cache=self._cache, force=force)
@@ -1648,7 +2001,12 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(self._busy)
         for b in (self.create_btn, self.open_btn, self.preset_import_btn,
                   self.settings_save_btn, self.settings_cancel_btn,
-                  self.fetch_limits_btn):
+                  self.fetch_limits_btn, self.bible_begin_btn,
+                  self.bible_save_btn, self.bible_accept_btn,
+                  self.bible_edit_btn, self.bible_skip_btn,
+                  self.bible_leave_btn, self.bible_text_edit_btn,
+                  self.bible_text_save_btn, self.bible_text_cancel_btn,
+                  self.bible_history_btn):
             b.setEnabled(not self._busy)
         has_batch = bool(self._batch and self._batch.get("saved"))
         for b in (self.accept_btn, self.view_btn, self.reroll_btn,
@@ -1927,6 +2285,44 @@ class MainWindow(QMainWindow):
                    + (f"; not found: {', '.join(value['not_found'])}"
                       if value["not_found"] else ""))
             self._status(msg)
+        elif kind == "bible_begin" and isinstance(value, dict):
+            self._bible_session = True
+            self._bible_baseline = dict(value.get("baseline") or {})
+            self._bible_preview_section = None
+            self._bible_preview_is_current = False
+            if not self._bible_heading and self._bible_overview and \
+                    self._bible_overview.get("sections"):
+                self._bible_heading = \
+                    self._bible_overview["sections"][0]["heading"]
+            self._load_bible_form()
+            msg = ("bible session started"
+                   + (f"; backed up {value['backup']}" if value.get("backup")
+                      else "") + ". Fill the form, Save answers, then Accept.")
+            self._status(msg)
+        elif kind == "bible_save" and isinstance(value, dict):
+            self._bible_form_loaded = self.bible_form_edit.toPlainText()
+            self._bible_mode = "form"
+            self._bible_preview_section = value["preview"]
+            self._bible_preview_is_current = False
+            self.bible_preview.setPlainText(value["preview"] or "(empty)")
+            self.bible_editor_label.setText(
+                f"Preview for {value['heading']} ({value['words']} words) — "
+                "bible.md is unchanged until you press Accept section")
+            self._status(f"saved answers to {value['form_path']} and input "
+                         "history; bible.md unchanged until Accept")
+        elif kind == "bible_accept" and isinstance(value, dict):
+            self._bible_preview_section = None
+            self._bible_preview_is_current = True
+            self._refresh_bible_overview()
+            self._bible_baseline = self._refresh_bible_baseline()
+            self._status(f"accepted {value['heading']} "
+                         f"({value['words']} words) into bible.md")
+        elif kind == "bible_text_save" and isinstance(value, dict):
+            self._refresh_bible_overview()
+            self._bible_baseline = self._refresh_bible_baseline()
+            self._bible_mode = "form"
+            self._load_bible_form()
+            self._status(f"saved section text for {value['heading']}")
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
@@ -2411,6 +2807,7 @@ class MainWindow(QMainWindow):
         self._update_scene_tab()
         self._lore_refresh()
         self._update_setup_tab()
+        self._update_bible_tab()
         self._update_steering_ui()
 
     def _reconcile_selection(self):
