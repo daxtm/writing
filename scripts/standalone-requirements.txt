@@ -1,0 +1,15 @@
+# Fully pinned build dependency closure for scripts/build-standalone.sh.
+# Build-only: never added to the PEP 723 runtime dependencies of longform.py.
+# Resolved with `uv pip compile --python-version 3.11` on 2026-11-23.
+altgraph==0.17.5
+anyio==4.16.0
+certifi==2026.11.20
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+packaging==26.4
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
+setuptools==84.2.1
+typing-extensions==4.16.0

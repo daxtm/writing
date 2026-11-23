@@ -14,6 +14,7 @@ except to mark it superseded by a newer ADR.
 | [0005](0005-desktop-gui.md) | Use Tkinter and ttk for the native read-only desktop reader | Superseded by ADR-0006 | 2026-11-23 |
 | [0006](0006-wayland-writing-workspace.md) | Use Qt Widgets for the Wayland writing workspace | Accepted | 2026-11-23 |
 | [0007](0007-shared-writing-operations.md) | Share writing operations between CLI and an asynchronous GUI | Accepted | 2026-11-23 |
+| [0008](0008-standalone-native-executable.md) | Distribute a frozen native executable alongside the source launcher | Accepted | 2026-11-23 |
 
 ADR-0004/0005 are the reader-baseline decisions integrated from the
 `feat/reader-gui` branch; ADR-0006 supersedes 0005's Tk presentation choice for

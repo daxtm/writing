@@ -1,0 +1,911 @@
+"""Standalone-executable acceptance tests.
+
+These tests exercise the *production* artifact built by scripts/build-standalone.sh
+(never a development wrapper): the executable is copied alone into a temporary
+directory with spaces and run by absolute path from an unrelated working
+directory with Python/uv and the source checkout absent from its environment.
+
+The whole session is network-guarded at the native level: an LD_PRELOAD guard
+compiled with cc denies Internet socket creation/connection, datagram sends and
+hostname resolution for the frozen bootloader, interpreter and every child
+process, and a small native challenge probe proves the denial without Python on
+PATH. Source-side monkeypatch/sitecustomize guards (tests/conftest.py) are kept
+and still cover the source CLI parity runs.
+
+Missing compiler, missing guard or a failed build fails explicitly -- coverage
+is never skipped.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import types
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+BUILD_SCRIPT = REPO / "scripts" / "build-standalone.sh"
+BINARY_NAME = "longform"
+
+# Recognizable stderr marker emitted by the native guard on every denied call.
+NET_DENIAL_MARKER = "LONGFORM-NETWORK-DENIED"
+
+CREDENTIAL_VARS = ("FEATHERLESS_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+TRUST_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE")
+PYTHON_VARS = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONOPTIMIZE",
+               "PYTHONWARNINGS", "PYTHONUSERBASE", "PYTHONNOUSERSITE", "PYTHONUNBUFFERED")
+
+# ---------------------------------------------------------------------------
+# Native network guard (test-only). Interposed functions deny Internet traffic
+# before it reaches the network and print the marker to stderr. LD_PRELOAD is
+# inherited by children, so the guard also covers them.
+# ---------------------------------------------------------------------------
+
+NETGUARD_C = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+static void deny(const char *op) {
+    fprintf(stderr, "LONGFORM-NETWORK-DENIED op=%s\n", op);
+}
+
+static int internet_family(const struct sockaddr *addr, socklen_t len) {
+    if (!addr || len < sizeof(sa_family_t)) return 0;
+    return addr->sa_family == AF_INET || addr->sa_family == AF_INET6;
+}
+
+int socket(int domain, int type, int protocol) {
+    if (domain == AF_INET || domain == AF_INET6) {
+        deny("socket");
+        errno = EPERM;
+        return -1;
+    }
+    static int (*real_sym)(int, int, int);
+    if (!real_sym) real_sym = (int (*)(int, int, int))dlsym(RTLD_NEXT, "socket");
+    return real_sym(domain, type, protocol);
+}
+
+int connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    if (internet_family(addr, len)) {
+        deny("connect");
+        errno = EPERM;
+        return -1;
+    }
+    static int (*real_sym)(int, const struct sockaddr *, socklen_t);
+    if (!real_sym) real_sym = (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_NEXT, "connect");
+    return real_sym(fd, addr, len);
+}
+
+ssize_t sendto(int fd, const void *buf, size_t n, int flags,
+               const struct sockaddr *addr, socklen_t alen) {
+    if (internet_family(addr, alen)) {
+        deny("sendto");
+        errno = EPERM;
+        return -1;
+    }
+    static ssize_t (*real_sym)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+    if (!real_sym) real_sym = (ssize_t (*)(int, const void *, size_t, int, const struct sockaddr *, socklen_t))
+        dlsym(RTLD_NEXT, "sendto");
+    return real_sym(fd, buf, n, flags, addr, alen);
+}
+
+int getaddrinfo(const char *node, const char *service,
+                const struct addrinfo *hints, struct addrinfo **res) {
+    deny("getaddrinfo");
+    (void)node; (void)service; (void)hints; (void)res;
+    return EAI_FAIL;
+}
+
+struct hostent *gethostbyname(const char *name) {
+    deny("gethostbyname");
+    (void)name;
+    h_errno = HOST_NOT_FOUND;
+    return NULL;
+}
+
+struct hostent *gethostbyname2(const char *name, int af) {
+    deny("gethostbyname2");
+    (void)name; (void)af;
+    h_errno = HOST_NOT_FOUND;
+    return NULL;
+}
+"""
+
+# ---------------------------------------------------------------------------
+# Native challenge probe (test-only). Tries every guarded operation and exits 0
+# only when each one was denied -- without Python on PATH.
+# ---------------------------------------------------------------------------
+
+PROBE_C = r"""
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int failures = 0;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s >= 0) {
+        fprintf(stderr, "probe: socket(AF_INET) unexpectedly succeeded\n");
+        failures++;
+        close(s);
+    } else {
+        fprintf(stderr, "probe: socket(AF_INET) denied with errno=%d\n", errno);
+    }
+    int u = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (u >= 0) {
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons(80);
+        a.sin_addr.s_addr = inet_addr("192.0.2.1"); /* TEST-NET-1, never routed */
+        if (connect(u, (struct sockaddr *)&a, sizeof a) == 0) {
+            fprintf(stderr, "probe: connect(AF_INET) unexpectedly succeeded\n");
+            failures++;
+        } else {
+            fprintf(stderr, "probe: connect(AF_INET) denied with errno=%d\n", errno);
+        }
+        struct sockaddr_in d;
+        memcpy(&d, &a, sizeof d);
+        if (sendto(u, "x", 1, 0, (struct sockaddr *)&d, sizeof d) >= 0) {
+            fprintf(stderr, "probe: sendto(AF_INET) unexpectedly succeeded\n");
+            failures++;
+        } else {
+            fprintf(stderr, "probe: sendto(AF_INET) denied with errno=%d\n", errno);
+        }
+        close(u);
+    } else {
+        fprintf(stderr, "probe: AF_UNIX socket failed unexpectedly (errno=%d)\n", errno);
+        failures++;
+    }
+    struct addrinfo *res = NULL;
+    int rc = getaddrinfo("localhost", "80", NULL, &res);
+    if (rc == 0) {
+        fprintf(stderr, "probe: getaddrinfo unexpectedly succeeded\n");
+        failures++;
+        freeaddrinfo(res);
+    } else {
+        fprintf(stderr, "probe: getaddrinfo denied (rc=%d)\n", rc);
+    }
+    struct hostent *h = gethostbyname("localhost");
+    if (h != NULL) {
+        fprintf(stderr, "probe: gethostbyname unexpectedly succeeded\n");
+        failures++;
+    }
+    return failures ? 1 : 0;
+}
+"""
+
+
+def require_cc() -> str:
+    cc = shutil.which("cc")
+    if not cc:
+        pytest.fail("native guard: no cc compiler found; frozen standalone tests cannot run "
+                    "(install a C compiler, e.g. gcc, providing cc)")
+    return cc
+
+
+@pytest.fixture(scope="session")
+def net_guard(tmp_path_factory):
+    """Compile the native LD_PRELOAD guard and challenge it with the probe."""
+    cc = require_cc()
+    d = tmp_path_factory.mktemp("netguard")
+    (d / "netguard.c").write_text(NETGUARD_C, encoding="utf-8")
+    (d / "probe.c").write_text(PROBE_C, encoding="utf-8")
+    so = d / "netguard.so"
+    probe = d / "probe"
+    for src, out, shared in (("netguard.c", so, True), ("probe.c", probe, False)):
+        cmd = [cc, "-fPIC", "-O2"]
+        if shared:
+            cmd.append("-shared")
+        cmd += ["-o", str(out), str(d / src), "-ldl"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.fail(f"native guard: compiling {src} failed:\n{r.stderr}")
+
+    # Empty PATH directory: the probe must prove denial without Python/uv.
+    empty_dir = tmp_path_factory.mktemp("empty-path")
+    env = {"PATH": str(empty_dir), "HOME": str(d), "TMPDIR": str(d),
+           "LD_PRELOAD": str(so)}
+    r = subprocess.run([str(probe)], env=env, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        pytest.fail("native guard challenge: the probe reached the network despite the guard:\n"
+                    + r.stderr + "\n" + r.stdout)
+    if NET_DENIAL_MARKER not in r.stderr:
+        pytest.fail("native guard challenge: denial marker missing from probe stderr:\n" + r.stderr)
+    return types.SimpleNamespace(dir=d, so=so, probe=probe)
+
+
+def frozen_env(root: Path, guard: Path, extra=None) -> dict:
+    """Clean environment for frozen runs: empty PATH dir, no Python paths, no
+    credentials, no trust overrides, native guard active."""
+    empty_dir = root / "empty-path"
+    tmp_dir = root / "tmp"
+    empty_dir.mkdir(exist_ok=True)
+    tmp_dir.mkdir(exist_ok=True)
+    env = {
+        "PATH": str(empty_dir),
+        "HOME": str(root),
+        "TMPDIR": str(tmp_dir),
+        "LD_PRELOAD": str(guard),
+    }
+    for var in CREDENTIAL_VARS + TRUST_VARS + PYTHON_VARS:
+        env[var] = ""
+    env.update(extra or {})
+    return env
+
+
+def check_clean_extraction(tmp_dir: Path):
+    """PyInstaller must remove its extraction dir; no writes left in TMPDIR."""
+    leftovers = [p.name for p in tmp_dir.iterdir()]
+    assert not leftovers, f"extraction/tmp writes left behind in {tmp_dir}: {leftovers}"
+
+
+def assert_no_denial(proc):
+    blob = (proc.stdout or "") + (proc.stderr or "")
+    assert NET_DENIAL_MARKER not in blob, (
+        f"native network guard denied something during a frozen run:\n{blob}")
+
+
+def run_frozen(binary: Path, args, env, cwd=None, stdin=None, timeout=300):
+    tmp_dir = Path(env["TMPDIR"])
+    proc = subprocess.run([str(binary), *args], env=env, cwd=cwd, input=stdin,
+                          capture_output=True, text=True, timeout=timeout)
+    assert_no_denial(proc)
+    check_clean_extraction(tmp_dir)
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# Source CLI runs for parity (existing invocation, sitecustomize network guard)
+# ---------------------------------------------------------------------------
+
+def source_env(root: Path) -> dict:
+    """Real environment minus credentials, with the subprocess network guard."""
+    env = dict(os.environ)
+    for var in CREDENTIAL_VARS:
+        env.pop(var, None)
+    root.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    guard_dir = Path(tempfile.mkdtemp(prefix="longform-netguard-"))
+    guard_dir.mkdir(exist_ok=True)
+    (guard_dir / "sitecustomize.py").write_text(textwrap.dedent("""
+        import socket
+
+        def _refuse(*_a, **_k):
+            raise AssertionError("network access attempted in a test subprocess")
+
+        socket.socket.connect = _refuse
+        socket.create_connection = _refuse
+    """), encoding="utf-8")
+    env["PYTHONPATH"] = str(guard_dir)
+    return env
+
+
+def run_source(args, root: Path, cwd=None, extra_env=None, timeout=300):
+    env = source_env(root)
+    env.update(extra_env or {})
+    proc = subprocess.run(["uv", "run", "--script", str(REPO / "longform.py"), *args],
+                          env=env, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped build through the production script
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def built(tmp_path_factory, net_guard):
+    """Build once per session through the documented script, then copy only the
+    executable into a temporary directory with spaces. An artifact that is
+    newer than every build input (e.g. produced by ./scripts/check.sh moments
+    earlier) is reused; anything missing or stale is rebuilt by the script."""
+    if not BUILD_SCRIPT.is_file():
+        pytest.fail(f"scripts/build-standalone.sh not found at {BUILD_SCRIPT}: the documented "
+                    "build entry point does not exist, so the standalone owner journey cannot run")
+    exe = REPO / "dist" / BINARY_NAME
+    venv_py = REPO / "build" / "standalone" / "venv" / "bin" / "python"
+    inputs = [BUILD_SCRIPT, REPO / "scripts" / "standalone-requirements.txt", REPO / "longform.py"]
+    inputs += sorted((REPO / "longform_core").glob("*.py"))
+    fresh = (exe.is_file() and venv_py.is_file()
+             and all(p.stat().st_mtime_ns <= exe.stat().st_mtime_ns for p in inputs))
+    if not fresh:
+        print("\nbuilding standalone executable via scripts/build-standalone.sh ...")
+        proc = subprocess.run(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
+                              capture_output=True, text=True, timeout=3600)
+        if proc.returncode != 0:
+            pytest.fail("scripts/build-standalone.sh failed:\n"
+                        + (proc.stdout or "") + "\n" + (proc.stderr or ""))
+    if not exe.is_file():
+        pytest.fail(f"build script reported success but no artifact at {exe}")
+    if not os.access(exe, os.X_OK):
+        pytest.fail(f"{exe} is not executable")
+    if not venv_py.is_file():
+        pytest.fail(f"build venv interpreter missing at {venv_py}; the build script did not "
+                    "provision its documented build environment")
+    copied_dir = tmp_path_factory.mktemp("copied dir with spaces")
+    copied = copied_dir / BINARY_NAME
+    shutil.copy2(exe, copied)
+    copied.chmod(0o755)
+    return types.SimpleNamespace(exe=exe, copied=copied, copied_dir=copied_dir, venv_py=venv_py,
+                                 guard_so=net_guard.so)
+
+
+# ---------------------------------------------------------------------------
+# Owner journey (tasks 1.1)
+# ---------------------------------------------------------------------------
+
+EXPECTED_COMMANDS = ("init", "limits", "bible", "outline", "scenes", "draft", "update-state",
+                     "compress", "critique", "check", "revise", "status", "export")
+
+
+def test_copied_binary_runs_help_without_python_uv_or_checkout(built, tmp_path):
+    """Copy only the binary away from the checkout, run it by absolute path from
+    another working directory with an empty PATH dir."""
+    work = tmp_path / "work dir with spaces"
+    work.mkdir()
+    env = frozen_env(tmp_path, built.guard_so)
+    r = run_frozen(built.copied, ["--help"], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    for cmd in EXPECTED_COMMANDS:
+        assert cmd in r.stdout, f"--help did not list {cmd}"
+
+
+def test_copied_binary_init_creates_project_files(built, tmp_path):
+    work = tmp_path / "also unrelated cwd"
+    work.mkdir()
+    env = frozen_env(tmp_path, built.guard_so)
+    proj = tmp_path / "demo project"
+    r = run_frozen(built.copied, ["init", str(proj)], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert f"project: {proj}" in r.stdout
+    made = r.stdout.splitlines()[1]
+    assert made.startswith("created: ")
+    for name in ("project.json", "bible.md", "state.md", "scenes.json", "summaries.json"):
+        assert (proj / name).is_file(), name
+    for d in ("trees", "outlines", "critiques", "checks", "state_history", "lorebooks", "bible_history"):
+        assert (proj / d).is_dir(), d
+    cfg = json.loads((proj / "project.json").read_text(encoding="utf-8"))
+    assert cfg["title"] == "Untitled"
+
+
+# ---------------------------------------------------------------------------
+# Artifact inspection (tasks 1.2)
+# ---------------------------------------------------------------------------
+
+FORBIDDEN_ARCHIVE_FRAGMENTS = (
+    "myfic", "tests", ".env", "writer_prompt_fixture", "test_standalone",
+    "netguard", "sitecustomize", "56295265",
+)
+
+INSPECT_ARCHIVE_SCRIPT = textwrap.dedent("""
+    import json, sys, tempfile, os
+    from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
+    exe = sys.argv[1]
+    r = CArchiveReader(exe)
+    cnames = list(r.toc)
+    pyz_names = []
+    for n in cnames:
+        if n.endswith(".pyz"):
+            fd, path = tempfile.mkstemp(suffix=".pyz")
+            os.close(fd)
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(r.extract(n))
+                pyz_names = list(ZlibArchiveReader(path).toc)
+            finally:
+                os.unlink(path)
+    libpython_name = [n for n in cnames if n.startswith("libpython")][0]
+    libpython = r.extract(libpython_name)
+    cacert = r.extract("certifi/cacert.pem")
+    print(json.dumps({
+        "carchive": cnames,
+        "pyz": pyz_names,
+        "libpython_name": libpython_name,
+        "has_pyinit_ssl": b"PyInit__ssl" in libpython,
+        "cacert_size": len(cacert),
+        "cacert_head": cacert[:2048].decode("ascii", "replace"),
+    }))
+""")
+
+
+@pytest.fixture(scope="session")
+def archive_contents(built):
+    r = subprocess.run([str(built.venv_py), "-c", INSPECT_ARCHIVE_SCRIPT, str(built.exe)],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        pytest.fail("inspecting the built archive failed:\n" + r.stderr)
+    return json.loads(r.stdout)
+
+
+def test_archive_contains_runtime_modules_ssl_and_ca_data(archive_contents):
+    carchive, pyz = archive_contents["carchive"], archive_contents["pyz"]
+    assert "longform" in carchive, "launcher script not bundled"
+    assert "libpython" in archive_contents["libpython_name"]
+    for mod in ("longform_core", "longform_core.cli", "longform_core.commands",
+                "longform_core.utils", "ssl", "httpx", "httpcore", "anyio", "certifi"):
+        assert mod in pyz, f"{mod} not bundled in the PYZ archive"
+    # _ssl is statically compiled into the bundled libpython on this toolchain
+    assert archive_contents["has_pyinit_ssl"], "no bundled _ssl extension found"
+    assert archive_contents["cacert_size"] > 10000, "certifi CA data missing or empty"
+    assert "BEGIN CERTIFICATE" in archive_contents["cacert_head"]
+
+
+def test_archive_contains_no_private_or_test_inputs(archive_contents):
+    names = archive_contents["carchive"] + archive_contents["pyz"]
+    for fragment in FORBIDDEN_ARCHIVE_FRAGMENTS:
+        assert not any(fragment in n for n in names), f"private/test input {fragment!r} in bundle"
+
+
+# ---------------------------------------------------------------------------
+# External editor invocation (tasks 2.1)
+# ---------------------------------------------------------------------------
+
+ENV_EDITOR_SH = """\
+#!/bin/sh
+{
+  printf 'LD_LIBRARY_PATH=[%s]\\n' "$LD_LIBRARY_PATH"
+  printf 'LD_LIBRARY_PATH_SET=[%s]\\n' "${LD_LIBRARY_PATH+set}"
+  printf 'LD_LIBRARY_PATH_ORIG=[%s]\\n' "$LD_LIBRARY_PATH_ORIG"
+  printf 'LD_LIBRARY_PATH_ORIG_SET=[%s]\\n' "${LD_LIBRARY_PATH_ORIG+set}"
+} > "$EDITOR_DUMP"
+printf 'EDITED BY FAKE EDITOR\\n' >> "$1"
+"""
+
+
+def make_env_editor(tmp_path):
+    dump = tmp_path / "editor-env-dump.txt"
+    editor = tmp_path / "env-editor.sh"
+    editor.write_text(ENV_EDITOR_SH, encoding="utf-8")
+    editor.chmod(0o755)
+    return editor, dump
+
+
+def read_env_dump(dump):
+    fields = {}
+    for line in dump.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"(\w+)=\[(.*)\]", line)
+        if m:
+            fields[m.group(1)] = m.group(2)
+    return fields
+
+
+def test_frozen_edit_text_restores_library_path(tmp_path, monkeypatch):
+    """Frozen only: the editor child must see the host's original library search
+    path instead of the extraction directory."""
+    from longform_core import utils
+    editor, dump = make_env_editor(tmp_path)
+    monkeypatch.setenv("VISUAL", str(editor))
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.setenv("EDITOR_DUMP", str(dump))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/frozen/extraction/dir")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/host/original/lib")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    result = utils.edit_text("original text\n")
+    assert "original text" in result and "EDITED BY FAKE EDITOR" in result
+    env = read_env_dump(dump)
+    assert env["LD_LIBRARY_PATH"] == "/host/original/lib"
+
+
+def test_frozen_edit_text_without_original_library_path_removes_it(tmp_path, monkeypatch):
+    from longform_core import utils
+    editor, dump = make_env_editor(tmp_path)
+    monkeypatch.setenv("VISUAL", str(editor))
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.setenv("EDITOR_DUMP", str(dump))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/frozen/extraction/dir")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    utils.edit_text("text\n")
+    env = read_env_dump(dump)
+    assert env["LD_LIBRARY_PATH_SET"] != "set", "extraction path must not leak into the editor"
+
+
+def test_source_edit_text_behavior_unchanged(tmp_path, monkeypatch):
+    """Without frozen execution the env is inherited exactly as before."""
+    from longform_core import utils
+    editor, dump = make_env_editor(tmp_path)
+    monkeypatch.setenv("VISUAL", str(editor))
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.setenv("EDITOR_DUMP", str(dump))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/host/whatever/lib")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/elsewhere/lib")
+    monkeypatch.delattr(sys, "frozen", raising=False)
+
+    result = utils.edit_text("text\n")
+    env = read_env_dump(dump)
+    assert env["LD_LIBRARY_PATH"] == "/host/whatever/lib"
+    assert "text" in result and "EDITED BY FAKE EDITOR" in result
+
+
+# ---------------------------------------------------------------------------
+# Synthetic projects used by frozen-command tests
+# ---------------------------------------------------------------------------
+
+WRITER_PRESET = {
+    "preset": {"temp": 1.0, "genamt": 50},
+    "instruct": {"macro": True, "input_sequence": "\n", "input_suffix": "\n",
+                 "output_sequence": "\n", "stop_sequence": ""},
+    "context": {"story_string": "{{description}}"},
+    "sysprompt": {"content": "You narrate {{char}}."},
+}
+
+TREE_1 = {
+    "nodes": {
+        "n1": {"id": "n1", "parent": None, "text": "Opening.", "sep": "\n\n",
+               "source": "model", "created": "2026-01-01 10:00", "model": "test-model",
+               "steer": "keep quiet"},
+        "n2": {"id": "n2", "parent": None, "text": "An inactive branch not exported.",
+               "sep": "\n\n", "source": "model", "created": "2026-01-01 10:01",
+               "model": "test-model"},
+    },
+    "head": "n1", "counter": 2,
+}
+
+ACTIVE_TEXT_1 = "Opening."
+
+
+def make_project(root: Path, scenes=None, trees=None, banned=None, preset=True, summaries=None):
+    """A fixed synthetic project (no API use): config, optional preset, scenes
+    and per-scene trees, including inactive branches."""
+    root.mkdir(parents=True, exist_ok=True)
+    cfg = {"title": "Frozen parity test"}
+    if banned is not None:
+        cfg["banned_phrases"] = banned
+    (root / "project.json").write_text(json.dumps(cfg) + "\n", encoding="utf-8")
+    if preset:
+        (root / "writer_preset.json").write_text(json.dumps(WRITER_PRESET) + "\n", encoding="utf-8")
+    (root / "bible.md").write_text("# Story bible\n\nA quiet town.\n", encoding="utf-8")
+    (root / "state.md").write_text("Mara is at the yard.\n", encoding="utf-8")
+    (root / "scenes.json").write_text(json.dumps(scenes if scenes is not None else [
+        {"id": "s001", "chapter": 1, "title": "Yard", "pov": "Mara",
+         "characters": ["Mara"], "goal": "count the windows", "target_words": 100,
+         "status": "drafting"},
+    ]) + "\n", encoding="utf-8")
+    (root / "summaries.json").write_text(json.dumps(summaries if summaries is not None
+                                                    else {"scenes": {}, "arcs": []}) + "\n",
+                                         encoding="utf-8")
+    (root / "trees").mkdir(exist_ok=True)
+    for sid, tree in (trees or {"s001": TREE_1}).items():
+        (root / "trees" / f"{sid}.json").write_text(json.dumps(tree) + "\n", encoding="utf-8")
+    return root
+
+
+def test_frozen_binary_draft_edit_saves_through_fake_editor(built, tmp_path):
+    """A synthetic draft session in the copied executable edits the steering note
+    with a user-supplied fake editor; the editor must see the host's original
+    library search environment, and its edits must be saved through the draft
+    flow."""
+    root = make_project(tmp_path / "editor project")
+    editor, dump = make_env_editor(tmp_path)
+
+    # Case 1: an original host library path exists (as LD_LIBRARY_PATH_ORIG set
+    # before the freeze).
+    env = frozen_env(tmp_path, built.guard_so, extra={
+        "VISUAL": str(editor), "EDITOR": str(editor), "EDITOR_DUMP": str(dump),
+        "LD_LIBRARY_PATH_ORIG": "/host/original/lib",
+    })
+    r = run_frozen(built.copied, ["draft", str(root), "--scene", "s001"], env=env,
+                   stdin="se\nq\n", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "steer set: EDITED BY FAKE EDITOR" in r.stdout
+    tree = json.loads((root / "trees" / "s001.json").read_text(encoding="utf-8"))
+    assert tree["steer"] == "EDITED BY FAKE EDITOR"
+    fields = read_env_dump(dump)
+    assert fields["LD_LIBRARY_PATH"] == "/host/original/lib", \
+        "the bundled extraction path must not leak into the editor"
+
+    # Case 2: no original library path; the editor child sees none.
+    dump.unlink()
+    env = frozen_env(tmp_path, built.guard_so, extra={
+        "VISUAL": str(editor), "EDITOR": str(editor), "EDITOR_DUMP": str(dump),
+    })
+    r = run_frozen(built.copied, ["draft", str(root), "--scene", "s001"], env=env,
+                   stdin="se\nq\n", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    fields = read_env_dump(dump)
+    assert fields.get("LD_LIBRARY_PATH_SET") != "set", \
+        f"editor saw a library search path it must not see: {fields}"
+    assert fields.get("LD_LIBRARY_PATH_ORIG_SET") != "set"
+
+
+# ---------------------------------------------------------------------------
+# Frozen/source CLI parity (tasks 2.2)
+# ---------------------------------------------------------------------------
+
+STAMP_RE = re.compile(r"\(\d{4}-\d{2}-\d{2}T[^)]*\)")
+
+
+def normalize(text, roots=(), prog_name=True):
+    """Only documented normalizations: temporary roots, program name, and the
+    known fixture timestamps. argparse wraps the usage block according to the
+    program-name length, so the wrapped usage is compared whitespace-collapsed
+    (a consequence of the permitted program-name difference)."""
+    for root in roots:
+        text = text.replace(str(root), "ROOT")
+    if prog_name:
+        text = text.replace("longform.py", "longform")
+        usage_re = re.compile(r"^usage:[^\n]*\n(?:[ \t][^\n]*\n?)*", re.M)
+        m = usage_re.search(text)
+        if m:
+            text = text[:m.start()] + " ".join(m.group(0).split()) + "\n" + text[m.end():]
+    return STAMP_RE.sub("(STAMP)", text)
+
+
+def parity(built, tmp_path, args, *, stdin=None, cwd="frozen-work", extra=None):
+    """Run the same command through the copied binary and the source launcher on
+    separate synthetic projects and compare output/exit status after
+    normalization."""
+    f_root = tmp_path / "frozen-root"
+    s_root = tmp_path / "source-root"
+    f_cwd = tmp_path / cwd
+    f_cwd.mkdir(parents=True, exist_ok=True)
+    s_cwd = tmp_path / (cwd + "-src")
+    s_cwd.mkdir(parents=True, exist_ok=True)
+
+    f_args = [a.replace("@ROOT@", str(f_root)) for a in args]
+    s_args = [a.replace("@ROOT@", str(s_root)) for a in args]
+
+    fr = run_frozen(built.copied, f_args, env=frozen_env(tmp_path, built.guard_so, extra=extra),
+                    cwd=f_cwd, stdin=stdin)
+    sr = run_source(s_args, root=s_root, cwd=s_cwd, extra_env=None)
+    assert fr.returncode == sr.returncode, \
+        f"exit status mismatch: frozen {fr.returncode} vs source {sr.returncode}\n" \
+        f"frozen stderr: {fr.stderr}\nsource stderr: {sr.stderr}"
+    f_norm = normalize(fr.stdout, roots=(f_root,)) + "|||" + normalize(fr.stderr, roots=(f_root,))
+    s_norm = normalize(sr.stdout, roots=(s_root,)) + "|||" + normalize(sr.stderr, roots=(s_root,))
+    assert f_norm == s_norm, (
+        "frozen/source output mismatch:\n--- frozen ---\n" + f_norm + "\n--- source ---\n" + s_norm)
+    return fr, sr, f_root, s_root
+
+
+def test_parity_help(built, tmp_path):
+    parity(built, tmp_path, ["--help"])
+
+
+def test_parity_invalid_command(built, tmp_path):
+    parity(built, tmp_path, ["definitely-not-a-command"])
+
+
+def test_parity_missing_required_argument(built, tmp_path):
+    parity(built, tmp_path, ["revise"])
+
+
+def test_parity_missing_project_directory(built, tmp_path):
+    parity(built, tmp_path, ["status", "/definitely/not/a/project/path"])
+
+
+def test_parity_init_first_and_repeated(built, tmp_path):
+    _, _, f_root, s_root = parity(built, tmp_path, ["init", "@ROOT@"])
+    # Same files with the same contents on both sides.
+    f_files = {p.relative_to(f_root).as_posix(): p for p in f_root.rglob("*") if p.is_file()}
+    s_files = {p.relative_to(s_root).as_posix(): p for p in s_root.rglob("*") if p.is_file()}
+    assert f_files and set(f_files) == set(s_files)
+    for rel, fpath in f_files.items():
+        assert fpath.read_bytes() == s_files[rel].read_bytes(), rel
+    f_dirs = {p.relative_to(f_root).as_posix() for p in f_root.rglob("*") if p.is_dir()}
+    s_dirs = {p.relative_to(s_root).as_posix() for p in s_root.rglob("*") if p.is_dir()}
+    assert f_dirs == s_dirs
+    # Repeated init changes nothing.
+    parity(built, tmp_path, ["init", "@ROOT@"], cwd="frozen-work-2")
+
+
+def test_parity_init_with_preset(tmp_path, built):
+    """--preset copies a fixed synthetic SillyTavern-style preset on both sides."""
+    preset = tmp_path / "synthetic preset.json"
+    preset.write_text(json.dumps(WRITER_PRESET) + "\n", encoding="utf-8")
+    f_root = tmp_path / "frozen-root"
+    s_root = tmp_path / "source-root"
+    fr = run_frozen(built.copied, ["init", str(f_root), "--preset", str(preset)],
+                    env=frozen_env(tmp_path, built.guard_so), cwd=tmp_path)
+    sr = run_source(["init", str(s_root), "--preset", str(preset)], root=tmp_path, cwd=tmp_path)
+    assert fr.returncode == sr.returncode == 0, (fr.stderr, sr.stderr)
+    assert normalize(fr.stdout, roots=(f_root,)) == normalize(sr.stdout, roots=(s_root,))
+    assert (f_root / "writer_preset.json").read_bytes() == (s_root / "writer_preset.json").read_bytes()
+
+
+def test_parity_status_with_inactive_branch(built, tmp_path):
+    root = make_project(tmp_path / "frozen-root")
+    make_project(tmp_path / "source-root")
+    parity(built, tmp_path, ["status", "@ROOT@"], cwd="parity-status")
+
+
+def test_parity_check_reports(built, tmp_path):
+    banned = ["red dragon", "spine"]
+    scenes = [
+        {"id": "s001", "chapter": 1, "title": "One", "characters": [], "target_words": 100},
+        {"id": "s002", "chapter": 1, "title": "Two", "characters": [], "target_words": 100},
+    ]
+    text1 = "Shivers down her spine. The red dragon flew over green hills. " * 3
+    trees = {
+        "s001": {
+            "nodes": {
+                "n1": {"id": "n1", "parent": None, "text": text1, "sep": "\n\n",
+                       "source": "model", "created": "2026-01-01 10:00", "model": "m"},
+                "n2": {"id": "n2", "parent": None, "text": "An inactive branch with the red dragon.",
+                       "sep": "\n\n", "source": "model", "created": "2026-01-01 10:01", "model": "m"},
+            },
+            "head": "n1", "counter": 2,
+        },
+        "s002": {
+            "nodes": {
+                "n1": {"id": "n1", "parent": None, "text": "Shivers down another spine.",
+                       "sep": "\n\n", "source": "model", "created": "2026-01-01 10:02", "model": "m"},
+            },
+            "head": "n1", "counter": 1,
+        },
+    }
+    make_project(tmp_path / "frozen-root", scenes=scenes, trees=trees, banned=banned)
+    make_project(tmp_path / "source-root", scenes=scenes, trees=trees, banned=banned)
+    parity(built, tmp_path, ["check", "@ROOT@"], cwd="parity-check")
+    # Reports written on both sides are identical after stamp normalization.
+    f_report = (tmp_path / "frozen-root" / "checks" / "all.md").read_text(encoding="utf-8")
+    s_report = (tmp_path / "source-root" / "checks" / "all.md").read_text(encoding="utf-8")
+    assert STAMP_RE.sub("(STAMP)", f_report) == STAMP_RE.sub("(STAMP)", s_report)
+    assert "inactive branch" not in f_report, "inactive branch text must not be checked"
+
+
+def test_parity_export_active_branch(built, tmp_path):
+    make_project(tmp_path / "frozen-root")
+    make_project(tmp_path / "source-root")
+    fr, sr, f_root, s_root = parity(built, tmp_path, ["export", "@ROOT@"],
+                                    cwd="parity-export")
+    f_ms = (f_root / "manuscript.md").read_text(encoding="utf-8")
+    s_ms = (s_root / "manuscript.md").read_text(encoding="utf-8")
+    assert f_ms == s_ms
+    assert "An inactive branch not exported." not in f_ms
+    assert ACTIVE_TEXT_1 in f_ms
+    # Relative --out resolves against the caller's working directory, not the
+    # executable or extraction dir.
+    work = tmp_path / "caller cwd"
+    work.mkdir()
+    env = frozen_env(tmp_path, built.guard_so)
+    r = run_frozen(built.copied, ["export", str(f_root), "--out", "relative.md"], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert (work / "relative.md").is_file()
+    assert (work / "relative.md").read_text(encoding="utf-8") == f_ms
+
+
+def test_parity_limits_without_credentials(built, tmp_path):
+    make_project(tmp_path / "frozen-root", preset=False)
+    make_project(tmp_path / "source-root", preset=False)
+    parity(built, tmp_path, ["limits", "@ROOT@"], cwd="parity-limits")
+
+
+def test_no_writes_to_bundle_or_extraction_paths(built, tmp_path):
+    """Frozen runs leave the dist/build sidecars untouched and the extraction
+    TMPDIR clean (checked by run_frozen for every invocation)."""
+    dist_before = {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in (REPO / "dist").iterdir()}
+    build_marker = REPO / "build" / "standalone"
+    build_before = {p.name: p.stat().st_mtime_ns for p in build_marker.iterdir()}
+    env = frozen_env(tmp_path, built.guard_so)
+    run_frozen(built.copied, ["--help"], env=env)
+    dist_after = {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in (REPO / "dist").iterdir()}
+    build_after = {p.name: p.stat().st_mtime_ns for p in build_marker.iterdir()}
+    assert dist_before == dist_after
+    assert build_before == build_after
+
+
+def test_build_script_fails_without_uv(tmp_path):
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    r = subprocess.run(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
+                       capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode != 0, "build script must exit nonzero when uv is missing"
+    assert "uv not found" in (r.stderr + r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Sidecars: build identity and third-party notices (tasks 1.3)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def build_json(built):
+    path = REPO / "dist" / "longform-build.json"
+    if not path.is_file():
+        pytest.fail("dist/longform-build.json missing; the build must record its identity")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_build_json_records_source_platform_interpreter_deps(built, build_json):
+    src = build_json["source"]
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(REPO),
+                          capture_output=True, text=True).stdout.strip()
+    assert src["commit"] == head
+    status = subprocess.run(["git", "status", "--porcelain", "-uno"], cwd=str(REPO),
+                            capture_output=True, text=True).stdout
+    assert src["dirty"] == bool(status.strip())
+
+    plat = build_json["platform"]
+    assert plat["os"] == "Linux"
+    assert plat["arch"] == "x86_64"
+    assert re.search(r"\d+\.\d+", plat["glibc"])
+
+    interp = build_json["interpreter"]
+    assert interp["implementation"] == "CPython"
+    assert interp["version"].startswith("3.11.")
+
+    deps = build_json["dependencies"]
+    for name, version in (("pyinstaller", "6.22.3"), ("pyinstaller-hooks-contrib", "2026.10"),
+                          ("httpx", "0.28.1"), ("certifi", None)):
+        actual = next((v for k, v in deps.items() if k.lower().replace("_", "-") == name), None)
+        assert actual is not None, f"{name} not recorded"
+        if version:
+            assert actual == version, f"{name}: expected {version}, recorded {actual}"
+
+    host = build_json["host_libraries"]
+    assert "libc.so.6" in host["ldd_artifact"], "artifact ldd boundary not recorded"
+    assert host["ldd_version"] == plat["glibc"]
+
+    art = build_json["artifact"]
+    assert art["bytes"] == built.exe.stat().st_size
+    import hashlib
+    assert art["sha256"] == hashlib.sha256(built.exe.read_bytes()).hexdigest()
+
+
+def test_third_party_notices_cover_bundled_licenses(built):
+    path = REPO / "dist" / "THIRD-PARTY-NOTICES.txt"
+    if not path.is_file():
+        pytest.fail("dist/THIRD-PARTY-NOTICES.txt missing; the build must record license texts")
+    text = path.read_text(encoding="utf-8")
+    assert "PSF" in text, "Python runtime license text missing"
+    assert "Bootloader Exception" in text, "PyInstaller bootloader exception missing"
+    assert "Mozilla Public License" in text, "certifi (CA data) license text missing"
+    for name, version in (("httpx", "0.28.1"), ("certifi", None), ("anyio", None),
+                          ("pyinstaller", "6.22.3"), ("pyinstaller-hooks-contrib", "2026.10")):
+        assert f"{name} {version}  (" in text if version else f"{name} " in text, \
+            f"license section for {name} missing"
+
+
+def test_copied_binary_runs_without_sidecars(built, tmp_path):
+    """The copied executable is alone in its directory: neither sidecar present."""
+    assert not (built.copied_dir / "longform-build.json").exists()
+    assert not (built.copied_dir / "THIRD-PARTY-NOTICES.txt").exists()
+    env = frozen_env(tmp_path, built.guard_so)
+    r = run_frozen(built.copied, ["--help"], env=env)
+    assert r.returncode == 0, r.stderr
+    assert "usage:" in r.stdout
+
+
+def test_extracted_certifi_data_loads_into_verifying_ssl_context(built, tmp_path):
+    """Packaging/trust evidence: the bundled CA data parses into a verifying SSL
+    context without an HTTPS call."""
+    script = textwrap.dedent("""
+        import json, ssl, tempfile, os, sys
+        from PyInstaller.archive.readers import CArchiveReader
+        r = CArchiveReader(sys.argv[1])
+        data = r.extract("certifi/cacert.pem")
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        os.close(fd)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(data)
+            ctx = ssl.create_default_context(cafile=path)
+        finally:
+            os.unlink(path)
+        print(json.dumps({"verify_mode": ctx.verify_mode, "ca_certs": len(ctx.get_ca_certs())}))
+    """)
+    r = subprocess.run([str(built.venv_py), "-c", script, str(built.exe)],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        pytest.fail("loading bundled CA data into an SSL context failed:\n" + r.stderr)
+    result = json.loads(r.stdout)
+    import ssl as _ssl
+    assert result["verify_mode"] == _ssl.CERT_REQUIRED, "verification must stay enabled"
+    assert result["ca_certs"] > 50, "certifi CA bundle did not load any certificates"

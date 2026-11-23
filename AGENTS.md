@@ -7,8 +7,16 @@ CLI for writers planning and collaboratively drafting long-form fiction with Fea
 Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
 
 ## Checks
-`./scripts/check.sh`: py_compile; CLI `--help` if uv exists; pytest if `tests/` exists (fails without uv).
-Suite: `uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests`; no lint/build step.
+`./scripts/check.sh`: py_compile; CLI `--help` if uv exists; `== standalone`
+(builds `dist/longform` through `scripts/build-standalone.sh` and runs the frozen
+executable tests — needs uv and a C compiler providing `cc` for the test-only
+network guard, never skipped); source pytest for the remaining regression and
+GUI/Qt cases (fails without uv).
+Suite: `uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests`;
+includes `tests/test_standalone.py`, which builds the standalone executable through
+the production script when `dist/longform` is missing or stale and runs it away
+from the checkout; `./scripts/check.sh` builds it once and the frozen tests reuse
+that artifact; no lint step.
 The launcher declares `pyside6>=6.12.0,<6.13` beside `httpx`: `uv run --script longform.py …` downloads
 PySide6 (~hundreds of MB of wheel downloads plus installed size, and the matching `uv` cache) on first
 use even for CLI-only users, as accepted in ADR-0006; GUI imports stay lazy, so `--help` needs no display.

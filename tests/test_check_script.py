@@ -14,9 +14,11 @@ SCRIPT = REPO / "scripts" / "check.sh"
 EXPECTED_ORDER = [
     "python3 -m py_compile longform.py",
     "uv run --script longform.py --help",
+    "bash scripts/build-standalone.sh",
+    "uv run --with pytest --with httpx pytest -q tests/test_standalone.py",
     # the fake uv logs "$*" without shell quoting; the real command quotes the
-    # version range: uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests
-    "uv run --with pytest --with httpx --with pyside6>=6.12.0,<6.13 pytest -q tests",
+    # version range: uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests --ignore=tests/test_standalone.py
+    "uv run --with pytest --with httpx --with pyside6>=6.12.0,<6.13 pytest -q tests --ignore=tests/test_standalone.py",
 ]
 
 
@@ -27,6 +29,13 @@ def tmp_repo(tmp_path):
     shutil.copy(SCRIPT, repo / "scripts" / "check.sh")
     (repo / "longform.py").write_text("# dummy source file\n", encoding="utf-8")
     (repo / "tests").mkdir()
+    fake_build = repo / "scripts" / "build-standalone.sh"
+    fake_build.write_text(textwrap.dedent('''\
+        #!/usr/bin/env bash
+        echo "bash scripts/build-standalone.sh" >> "$FAKE_LOG"
+        exit ${FAKE_BUILD_EXIT:-0}
+    '''), encoding="utf-8")
+    fake_build.chmod(0o755)
     return repo
 
 
@@ -48,6 +57,8 @@ def run_script(tmp_repo, tmp_path, with_uv=True, extra_env=None):
         fake_uv = make_fake(tmp_path, "uv", '''\
             echo "uv $*" >> "$FAKE_LOG"
             case "$*" in
+              *--ignore*) exit ${FAKE_PYTEST_EXIT:-0} ;;
+              *test_standalone.py*) exit ${FAKE_STANDALONE_EXIT:-0} ;;
               *pytest*) exit ${FAKE_PYTEST_EXIT:-0} ;;
               *) exit ${FAKE_UV_EXIT:-0} ;;
             esac
@@ -69,7 +80,7 @@ def test_check_script_command_order_and_success(tmp_repo, tmp_path):
     r = run_script(tmp_repo, tmp_path, with_uv=True)
     assert r.returncode == 0, r.stderr
     assert log_lines(tmp_repo) == EXPECTED_ORDER
-    assert r.stdout == "== syntax\n== cli smoke\n== tests\n"
+    assert r.stdout == "== syntax\n== cli smoke\n== standalone\n== tests\n"
 
 
 def test_check_script_failing_pytest_propagates(tmp_repo, tmp_path):
@@ -77,6 +88,31 @@ def test_check_script_failing_pytest_propagates(tmp_repo, tmp_path):
     assert r.returncode == 3
     assert log_lines(tmp_repo) == EXPECTED_ORDER
     assert "== tests" in r.stdout
+
+
+def test_check_script_failing_frozen_tests_fail_checks(tmp_repo, tmp_path):
+    r = run_script(tmp_repo, tmp_path, with_uv=True, extra_env={"FAKE_STANDALONE_EXIT": "5"})
+    assert r.returncode == 5
+    assert log_lines(tmp_repo) == EXPECTED_ORDER[:4]
+    assert "== standalone" in r.stdout
+    assert "== tests" not in r.stdout
+
+
+def test_check_script_failing_build_fails_checks(tmp_repo, tmp_path):
+    r = run_script(tmp_repo, tmp_path, with_uv=True, extra_env={"FAKE_BUILD_EXIT": "7"})
+    assert r.returncode == 7
+    assert log_lines(tmp_repo) == EXPECTED_ORDER[:3]
+    assert "== standalone" in r.stdout
+    assert "== tests" not in r.stdout
+
+
+def test_check_script_missing_build_script_fails_checks(tmp_repo, tmp_path):
+    (tmp_repo / "scripts" / "build-standalone.sh").unlink()
+    r = run_script(tmp_repo, tmp_path, with_uv=True)
+    assert r.returncode != 0
+    assert log_lines(tmp_repo) == EXPECTED_ORDER[:2]
+    assert "== standalone" in r.stdout
+    assert "== tests" not in r.stdout
 
 
 def test_check_script_missing_uv_with_tests_is_error(tmp_repo, tmp_path):
