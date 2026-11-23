@@ -12,3 +12,4 @@ __pycache__/
 # --- generated fiction projects ---
 # Run artifacts: bibles, drafts, call logs. Keep source/projects out of git.
 /myfic/
+/56295265-LLam_ception-1.3.json
