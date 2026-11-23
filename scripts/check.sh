@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Project checks — `ock check` runs this on a commit, CI runs it on every PR.
-# Offline and deterministic: no live API calls, no network beyond uv fetching dependencies once.
+# Offline and deterministic: no live API calls; only dependency provisioning and
+# the standalone build may use the network. The built application and the test
+# processes are network-guarded and must never reach it.
 #   1. Python syntax of the CLI.
 #   2. CLI smoke test (imports httpx, parses args) when uv is available.
-#   3. Test suite once tests/ exists (see openspec/changes/*test*).
+#   3. Standalone: build the native executable (provisioning build deps through
+#      scripts/build-standalone.sh) and run the frozen-process tests. Requires
+#      uv and a C compiler for the test-only native network guard; never skipped.
+#   4. Source regression suite (offline; frozen executable tests are excluded
+#      here because they already ran in step 3 against the built artifact).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,8 +28,11 @@ if [ -d tests ]; then
 		echo "tests/ exists but uv is unavailable; install uv to run the suite" >&2
 		exit 1
 	fi
+	echo "== standalone"
+	bash scripts/build-standalone.sh >/dev/null
+	uv run --with pytest --with httpx pytest -q tests/test_standalone.py
 	echo "== tests"
-	uv run --with pytest --with httpx pytest -q tests
+	uv run --with pytest --with httpx pytest -q tests --ignore=tests/test_standalone.py
 else
 	echo "no tests/ yet: see docs/ROADMAP.md for the testing plan"
 fi

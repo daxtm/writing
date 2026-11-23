@@ -7,8 +7,8 @@ CLI for writers planning and collaboratively drafting long-form fiction with Fea
 Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27`; argparse CLI, JSON/Markdown files, no database.
 
 ## Checks
-`./scripts/check.sh`: py_compile; CLI `--help` if uv exists; pytest if `tests/` exists (fails without uv).
-Suite: `uv run --with pytest --with httpx pytest -q tests`; no lint/build step.
+`./scripts/check.sh`: py_compile; CLI `--help` if uv exists; `== standalone` (builds `dist/longform` through `scripts/build-standalone.sh` and runs the frozen executable tests — needs uv and a C compiler providing `cc` for the test-only network guard, never skipped); source pytest for the remaining regression suite (fails without uv).
+Suite: `uv run --with pytest --with httpx pytest -q tests` (includes `tests/test_standalone.py`, which builds the standalone executable through the production script when `dist/longform` is missing or stale and runs it away from the checkout; `./scripts/check.sh` builds it once and the frozen tests reuse that artifact); no lint step.
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
 Current main has no `gui` command. The separate `feat/reader-gui` branch contains

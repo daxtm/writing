@@ -103,13 +103,34 @@ def extract_tagged(text, tag):
     return raw.strip(), False
 
 
+def _editor_env():
+    """Environment for the editor child process, or None to inherit unchanged.
+
+    In a frozen (PyInstaller) build the bootloader points LD_LIBRARY_PATH at the
+    one-file extraction directory, saving the pre-frozen value in
+    LD_LIBRARY_PATH_ORIG. The editor is a user-supplied host program and must see
+    the host's original library search path, so frozen execution restores it
+    (or removes the variable when there was no original value). The parent
+    environment is never modified, and source execution is unchanged.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    env = dict(os.environ)
+    orig = os.environ.get("LD_LIBRARY_PATH_ORIG")
+    if orig:
+        env["LD_LIBRARY_PATH"] = orig
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
 def edit_text(initial, suffix=".md"):
     ed = os.environ.get("VISUAL") or os.environ.get("EDITOR") or ("nano" if shutil.which("nano") else "vi")
     with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as f:
         f.write(initial)
         tmp = f.name
     try:
-        subprocess.run(shlex.split(ed) + [tmp], check=False)
+        subprocess.run(shlex.split(ed) + [tmp], check=False, env=_editor_env())
         return Path(tmp).read_text(encoding="utf-8")
     finally:
         os.unlink(tmp)
