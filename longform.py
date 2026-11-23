@@ -814,9 +814,8 @@ class Tree:
 
 # --------------------------------------------------------------------------- lorebooks
 
-def read_card_png(path):
-    """Card JSON from a SillyTavern character PNG (tEXt/iTXt chunk 'ccv3' preferred, then 'chara')."""
-    data = Path(path).read_bytes()
+def card_png_json(data):
+    """Card JSON from PNG bytes (tEXt/iTXt chunk 'ccv3' preferred, then 'chara'); None if absent."""
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         return None
     pos, found = 8, {}
@@ -848,6 +847,11 @@ def read_card_png(path):
             except (ValueError, UnicodeDecodeError):
                 continue
     return None
+
+
+def read_card_png(path):
+    """Card JSON from a SillyTavern character PNG file; None if the file holds no card data."""
+    return card_png_json(Path(path).read_bytes())
 
 
 def card_fields(d):
