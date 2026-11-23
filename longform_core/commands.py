@@ -1128,70 +1128,59 @@ def cmd_check(p, args):
 
 
 def cmd_revise(p, args):
-    scenes = p.scenes()
-    idx = p.scene_index(scenes, args.scene)
-    sc = scenes[idx]
-    tree = Tree(p, sc["id"])
-    if not tree.head:
-        die(f"scene {sc['id']} has no text")
-    notes = []
-    for path in (p.f("critiques", f"{sc['id']}.md"), p.f("checks", f"{sc['id']}.md")):
-        if path.exists():
-            notes.append(read_text(path).strip())
-    if not notes:
-        die(f"no notes for {sc['id']}: run critique {p.root} --scene {sc['id']} and/or check {p.root} --scene {sc['id']} first")
-    notes_text = "\n\n".join(notes)
-    bible = read_text(p.f("bible.md")).strip()
-    api = Api(p)
-    chain = tree.chain()
-    changed = 0
-    for k, nid in enumerate(chain):
-        n = tree.node(nid)
-        prev_tail = tree.text(chain[k - 1])[-900:] if k > 0 else ""
-        cast = ", ".join(sc.get("characters") or [])
-        user = (
-            f"# Story bible (style rules apply)\n{bible}\n\n"
-            + (f"# Characters present in this scene\n{cast}\n\n" if cast else "")
-            + f"# Editor's notes for this scene\n{notes_text}\n\n"
-            + (f"# Text just before the passage (context only, do not output it)\n...{prev_tail}\n\n" if prev_tail else "")
-            + f"# Passage to revise\n{n['text'].strip()}\n\n"
-            "Fix only the listed problems that occur in this passage. If none occur in it, answer NO CHANGES. "
-            "Otherwise answer with the full revised passage. " + tag_instr("passage")
-        )
-        msgs = [{"role": "system", "content": EDITOR_SYSTEM}, {"role": "user", "content": user}]
+    """CLI adapter over the shared revision session: identical prompts,
+    diffs, ask points, in-place node edits and the normal-completion-only
+    stale warning; the external editor stays here."""
+    import longform_core.review_operations as ro
+
+    try:
+        session = ro.revise_prepare(p.root, args.scene)
+    except ro.OpError as e:
+        _op_fail(e)
+    api = ro.provider_for(p.root, api_cls=Api)
+    chain = session.chain
+    while session.k < len(chain):
+        psg = ro.revise_passage(p.root, session, session.k)
+        nid = psg["nid"]
         while True:
-            print(col(f"\n--- {nid} ({k + 1}/{len(chain)}) ---", "36"))
-            text, finish, _ = api.chat("editor", msgs, max_tokens=max(int(p.cfg["roles"]["editor"]["max_tokens"]), int(words(n["text"]) * 2)))
-            text, ok = extract_tagged(text, "passage")
-            if not ok and not text.upper().startswith("NO CHANGES"):
-                warn("no <passage> tags in the editor output; check it for stray text")
-            if text.upper().startswith("NO CHANGES") or text == n["text"].strip():
+            print(col(f"\n--- {nid} ({session.k + 1}/{len(chain)}) ---", "36"))
+            res = ro.revise_generate(p.root, session, session.k, provider=api)
+            text, finish = res["text"], res["finish"]
+            if not res["ok"] and not text.upper().startswith("NO CHANGES"):
+                warn("no <passage> tags in the editor output; check it for "
+                     "stray text")
+            if text.upper().startswith("NO CHANGES") or text == psg["original"]:
                 print("no changes")
+                session.k += 1
                 break
             if finish == "length":
                 warn("editor output hit max_tokens; it may be truncated")
-            print(word_diff(n["text"].strip(), text))
-            c = ask(f"\n({words(n['text'])} -> {words(text)} words) [a]ccept / [s]kip / [e]dit / [r]egenerate / [q]uit: ").strip().lower()
+            print(word_diff(psg["original"], text))
+            c = ask(f"\n({words(psg['original'])} -> {words(text)} words) "
+                    "[a]ccept / [s]kip / [e]dit / [r]egenerate / [q]uit: "
+                    ).strip().lower()
             if c.startswith("e"):
-                text = edit_saved(p, f"revise_{sc['id']}_{nid}", text).strip()
+                text = edit_saved(p, f"revise_{session.scene_id}_{nid}",
+                                  text).strip()
                 c = "a"
             if c.startswith("r"):
                 continue
             if c.startswith("a") and text:
-                if n.get("sep") == "":
-                    text = keep_lead(n["text"], text)
-                n["history"].append({"time": now(), "text": n["text"], "by": "revise"})
-                n["text"] = text
-                tree.save()
-                changed += 1
+                try:
+                    ro.revise_accept(p.root, session, session.k, psg, text)
+                except ro.OpError as e:
+                    _op_fail(e, soft_ok=True)
+                    return
             if c.startswith("q"):
-                print(f"revised {changed} passages")
+                print(f"revised {session.changed} passages")
                 return
+            session.k += 1
             break
-    print(f"revised {changed} passages")
-    rec = p.summaries()["scenes"].get(sc["id"])
-    if changed and rec:
-        warn(f"summary for {sc['id']} is now stale (run: update-state {p.root} --scene {sc['id']} --summary-only)")
+    print(f"revised {session.changed} passages")
+    rec = p.summaries()["scenes"].get(session.scene_id)
+    if session.changed and rec:
+        warn(f"summary for {session.scene_id} is now stale (run: update-state "
+             f"{p.root} --scene {session.scene_id} --summary-only)")
 
 
 def cmd_status(p, args):

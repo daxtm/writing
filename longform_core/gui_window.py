@@ -119,6 +119,8 @@ class MainWindow(QMainWindow):
         self._report_edit_dirty = False
         self._report_key = None      # selected report path
         self._report_rows = []       # last report list paths
+        self._revision = None        # shared revise session + active passage
+        self._rev_editing = False
         self._plan = plan.project_overview(self._root)
 
         self.snap = None              # last valid Snapshot
@@ -1881,14 +1883,324 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_revision_tab(self):
-        """Passage-by-passage revision over the shared session (task 1.5)."""
+        """Passage-by-passage revision over the shared session: one active
+        passage at a time with Accept/Skip/Edit/Regenerate/Quit; no passage
+        changes without explicit Accept."""
         box = QWidget()
         l = QVBoxLayout(box)
         l.setContentsMargins(0, 0, 0, 0)
-        l.addWidget(QLabel("Passage-by-passage revision is added by the "
-                           "revision feature commit."))
-        l.addStretch(1)
+        btns = QHBoxLayout()
+        self.revise_btn = QPushButton("Begin revision")
+        self.revise_btn.setToolTip(
+            "Revise the selected scene's captured active chain passage by "
+            "passage using saved critiques/<scene>.md and/or checks/"
+            "<scene>.md notes (checks/all.md is never substituted)")
+        self.revise_btn.clicked.connect(self.revise_begin)
+        btns.addWidget(self.revise_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        self.revise_label = QLabel("Revision — no session open")
+        self.revise_label.setWordWrap(True)
+        l.addWidget(self.revise_label)
+        self.revise_view = QPlainTextEdit()
+        self.revise_view.setReadOnly(True)
+        self.revise_view.setPlaceholderText(
+            "The active passage shows original text, the full proposed "
+            "text, the word diff and word counts. Nothing changes until "
+            "you press Accept.")
+        l.addWidget(self.revise_view, 2)
+        rbtns = QHBoxLayout()
+        self.revise_accept_btn = QPushButton("Accept")
+        self.revise_accept_btn.setToolTip(
+            "Write the proposed text into the existing node (history "
+            "records the old text; shared ancestors change too, as in the "
+            "CLI), then advance to the next passage")
+        self.revise_accept_btn.clicked.connect(self.revise_accept)
+        rbtns.addWidget(self.revise_accept_btn)
+        self.revise_skip_btn = QPushButton("Skip")
+        self.revise_skip_btn.setToolTip(
+            "Advance without writing this passage")
+        self.revise_skip_btn.clicked.connect(self.revise_skip)
+        rbtns.addWidget(self.revise_skip_btn)
+        self.revise_edit_btn = QPushButton("Edit proposal")
+        self.revise_edit_btn.setToolTip(
+            "Open the built-in editor on the proposal; Save edit keeps it "
+            "as input history and still needs Accept")
+        self.revise_edit_btn.clicked.connect(self.revise_edit_open)
+        rbtns.addWidget(self.revise_edit_btn)
+        self.revise_save_edit_btn = QPushButton("Save edit")
+        self.revise_save_edit_btn.setToolTip(
+            "Save the edited proposal to inputs/revise_<scene>_<node>.md "
+            "with history; the node changes only on Accept")
+        self.revise_save_edit_btn.clicked.connect(self.revise_save_edit)
+        rbtns.addWidget(self.revise_save_edit_btn)
+        self.revise_regen_btn = QPushButton("Regenerate")
+        self.revise_regen_btn.setToolTip(
+            "Repeat this passage's captured request")
+        self.revise_regen_btn.clicked.connect(self.revise_regen)
+        rbtns.addWidget(self.revise_regen_btn)
+        self.revise_quit_btn = QPushButton("Quit")
+        self.revise_quit_btn.setToolTip(
+            "End the session; earlier accepted passages stay saved")
+        self.revise_quit_btn.clicked.connect(self.revise_quit)
+        rbtns.addWidget(self.revise_quit_btn)
+        rbtns.addStretch(1)
+        l.addLayout(rbtns)
+        self.revise_edit_label = QLabel("")
+        l.addWidget(self.revise_edit_label)
+        self.revise_edit = QPlainTextEdit()
+        self.revise_edit.setPlaceholderText(
+            "Edit the proposed passage here; Save edit keeps it as input "
+            "history, Accept is still separate. Empty edits cannot replace "
+            "prose.")
+        self.revise_edit.textChanged.connect(self._rev_edited)
+        l.addWidget(self.revise_edit, 1)
         return box
+
+    # --------------------------------------------------------- revise ops
+
+    def _rev_edited(self):
+        if self._revision is not None and self._rev_editing:
+            self._revision["dirty"] = True
+
+    def _rev_reset(self):
+        self._revision = None
+        self._rev_editing = False
+        self.revise_edit.setPlainText("")
+        self.revise_edit_label.setText("")
+        self._update_revise_view()
+
+    def revise_begin(self):
+        """Start (or restart) the shared revision session for the selected
+        scene; missing notes show the CLI's prerequisite message."""
+        if self._busy:
+            self._status("An operation is running; revision actions are "
+                         "paused until it settles.", error=True)
+            return
+        if not self._session.get("creds_ok"):
+            env = self._session.get("api_key_env") or "the configured key"
+            self._status("Revision is unavailable: supply provider "
+                         f"credentials (api_key in project.json or export "
+                         f"{env}=...).", error=True)
+            return
+        if not self._resolve_rev_dirty("beginning a new revision session"):
+            return
+        scene = self._scene_sel
+        if scene is None:
+            self._status("Select a scene in the sidebar to revise.")
+            return
+
+        def fn(sink, token):
+            session = ro.revise_prepare(self._root, scene, token=token)
+            res = ro.revise_generate(self._root, session, 0,
+                                     provider_factory=self._provider_factory,
+                                     token=token, events=sink)
+            return {"session": session, "psg": res}
+
+        self._dispatch(fn, kind="revise_generate")
+
+    def _advance_revise(self, generate=True):
+        """Advance to the next passage or finish; generation is one op."""
+        rv = self._revision
+        session = rv["session"]
+        session.k += 1
+        if session.k >= len(session.chain):
+            self._finish_revise()
+            return
+        if not generate:
+            return
+
+        def fn(sink, token):
+            res = ro.revise_generate(self._root, session, session.k,
+                                     provider_factory=self._provider_factory,
+                                     token=token, events=sink)
+            return {"session": session, "psg": res}
+
+        self._dispatch(fn, kind="revise_generate")
+
+    def _finish_revise(self):
+        session = self._revision["session"]
+        self._rev_reset()
+        try:
+            fin = ro.revise_finish(self._root, session)
+        except ro.OpError as e:
+            self._status(str(e), error=True)
+            return
+        msg = fin["message"] + " — session complete."
+        if fin["stale"]:
+            msg += " warning: " + fin["stale_message"] + \
+                " (Continuity → Summary only refreshes it.)"
+        self._status(msg)
+        self.refresh(force=True)
+
+    def revise_accept(self):
+        """Accept the active proposal: the node changes in place with
+        history, then the session advances to the next passage."""
+        if self._busy or self._revision is None:
+            return
+        rv = self._revision
+        if self._rev_editing and not self._resolve_rev_dirty("accepting"):
+            return
+        text = rv.get("text") or ""
+        psg = dict(rv["psg"])
+        session = rv["session"]
+        baseline = dict(session.baseline)
+
+        def fn(sink, token):
+            return ro.revise_accept(self._root, session, psg["k"], psg, text,
+                                    baseline=baseline, token=token,
+                                    events=sink)
+
+        self._dispatch(fn, kind="revise_accept")
+
+    def revise_skip(self):
+        if self._busy or self._revision is None:
+            return
+        if self._rev_editing and not self._resolve_rev_dirty("skipping"):
+            return
+        self._advance_revise(generate=True)
+
+    def revise_edit_open(self):
+        if self._busy or self._revision is None:
+            return
+        if self._rev_editing and not self._resolve_rev_dirty(
+                "switching the editor"):
+            return
+        rv = self._revision
+        self.revise_edit.setPlainText(rv.get("text") or "")
+        self.revise_edit_label.setText(
+            f"Editing proposal for {rv['psg']['nid']} — Save edit keeps it "
+            "in inputs/revise_*.md (with history); Accept is still "
+            "separate.")
+        self._rev_editing = True
+        rv["dirty"] = False
+        self._update_revise_ui()
+
+    def revise_save_edit(self):
+        if self._busy or self._revision is None or not self._rev_editing:
+            return
+        rv = self._revision
+        nid, text = rv["psg"]["nid"], self.revise_edit.toPlainText()
+        session = rv["session"]
+
+        def fn(sink, token):
+            return ro.revise_save_edit_input(self._root, session, nid, text,
+                                             token=token)
+
+        self._dispatch(fn, kind="revise_input")
+
+    def _rev_save_input_now(self):
+        rv = self._revision
+        text = self.revise_edit.toPlainText()
+        try:
+            return ro.revise_save_edit_input(self._root, rv["session"],
+                                             rv["psg"]["nid"], text)
+        except ro.OpError as e:
+            self._status(str(e), error=True)
+            return None
+
+    def _resolve_rev_dirty(self, what):
+        if self._revision is None or not self._rev_editing or \
+                not self._revision.get("dirty"):
+            return True
+        pick = self._choice(
+            "Unsaved revision edit",
+            f"The built-in revision editor has unsaved changes. Save them "
+            f"to the existing input history before {what}?",
+            ["Save", "Discard", "Cancel"])
+        if pick == "Save":
+            ok = self._rev_save_input_now() is not None
+            if ok:
+                rv = self._revision
+                rv["text"] = self.revise_edit.toPlainText()
+                self._rev_editing = False
+                self.revise_edit.setPlainText("")
+                self.revise_edit_label.setText("")
+                self._update_revise_view()
+            return ok
+        if pick == "Discard":
+            self._revision["dirty"] = False
+            return True
+        self._status("Cancelled; the edit is kept and nothing changed.")
+        return False
+
+    def revise_regen(self):
+        if self._busy or self._revision is None:
+            return
+        if not self._resolve_rev_dirty("regenerating"):
+            return
+        rv = self._revision
+        session, k = rv["session"], rv["psg"]["k"]
+
+        def fn(sink, token):
+            res = ro.revise_generate(self._root, session, k,
+                                     provider_factory=self._provider_factory,
+                                     token=token, events=sink)
+            return {"session": session, "psg": res}
+
+        self._dispatch(fn, kind="revise_generate")
+
+    def revise_quit(self):
+        if self._busy or self._revision is None:
+            return
+        if not self._resolve_rev_dirty("quitting the revision"):
+            return
+        changed = self._revision["session"].changed
+        self._rev_reset()
+        self._status(f"revised {changed} passages — Quit kept earlier "
+                     "accepted changes; remaining passages were not "
+                     "revised.")
+
+    def _update_revise_view(self):
+        rv = self._revision
+        if rv is None:
+            self.revise_label.setText("Revision — no session open")
+            self.revise_view.setPlainText("")
+        else:
+            psg, text = rv["psg"], rv.get("text") or ""
+            bits = [f"--- {psg['nid']} ({psg['k'] + 1}/{psg['total']}) ---",
+                    "",
+                    "original:",
+                    psg["original"],
+                    "",
+                    "proposed:",
+                    text,
+                    "",
+                    "diff:",
+                    word_diff(psg["original"], text),
+                    "",
+                    f"({ro.words(psg['original'])} -> {ro.words(text)} "
+                    "words)"]
+            warnings = []
+            if not rv.get("ok") and \
+                    not text.upper().startswith("NO CHANGES"):
+                warnings.append("warning: no <passage> tags in the editor "
+                                "output; check it for stray text")
+            if rv.get("finish") == "length":
+                warnings.append("warning: editor output hit max_tokens; it "
+                                "may be truncated")
+            if warnings:
+                bits = warnings + [""] + bits
+            self.revise_view.setPlainText("\n".join(bits))
+            self.revise_label.setText(
+                f"Passage {psg['k'] + 1} of {psg['total']} ({psg['nid']}) — "
+                "nothing changes until you press Accept")
+        self._update_revise_ui()
+
+    def _update_revise_ui(self):
+        busy, rv = self._busy, self._revision
+        has = rv is not None
+        self.revise_btn.setEnabled(not busy)
+        self.revise_accept_btn.setEnabled(
+            has and not busy and bool((rv.get("text") or "").strip())
+            and not (rv.get("ok") is False and
+                     (rv.get("text") or "").upper().startswith("NO CHANGES")))
+        self.revise_skip_btn.setEnabled(has and not busy)
+        self.revise_edit_btn.setEnabled(has and not busy)
+        self.revise_save_edit_btn.setEnabled(
+            has and self._rev_editing and not busy)
+        self.revise_regen_btn.setEnabled(has and not busy)
+        self.revise_quit_btn.setEnabled(has and not busy)
 
     def _build_status_tab(self):
         box = QWidget()
@@ -3075,6 +3387,8 @@ class MainWindow(QMainWindow):
         self._report_edit_dirty = False
         self._report_key = None
         self._report_rows = []
+        self._revision = None
+        self._rev_editing = False
         self._cont = None
         self._cont_editing = None
         self._bind_steering(None)
@@ -3445,6 +3759,7 @@ class MainWindow(QMainWindow):
         self._update_steering_label()
         self._update_continuity_ui()
         self._update_review_ui()
+        self._update_revise_ui()
 
     def _update_draft_actions(self):
         """Generate/Stop/Accept availability with recovery guidance."""
@@ -3943,6 +4258,47 @@ class MainWindow(QMainWindow):
                          + ("" if value["ok"] else "; warning: no <summary> "
                             "tags in the output; check it for stray text")
                          + "; nothing is written until you press Accept.")
+        elif kind == "revise_generate" and isinstance(value, dict):
+            res = value["psg"]
+            if res["text"].upper().startswith("NO CHANGES") or \
+                    res["text"] == res["original"]:
+                value["session"].k += 1
+                if value["session"].k >= len(value["session"].chain):
+                    self._revision = {"session": value["session"],
+                                      "psg": res, "text": res["text"],
+                                      "ok": res["ok"], "dirty": False}
+                    self._finish_revise()
+                else:
+                    self._status("no changes; advancing")
+
+                    def nxt(sink, token):
+                        r = ro.revise_generate(
+                            self._root, value["session"],
+                            value["session"].k,
+                            provider_factory=self._provider_factory,
+                            token=token, events=sink)
+                        return {"session": value["session"], "psg": r}
+
+                    self._dispatch(nxt, kind="revise_generate")
+                return
+            self._revision = {"session": value["session"], "psg": res,
+                              "text": res["text"], "ok": res["ok"],
+                              "dirty": False}
+            self._rev_editing = False
+            self._update_revise_view()
+        elif kind == "revise_accept" and isinstance(value, dict):
+            self.refresh(force=True)
+            self._advance_revise(generate=True)
+        elif kind == "revise_input" and isinstance(value, dict):
+            rv = self._revision
+            if rv is not None:
+                rv["text"] = self.revise_edit.toPlainText()
+                self._rev_editing = False
+                self.revise_edit.setPlainText("")
+                self.revise_edit_label.setText("")
+                self._update_revise_view()
+            self._status(f"saved {value['saved']} (with input history); "
+                         "the node still changes only on Accept")
         elif kind == "continuity_input" and isinstance(value, dict):
             if self._cont is not None:
                 self._cont_after_edit(self.continuity_edit.toPlainText())

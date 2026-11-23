@@ -2803,6 +2803,121 @@ def case_review_reports(root):
     win3.close()
 
 
+def _review_prime_notes(project):
+    """Saved critique/check notes for the revision journeys."""
+    import review_fixtures as rfx
+    rfx.run_cli(project, "critique", [REVIEW_CRITIQUE], args={"scene": "s001"})
+    rfx.run_cli(project, "check", [], args={"scene": "s001"})
+    return project
+
+
+def case_review_revise(root):
+    """Revision pane: shared passage session with Accept/Skip/Edit/
+    Regenerate/Quit, in-place node effects, prerequisite errors and stale
+    refusal (task 1.5)."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _review_project(root, "p")
+    sums = {"scenes": {"s001": {"detailed": "d", "brief": "b",
+                                "updated": "x", "text_hash": "h"}},
+            "arcs": []}
+    _write_json(project / "summaries.json", sums)
+    fake = ReviewChatFake([REVIEW_PASSAGE,
+                           "<passage>She ticks off every pane.</passage>",
+                           REVIEW_PASSAGE, REVIEW_PASSAGE, REVIEW_PASSAGE,
+                           REVIEW_PASSAGE, REVIEW_PASSAGE])
+    win = gw.MainWindow(str(project), choice=_no_dialogs("review revise"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.tabs.setCurrentIndex(gw.REVISION)
+
+    # no notes: the CLI prerequisite message, no request
+    n0 = len(fake.calls)
+    win.revise_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "no notes for s001" in win.status.text()
+    assert len(fake.calls) == n0
+
+    # with notes: session begins on passage 1
+    _review_prime_notes(project)
+    win.refresh(force=True)
+    win.revise_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._revision is not None and win._revision["psg"]["nid"] == "n1"
+    assert "Mara counts the lit windows." in win.revise_view.toPlainText()
+    assert "Mara pushed the gate open." in win.revise_view.toPlainText()
+    assert "[-counts-]{+pushed+}" in win.revise_view.toPlainText()
+    assert "(5 -> 5 words)" in win.revise_view.toPlainText()
+
+    # accept: the node changes in place with history; session advances
+    win.revise_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert tree["nodes"]["n1"]["text"] == "Mara pushed the gate open."
+    assert tree["nodes"]["n1"]["history"][-1]["by"] == "revise"
+    assert win._revision["psg"]["nid"] == "n2", "the session advanced"
+    assert "She ticks off each pane." in win.revise_view.toPlainText()
+
+    # skip leaves the node untouched; the session completes
+    win.revise_skip_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert tree["nodes"]["n2"]["text"] == "She ticks off each pane.", \
+        "skip never writes"
+    assert tree["nodes"]["n2"]["history"] == []
+    assert win._revision is None, "the session completed after the last skip"
+
+    # session complete: revised count and the stale recovery action
+    assert "revised 1 passages" in win.status.text()
+    assert "stale" in win.status.text().lower()
+    assert "Summary only" in win.status.text()
+
+    # a fresh session: passage 1 is now identical to the accepted node text,
+    # so the shared session advances with no save; edit the n2 proposal,
+    # Save keeps input history, then regenerate repeats the captured
+    # request, and Quit keeps earlier saves
+    _review_prime_notes(project)
+    win.refresh(force=True)
+    win.revise_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._revision["psg"]["nid"] == "n2", \
+        "an identical first passage advances without a save"
+    before_calls = len(fake.calls)
+    win.revise_edit_btn.click()
+    win.revise_edit.setPlainText("Edited proposal.")
+    win.revise_save_edit_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "inputs" / "revise_s001_n2.md").read_text() == \
+        "Edited proposal."
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert tree["nodes"]["n2"]["text"] == "She ticks off each pane.", \
+        "saving an edit never changes the node"
+    win.revise_regen_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == before_calls + 1, "regenerate made one call"
+    win.revise_quit_btn.click()
+    assert win._revision is None
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert tree["nodes"]["n2"]["text"] == "She ticks off each pane.", \
+        "Quit retains earlier accepted changes"
+
+    # stale refusal: the tree changed under the open session
+    win.revise_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._revision["psg"]["nid"] == "n2"
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    tree["nodes"]["n1"]["text"] = "externally edited"
+    _write_json(project / "trees" / "s001.json", tree)
+    win.revise_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "changed on disk" in win.status.text()
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    assert tree["nodes"]["n1"]["text"] == "externally edited"
+    win.revise_quit_btn.click()
+    win.close()
+
+
 def case_review_journey(root):
     """Completed scenes → continuity → compression → reports → revision →
     status → picked export → reopen, compared with fixed-clock CLI fixtures
@@ -3070,6 +3185,7 @@ CASES = {
     "case_review_update_state": case_review_update_state,
     "case_review_compress": case_review_compress,
     "case_review_reports": case_review_reports,
+    "case_review_revise": case_review_revise,
     "case_review_journey": case_review_journey,
 }
 

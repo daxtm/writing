@@ -745,3 +745,215 @@ def test_ops_check_stale_refusal(project, tmp_path):
                       baseline=out["baseline"])
     assert e.value.stale
     assert not (ops_root / "checks" / "all.md").exists()
+
+
+# ---------------------------------------------------------------- revise
+
+def _prime_notes(project):
+    rf.run_cli(project, "critique", [CRITIQUE_TEXT], args={"scene": "s001"})
+    rf.run_cli(project, "check", [], args={"scene": "s001"})
+
+
+def test_revise_accept_both_transcript_and_history(project):
+    _prime_notes(project)
+    t, snap, calls = rf.run_cli(
+        project, "revise",
+        [PASSAGE_1, "<passage>She ticks off every pane.</passage>"],
+        args={"scene": "s001"})
+    assert t == ("\n--- n1 (1/2) ---\n"
+                 "Mara [-counts-]{+pushed+} the [-lit-]{+gate+} "
+                 "[-windows.-]{+open.+}\n"
+                 "\n--- n2 (2/2) ---\n"
+                 "She ticks off [-each-]{+every+} pane.\n"
+                 "revised 2 passages\n")
+    tree = json.loads(snap["trees/s001.json"])
+    assert tree["nodes"]["n1"]["text"] == "Mara pushed the gate open."
+    assert tree["nodes"]["n1"]["history"] == [
+        {"time": "(TS)", "text": "Mara counts the lit windows.",
+         "by": "revise"}]
+    assert tree["nodes"]["n2"]["text"] == "She ticks off every pane."
+    assert tree["head"] == "n2" and tree["counter"] == 2, \
+        "node ids, head, branches and metadata stay unchanged"
+    assert calls[0][3] == 1600, \
+        "the output cap is max(editor.max_tokens, 2*words(original))"
+
+
+def test_revise_accept_then_skip_updates_preceding_tail(project):
+    _prime_notes(project)
+    t, snap, calls = rf.run_cli(project, "revise",
+                                [PASSAGE_1, "NO CHANGES"],
+                                args={"scene": "s001"})
+    assert t == ("\n--- n1 (1/2) ---\n"
+                 "Mara [-counts-]{+pushed+} the [-lit-]{+gate+} "
+                 "[-windows.-]{+open.+}\n"
+                 "\n--- n2 (2/2) ---\nno changes\nrevised 1 passages\n")
+    tree = json.loads(snap["trees/s001.json"])
+    assert tree["nodes"]["n2"]["text"] == "She ticks off each pane."
+    assert tree["nodes"]["n2"]["history"] == []
+    user2 = calls[1][2][1]["content"]
+    assert "# Text just before the passage" in user2
+    assert "...Mara pushed the gate open.\n\n" in user2, \
+        "the preceding tail is the last 900 chars of the now-current text"
+
+
+def test_revise_notes_prerequisites_exclude_all(project):
+    t, _, _ = rf.run_cli(project, "revise", [], args={"scene": "s001"})
+    assert t == (f"error: no notes for s001: run critique {project} "
+                 f"--scene s001 and/or check {project} --scene s001 first\n")
+    rf.run_cli(project, "check", [])
+    t, _, _ = rf.run_cli(project, "revise", [], args={"scene": "s001"})
+    assert t.startswith("error: no notes for s001:"), \
+        "checks/all.md is never substituted for the scene note"
+
+
+def test_revise_no_changes_untagged_and_empty(project):
+    _prime_notes(project)
+    t, snap, _ = rf.run_cli(project, "revise", ["NO CHANGES", "no tags"],
+                            args={"scene": "s001"})
+    assert t == ("\n--- n1 (1/2) ---\nno changes\n"
+                 "\n--- n2 (2/2) ---\n"
+                 "warning: no <passage> tags in the editor output; check it "
+                 "for stray text\n"
+                 "[-She-]{+no+} [-ticks off each pane.-]{+tags+}\n"
+                 "revised 1 passages\n")
+    # an empty edit accepted advances without writing
+    t, snap, calls = rf.run_cli(
+        project, "revise", [PASSAGE_1, "NO CHANGES"], answers=["e", "a"],
+        args={"scene": "s001"}, edits={"revise_s001_n1": ""})
+    tree = json.loads(snap["trees/s001.json"])
+    assert tree["nodes"]["n1"]["text"] == "Mara counts the lit windows."
+    assert tree["nodes"]["n1"]["history"] == []
+    assert "revised 0 passages" in t
+
+
+def test_revise_edit_implies_accept_and_input_history(project):
+    _prime_notes(project)
+    t, snap, _ = rf.run_cli(
+        project, "revise", [PASSAGE_1, "NO CHANGES"], answers=["e", "a"],
+        args={"scene": "s001"},
+        edits={"revise_s001_n1": "Edited passage."})
+    assert t == ("\n--- n1 (1/2) ---\n"
+                 "Mara [-counts-]{+pushed+} the [-lit-]{+gate+} "
+                 "[-windows.-]{+open.+}\n"
+                 "\n--- n2 (2/2) ---\nno changes\nrevised 1 passages\n")
+    assert snap["inputs/revise_s001_n1.md"] == "Edited passage."
+    assert snap["inputs/history/revise_s001_n1_(STAMP).md"] == \
+        "Edited passage."
+    tree = json.loads(snap["trees/s001.json"])
+    assert tree["nodes"]["n1"]["text"] == "Edited passage."
+
+
+def test_revise_regenerate_repeats_prompt(project):
+    _prime_notes(project)
+    t, snap, calls = rf.run_cli(
+        project, "revise", ["junk", PASSAGE_1, "NO CHANGES"],
+        answers=["r", "a"], args={"scene": "s001"})
+    assert t.count("--- n1 (1/2) ---") == 2, "regeneration repeats the header"
+    assert calls[0][2] == calls[1][2] and calls[0][3] == calls[1][3], \
+        "regeneration repeats the captured request"
+    assert t == ("\n--- n1 (1/2) ---\n"
+                 "warning: no <passage> tags in the editor output; check it "
+                 "for stray text\n"
+                 "[-Mara counts the lit windows.-]{+junk+}\n"
+                 "\n--- n1 (1/2) ---\n"
+                 "Mara [-counts-]{+pushed+} the [-lit-]{+gate+} "
+                 "[-windows.-]{+open.+}\n"
+                 "\n--- n2 (2/2) ---\nno changes\nrevised 1 passages\n")
+
+
+def test_revise_quit_retains_saves_and_skips_stale_warning(project):
+    _prime_notes(project)
+    t, snap, _ = rf.run_cli(project, "revise",
+                            [PASSAGE_1, "<passage>unused</passage>"],
+                            answers=["a", "q"], args={"scene": "s001"})
+    assert t == ("\n--- n1 (1/2) ---\n"
+                 "Mara [-counts-]{+pushed+} the [-lit-]{+gate+} "
+                 "[-windows.-]{+open.+}\n"
+                 "\n--- n2 (2/2) ---\n"
+                 "[-She ticks off each pane.-]{+unused+}\n"
+                 "revised 1 passages\n")
+    tree = json.loads(snap["trees/s001.json"])
+    assert tree["nodes"]["n1"]["text"] == "Mara pushed the gate open."
+    assert tree["nodes"]["n2"]["text"] == "She ticks off each pane."
+    assert "stale" not in t, "Quit keeps the CLI's completion-only warning"
+
+
+def test_revise_stale_warning_on_normal_completion(project):
+    _prime_notes(project)
+    sums = {"scenes": {"s001": {"detailed": "d", "brief": "b",
+                                "updated": "x", "text_hash": "h"}},
+            "arcs": []}
+    (project / "summaries.json").write_text(
+        json.dumps(sums, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, snap, _ = rf.run_cli(project, "revise", [PASSAGE_1, "NO CHANGES"],
+                            args={"scene": "s001"})
+    assert t.endswith(
+        "revised 1 passages\n"
+        f"warning: summary for s001 is now stale (run: update-state "
+        f"{project} --scene s001 --summary-only)\n")
+
+
+def test_revise_continuation_keep_lead(project):
+    _prime_notes(project)
+    tree = json.loads((project / "trees" / "s001.json").read_text())
+    tree["nodes"]["n2"]["sep"] = ""
+    tree["nodes"]["n2"]["text"] = "  She ticks off each pane."
+    (project / "trees" / "s001.json").write_text(
+        json.dumps(tree, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, snap, _ = rf.run_cli(
+        project, "revise",
+        ["NO CHANGES", "<passage>Ticks every pane.</passage>"],
+        args={"scene": "s001"})
+    tree = json.loads(snap["trees/s001.json"])
+    assert tree["nodes"]["n2"]["text"] == "  Ticks every pane.", \
+        "continuation leading whitespace is preserved (keep_lead)"
+
+
+# -------------------------------------------------------------- revise ops
+
+def test_ops_revise_parity(project, tmp_path):
+    _prime_notes(project)
+    ops_root = _copy(project, tmp_path)
+    t, cli_snap, calls = rf.run_cli(project, "revise",
+                                    [PASSAGE_1, "NO CHANGES"],
+                                    args={"scene": "s001"})
+    session = ro.revise_prepare(str(ops_root), "s001")
+    res = ro.revise_generate(str(ops_root), session, 0,
+                             provider_factory=lambda p: FakeProvider([PASSAGE_1]))
+    assert res["msgs"] == calls[0][2] and res["cap"] == calls[0][3]
+    ro.revise_accept(str(ops_root), session, 0, res, res["text"])
+    assert session.changed == 1
+    fin = ro.revise_finish(str(ops_root), session)
+    assert fin["message"] == "revised 1 passages"
+    assert rf.snapshot(ops_root) == cli_snap
+
+
+def test_ops_revise_accept_refuses_stale_tree(project, tmp_path):
+    _prime_notes(project)
+    ops_root = _copy(project, tmp_path)
+    session = ro.revise_prepare(str(ops_root), "s001")
+    psg = ro.revise_passage(str(ops_root), session, 0)
+    tree = json.loads((ops_root / "trees" / "s001.json").read_text())
+    tree["nodes"]["n1"]["text"] = "external"
+    (ops_root / "trees" / "s001.json").write_text(
+        json.dumps(tree, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    with pytest.raises(ro.OpError) as e:
+        ro.revise_accept(str(ops_root), session, 0, psg, "Mara pushed.")
+    assert e.value.stale
+    tree = json.loads((ops_root / "trees" / "s001.json").read_text())
+    assert tree["nodes"]["n1"]["text"] == "external"
+
+
+def test_ops_revise_notes_changed_requires_new_session(project, tmp_path):
+    _prime_notes(project)
+    ops_root = _copy(project, tmp_path)
+    session = ro.revise_prepare(str(ops_root), "s001")
+    (ops_root / "critiques" / "s001.md").write_text("external\n",
+                                                   encoding="utf-8")
+    psg = ro.revise_passage(str(ops_root), session, 0)
+    with pytest.raises(ro.OpError) as e:
+        ro.revise_accept(str(ops_root), session, 0, psg, "Mara pushed.")
+    assert e.value.stale, "changed notes invalidate the session baseline"

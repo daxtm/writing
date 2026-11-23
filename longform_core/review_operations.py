@@ -20,8 +20,8 @@ from .cancel import Cancelled
 from .checks import check_report
 from .config import CRITIC_SYSTEM, EDITOR_SYSTEM, SUMMARIZER_SYSTEM
 from .draft_operations import (OpError, _advance, _capture, _check_tree_writable,
-                               _emit, _project_of, _provider, _stale_check,
-                               _tree)
+                               _emit, _project_of, _provider, _save_tree,
+                               _stale_check, _tree)
 from .prompt import format_card, layered_summary
 from .reader_model import _no_symlink_below
 from .tree import Tree
@@ -401,6 +401,174 @@ def check_save(root, name, report, *, baseline=None, token=None, events=None):
     _advance(p, baseline, f"checks/{name}.md")
     _emit(events, "saved", report=f"checks/{name}.md")
     return {"name": name, "path": str(out), "message": f"wrote {out}"}
+
+
+# ================================================================ revise
+
+@dataclass
+class ReviseSession:
+    scene_id: str
+    chain: list
+    k: int = 0
+    changed: int = 0
+    notes_text: str = ""
+    baseline: dict = field(default_factory=dict)
+    finished: bool = False
+
+
+def revise_prepare(root, scene_id, *, token=None):
+    """Begin a revision session: captured chain and saved notes (critique
+    then scene check; checks/all.md is never substituted)."""
+    p = _project_of(root)
+    scenes = _scenes(p)
+    _find_idx(scenes, scene_id) or _require_scene(scenes, scene_id)
+    tree = _tree(p, scene_id)
+    if not tree.head:
+        raise OpError(f"scene {scene_id} has no text")
+    notes = []
+    for path in (p.f("critiques", f"{scene_id}.md"),
+                 p.f("checks", f"{scene_id}.md")):
+        if path.exists():
+            notes.append(read_text(path).strip())
+    if not notes:
+        raise OpError(f"no notes for {scene_id}: run critique {p.root} "
+                      f"--scene {scene_id} and/or check {p.root} --scene "
+                      f"{scene_id} first")
+    baseline = _capture(p, ["project.json", "scenes.json", "summaries.json",
+                            "bible.md", "state.md", "limits.json",
+                            "calib.json", f"trees/{scene_id}.json",
+                            f"critiques/{scene_id}.md",
+                            f"checks/{scene_id}.md"])
+    if token:
+        token.check()
+    return ReviseSession(scene_id=scene_id, chain=tree.chain(),
+                         notes_text="\n\n".join(notes), baseline=baseline)
+
+
+def _require_scene(scenes, scene_id):
+    if _find_idx(scenes, scene_id) is None:
+        raise OpError(f"no scene with id {scene_id}")
+
+
+def revise_passage(root, session, k):
+    """The exact captured request for passage k (re-read from the saved tree
+    so earlier accepted edits are visible, as in the CLI)."""
+    p = _project_of(root)
+    scenes = _scenes(p)
+    idx = _find_idx(scenes, session.scene_id)
+    if idx is None:
+        raise OpError(f"no scene with id {session.scene_id}", stale=True)
+    sc = scenes[idx]
+    tree = _tree(p, session.scene_id)
+    if k < 0 or k >= len(session.chain):
+        raise OpError("no such passage", soft=True)
+    nid = session.chain[k]
+    if nid not in tree.d["nodes"]:
+        raise OpError(f"node {nid} is no longer present; restart the "
+                      "revision session", stale=True)
+    n = tree.node(nid)
+    prev_tail = tree.text(session.chain[k - 1])[-900:] if k > 0 else ""
+    cast = ", ".join(sc.get("characters") or [])
+    user = (
+        f"# Story bible (style rules apply)\n"
+        f"{read_text(p.f('bible.md')).strip()}\n\n"
+        + (f"# Characters present in this scene\n{cast}\n\n" if cast else "")
+        + f"# Editor's notes for this scene\n{session.notes_text}\n\n"
+        + (f"# Text just before the passage (context only, do not output "
+           f"it)\n...{prev_tail}\n\n" if prev_tail else "")
+        + f"# Passage to revise\n{n['text'].strip()}\n\n"
+        "Fix only the listed problems that occur in this passage. If none "
+        "occur in it, answer NO CHANGES. Otherwise answer with the full "
+        "revised passage. " + tag_instr("passage")
+    )
+    msgs = [{"role": "system", "content": EDITOR_SYSTEM},
+            {"role": "user", "content": user}]
+    cap = max(int(p.cfg["roles"]["editor"]["max_tokens"]),
+              int(words(n["text"]) * 2))
+    return {"nid": nid, "k": k, "total": len(session.chain),
+            "original": n["text"].strip(), "msgs": msgs, "cap": cap,
+            "sep_empty": n.get("sep") == ""}
+
+
+def revise_generate(root, session, k, *, provider=None, provider_factory=None,
+                    token=None, events=None):
+    """One editor chat call for passage k; nothing written."""
+    p = _project_of(root)
+    psg = revise_passage(root, session, k)
+    if token:
+        token.check()
+    _emit(events, "progress",
+          msg=f"revising {psg['nid']} ({psg['k'] + 1}/{psg['total']})...")
+    provider = provider or _provider(p, provider_factory)
+    try:
+        raw, finish, _ = provider.chat("editor", psg["msgs"],
+                                       max_tokens=psg["cap"], token=token,
+                                       on_retry_event=(lambda why, delay:
+                                                       _emit(events, "retry"))
+                                                      if events else None)
+    except Cancelled:
+        raise
+    except (HttpErr, NoAnswerErr) as e:
+        raise OpError(f"editor failed: {e}", soft=True) from None
+    _advance(p, session.baseline, "calib.json")
+    text, ok = extract_tagged(raw, "passage")
+    return dict(psg, text=text, ok=ok, finish=finish)
+
+
+def revise_save_edit_input(root, session, nid, text, *, token=None):
+    """Keep the edited proposal in inputs/revise_<scene>_<node>.md plus
+    history; the node still needs Accept."""
+    p = _project_of(root)
+    if token:
+        token.check()
+    save_input(p.root, f"revise_{session.scene_id}_{nid}", text)
+    return {"saved": f"inputs/revise_{session.scene_id}_{nid}.md"}
+
+
+def revise_accept(root, session, k, psg, text, *, baseline=None, token=None,
+                  events=None):
+    """Accept one passage: history + in-place text change on the existing
+    node (shared ancestors on other branches change too, as in the CLI);
+    head/branches/separators/metadata are untouched."""
+    if not (text or "").strip():
+        raise OpError("empty text cannot replace prose", soft=True)
+    p = _project_of(root)
+    baseline = dict(session.baseline if baseline is None else baseline)
+    if token:
+        token.check()
+    _stale_check(p, baseline)
+    tree = _tree(p, session.scene_id)
+    nid = psg["nid"]
+    if nid not in tree.d["nodes"]:
+        raise OpError(f"node {nid} is no longer present; restart the "
+                      "revision session", stale=True)
+    n = tree.node(nid)
+    new = text
+    if psg.get("sep_empty"):
+        new = keep_lead(n["text"], new)
+    n["history"].append({"time": _utils.now(), "text": n["text"],
+                         "by": "revise"})
+    n["text"] = new
+    _save_tree(tree, p, session.scene_id, baseline)
+    session.baseline = baseline
+    session.changed += 1
+    _emit(events, "accepted", nid=nid, changed=session.changed)
+    return {"nid": nid, "changed": session.changed}
+
+
+def revise_finish(root, session):
+    """Normal completion facts: revised count and the CLI's
+    normal-completion-only stale-summary warning."""
+    p = _project_of(root)
+    rec = _sums(p)["scenes"].get(session.scene_id)
+    stale = bool(session.changed) and rec is not None
+    return {"changed": session.changed,
+            "message": f"revised {session.changed} passages",
+            "stale": stale,
+            "stale_message": (f"summary for {session.scene_id} is now stale "
+                              f"(run: update-state {p.root} --scene "
+                              f"{session.scene_id} --summary-only)")
+            if stale else ""}
 
 
 # ============================================================ update state
