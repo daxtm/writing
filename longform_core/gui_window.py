@@ -35,7 +35,7 @@ PRE_START_GUIDANCE = (
 REFRESH_MS = 2000
 
 # Tabs
-MANUSCRIPT, BRANCHES, DRAFT, SCENE, CONTEXT, NOTES = 0, 1, 2, 3, 4, 5
+MANUSCRIPT, BRANCHES, DRAFT, SCENE, CONTEXT, LORE, NOTES = 0, 1, 2, 3, 4, 5, 6
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -98,7 +98,7 @@ class MainWindow(QMainWindow):
         self._choice = choice or _ask_choice
         self._timer_factory = timer_factory
         self._provider_factory = provider_factory
-        self._picker = picker
+        self._picker = picker or self._default_picker
 
         self.snap = None              # last valid Snapshot
         self._stale_config = False    # required configuration currently invalid
@@ -189,6 +189,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_draft_tab(), "Draft")
         self.tabs.addTab(self._build_scene_tab(), "Scene")
         self.tabs.addTab(self._build_context_tab(), "Context")
+        self.tabs.addTab(self._build_lore_tab(), "Lore")
         self.tabs.addTab(self._build_notes_tab(), "Notes")
         right_l.addWidget(self.tabs, 1)
 
@@ -600,6 +601,197 @@ class MainWindow(QMainWindow):
                                        f"{view.head or '-'}):\n{text}")
         self._update_panes()
 
+    def _build_lore_tab(self):
+        """All discovered books with on/kind/character/role/entries; toggles,
+        classification and picker imports through the shared operations."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.lore_tree = QTreeWidget()
+        self.lore_tree.setHeaderLabels(["Book", "Kind", "Character", "Role",
+                                        "Entries", "On", "Aliases"])
+        self.lore_tree.setRootIsDecorated(False)
+        l.addWidget(self.lore_tree, 1)
+        r1 = QHBoxLayout()
+        self.lore_toggle_btn = QPushButton("Toggle selected")
+        self.lore_toggle_btn.setToolTip("Toggle the selected lorebooks on/off "
+                                        "(CLI lb N)")
+        self.lore_toggle_btn.clicked.connect(self.lore_toggle_selected)
+        r1.addWidget(self.lore_toggle_btn)
+        self.lore_all_on_btn = QPushButton("All on")
+        self.lore_all_on_btn.clicked.connect(lambda: self.lore_set_all(True))
+        r1.addWidget(self.lore_all_on_btn)
+        self.lore_all_off_btn = QPushButton("All off")
+        self.lore_all_off_btn.clicked.connect(lambda: self.lore_set_all(False))
+        r1.addWidget(self.lore_all_off_btn)
+        r1.addWidget(QLabel("Character name"))
+        self.lore_char_edit = self._line()
+        r1.addWidget(self.lore_char_edit)
+        self.lore_char_btn = QPushButton("Set Character + name")
+        self.lore_char_btn.clicked.connect(self.lore_set_char)
+        r1.addWidget(self.lore_char_btn)
+        r1.addStretch(1)
+        l.addLayout(r1)
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("Aliases (comma-separated)"))
+        self.lore_alias_edit = self._line()
+        r2.addWidget(self.lore_alias_edit)
+        self.lore_alias_btn = QPushButton("Set aliases")
+        self.lore_alias_btn.clicked.connect(self.lore_set_aliases)
+        r2.addWidget(self.lore_alias_btn)
+        self.lore_world_btn = QPushButton("Mark World")
+        self.lore_world_btn.clicked.connect(self.lore_set_world)
+        r2.addWidget(self.lore_world_btn)
+        r2.addStretch(1)
+        l.addLayout(r2)
+        r3 = QHBoxLayout()
+        self.lore_import_btn = QPushButton("Import JSON/PNG lorebook or card…")
+        self.lore_import_btn.setToolTip("Reads the picked file with the "
+                                        "existing card/World Info parsing, "
+                                        "copies unchanged bytes into "
+                                        "lorebooks/ and runs discovery; "
+                                        "cancelling or an invalid file writes "
+                                        "nothing")
+        self.lore_import_btn.clicked.connect(self.lore_import)
+        r3.addWidget(self.lore_import_btn)
+        r3.addStretch(1)
+        l.addLayout(r3)
+        self.lore_note = QLabel("")
+        self.lore_note.setWordWrap(True)
+        l.addWidget(self.lore_note)
+        return box
+
+    def _lore_refresh(self):
+        """Rebuild the lore list; classification rows come from the shared op."""
+        scene = self._scene_sel
+        if scene is None or self.snap is None:
+            self.lore_tree.clear()
+            self.lore_note.setText("select a scene to classify roles")
+            return
+        try:
+            rows = dop.lore_rows(self._root, scene)
+            self.lore_note.setText("")
+        except dop.OpError as e:
+            self.lore_note.setText(f"(lore unavailable: {e})")
+            return
+        current = self.lore_tree.currentItem()
+        want = current.data(0, _ROLE) if current else None
+        self.lore_tree.blockSignals(True)
+        self.lore_tree.clear()
+        for r in rows:
+            item = QTreeWidgetItem([
+                f"{r['n']:>2} {r['file']}", r["kind"], r["who"], r["role"],
+                str(r["entries"]), "on" if r["on"] else "off",
+                ""])
+            item.setData(0, _ROLE, r["n"])
+            self.lore_tree.addTopLevelItem(item)
+        if want is not None:
+            for i in range(self.lore_tree.topLevelItemCount()):
+                if self.lore_tree.topLevelItem(i).data(0, _ROLE) == want:
+                    self.lore_tree.setCurrentItem(self.lore_tree.topLevelItem(i))
+                    break
+        self.lore_tree.blockSignals(False)
+
+    def _lore_selected(self):
+        item = self.lore_tree.currentItem()
+        return item.data(0, _ROLE) if item else None
+
+    def _lore_dispatch(self, mkfn, kind="lore"):
+        if self._busy or self._scene_sel is None:
+            if self._scene_sel is None:
+                self._status("Select a scene first (lore roles are per scene).")
+            return
+        scene = self._scene_sel
+        self._op_scene = scene
+
+        def fn(sink, token):
+            return mkfn(scene, token)
+
+        self._dispatch(fn, kind=kind)
+
+    def lore_toggle_selected(self):
+        k = self._lore_selected()
+        if k is None:
+            self._status("Select a lorebook row to toggle it.")
+            return
+        self._lore_dispatch(lambda scene, token:
+                            dop.lore_toggle(self._root, scene, [k], token=token))
+
+    def lore_set_all(self, on):
+        self._lore_dispatch(lambda scene, token:
+                            dop.lore_set_all(self._root, scene, on, token=token))
+
+    def lore_set_char(self):
+        k = self._lore_selected()
+        if k is None:
+            self._status("Select a lorebook row to classify it.")
+            return
+        name = self.lore_char_edit.text().strip()
+        self._lore_dispatch(lambda scene, token:
+                            dop.lore_set_char(self._root, scene, k, name,
+                                              token=token))
+
+    def lore_set_aliases(self):
+        k = self._lore_selected()
+        if k is None:
+            self._status("Select a lorebook row to set aliases.")
+            return
+        names = [x.strip() for x in self.lore_alias_edit.text().split(",")]
+        self._lore_dispatch(lambda scene, token:
+                            dop.lore_set_aliases(self._root, scene, k, names,
+                                                 token=token))
+
+    def lore_set_world(self):
+        k = self._lore_selected()
+        if k is None:
+            self._status("Select a lorebook row to classify it.")
+            return
+        self._lore_dispatch(lambda scene, token:
+                            dop.lore_set_world(self._root, scene, k, token=token))
+
+    def lore_import(self):
+        """Desktop picker import; no selection means no writes."""
+        if self._busy:
+            return
+        src = self._picker("Pick a World Info JSON or character card (JSON/PNG)")
+        if not src:
+            self._status("No file picked: nothing was written.")
+            return
+        self._import_src = src
+        scene = self._scene_sel
+        self._op_scene = scene
+
+        def fn(sink, token):
+            return dop.lore_import(self._root, src, scene, replace=False,
+                                   token=token, events=sink)
+
+        self._dispatch(fn, kind="import")
+
+    def _default_picker(self, title):
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(self, title, str(self._root),
+                                              "Lorebooks (*.json *.png)")
+        return path or None
+
+    def _on_import_collision(self, err):
+        """Offer Replace/Cancel naming the destination; re-verify baselines."""
+        pick = self._choice(
+            "Import destination exists",
+            str(err) + "\n\nReplace overwrites the destination bytes "
+            "(existing registry metadata for that name is preserved).",
+            ["Replace", "Cancel"])
+        if pick != "Replace":
+            self._status("Import cancelled; destination unchanged.")
+            return
+        scene = self._scene_sel
+        self._op_scene = scene
+
+        def fn(sink, token):
+            return dop.lore_import(self._root, self._import_src, scene,
+                                   replace=True, token=token, events=sink)
+
+        self._dispatch(fn, kind="import")
+
     def _build_notes_tab(self):
         notes_split = QSplitter(Qt.Orientation.Horizontal)
         self.notes_list = QListWidget()
@@ -919,7 +1111,11 @@ class MainWindow(QMainWindow):
                   self.editor_cancel_btn, self.rewind_btn,
                   self.use_as_head_btn, self.delete_node_btn,
                   self.save_pov_btn, self.save_cast_btn,
-                  self.mark_done_btn, self.save_prompt_btn):
+                  self.mark_done_btn, self.save_prompt_btn,
+                  self.lore_toggle_btn, self.lore_all_on_btn,
+                  self.lore_all_off_btn, self.lore_char_btn,
+                  self.lore_alias_btn, self.lore_world_btn,
+                  self.lore_import_btn):
             b.setEnabled(not self._busy and
                          (has_batch if b in (self.accept_btn, self.view_btn,
                                              self.reroll_btn, self.reroll_all_btn,
@@ -1000,6 +1196,9 @@ class MainWindow(QMainWindow):
                          "branches are unchanged.")
         else:
             self._update_steering_ui()
+            if getattr(value, "collision", False) and self._op_kind == "import":
+                self._on_import_collision(value)
+                return
             self._status(str(value), error=True)
             if getattr(value, "stale", False):
                 self._status(str(value) + " — Reload (Refresh) or retry.",
@@ -1112,6 +1311,17 @@ class MainWindow(QMainWindow):
         elif kind == "dump" and isinstance(value, dict):
             self._status(f"wrote {value['path']} (exact prompt bytes; "
                          "no provider call)")
+        elif kind in ("lore", "import") and isinstance(value, dict):
+            self.refresh(force=True)
+            if kind == "import":
+                self._status(f"imported {value['imported']} "
+                             f"({value['entries']} entries"
+                             + (f", character {value['card_name']}"
+                                if value.get("card_name") else "")
+                             + (", replaced existing file"
+                                if value.get("replaced") else "") + ")")
+            else:
+                self._status("Lorebooks updated")
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
@@ -1594,6 +1804,7 @@ class MainWindow(QMainWindow):
         self._update_notes()
         self._update_steering_pane()
         self._update_scene_tab()
+        self._lore_refresh()
         self._update_steering_ui()
 
     def _reconcile_selection(self):

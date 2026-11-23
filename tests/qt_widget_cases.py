@@ -1157,6 +1157,122 @@ def case_draft_edit_and_branches(root):
     win.close()
 
 
+def case_draft_lore(root):
+    """Lore pane: listing with roles, individual/all toggles, Character+name,
+    aliases, World, and JSON/PNG import through the existing parser with
+    collision/cancel/invalid handling."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(root, name="p", scenes=[
+        _scene("s001", pov="Mara", characters=["Mara"])])
+    lb = project / "lorebooks"
+    lb.mkdir(exist_ok=True)
+    world = {"entries": {"0": {"comment": "tower", "key": ["tower"],
+                               "content": "The tower overlooks the harbour.",
+                               "constant": True}}}
+    v2 = {"spec": "chara_card_v2", "data": {"name": "Ivo",
+                                            "description": "a smith",
+                                            "character_book": {"entries": []}}}
+    (lb / "world.json").write_text(json.dumps(world), encoding="utf-8")
+    (lb / "mara.json").write_text(json.dumps(
+        {"name": "Mara", "description": "a harbour thief"}), encoding="utf-8")
+    imports = root / "imports"
+    imports.mkdir()
+    (imports / "new.json").write_text(json.dumps(v2), encoding="utf-8")
+    (imports / "bad.json").write_text("{nope", encoding="utf-8")
+
+    answers = ["Replace"]
+    win = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0),
+                        provider_factory=lambda _p: FakeProvider())
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.tabs.setCurrentIndex(gw.LORE)
+    win.refresh(force=True)
+    assert win.lore_tree.topLevelItemCount() == 2, "every discovered book listed"
+    texts = " | ".join(" | ".join(win.lore_tree.topLevelItem(i).text(c)
+                                  for c in range(win.lore_tree.columnCount()))
+                       for i in range(win.lore_tree.topLevelItemCount()))
+    assert "world.json" in texts and "mara.json" in texts
+    assert "off" in texts and "POV" in texts, "on/off and classified role shown"
+
+    # individual toggle via the row checkbox-like button
+    win.lore_tree.setCurrentItem(win.lore_tree.topLevelItem(0))
+    win.lore_toggle_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    reg = json.loads((project / "lorebooks.json").read_text())
+    on = [k for k, v in reg["books"].items() if v["on"]]
+    assert len(on) == 1, "individual toggle flips exactly one book"
+
+    # All off / All on
+    win.lore_all_off_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    reg = json.loads((project / "lorebooks.json").read_text())
+    assert not any(v["on"] for v in reg["books"].values())
+    win.lore_all_on_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    reg = json.loads((project / "lorebooks.json").read_text())
+    assert all(v["on"] for v in reg["books"].values())
+
+    # Character + name and aliases on the selected book, World on the other
+    win.lore_tree.setCurrentItem(win.lore_tree.topLevelItem(0))
+    win.lore_world_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.lore_tree.setCurrentItem(win.lore_tree.topLevelItem(1))
+    win.lore_char_edit.setText("Ivo")
+    win.lore_char_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.lore_alias_edit.setText("M, R")
+    win.lore_alias_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    reg = json.loads((project / "lorebooks.json").read_text())
+    assert reg["books"]["mara.json"]["kind"] == "world", \
+        "World classification applies to the selected row"
+    assert reg["books"]["world.json"]["character"] == "Ivo"
+    assert reg["books"]["world.json"]["aliases"] == ["M", "R"]
+
+    # back to World: an absent character's constant entries never load, so the
+    # tower book returns to world classification for the prompt check
+    win.lore_tree.setCurrentItem(win.lore_tree.topLevelItem(1))
+    win.lore_world_btn.click()
+    assert _pump(a, lambda: not win._busy)
+
+    # toggled-on lore reaches the prompt (no provider call)
+    win.tabs.setCurrentIndex(gw.CONTEXT)
+    win.inspect_btn.click()
+    assert "lore injected:" in win.context_view.toPlainText()
+    assert "tower" in win.context_view.toPlainText()
+
+    # Import: valid file appears; invalid reports errors and writes nothing
+    win.tabs.setCurrentIndex(gw.LORE)
+    win._picker = lambda *a, **k: str(imports / "new.json")
+    win.lore_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "lorebooks" / "new.json").exists()
+    reg = json.loads((project / "lorebooks.json").read_text())
+    assert reg["books"]["new.json"]["character"] == "Ivo", \
+        "existing parsing/discovery classification applies"
+    win.lore_import_btn.click()   # collision: Replace/Cancel offered
+    assert _pump(a, lambda: not win._busy)
+    assert answers == [], "the collision dialog was offered and answered"
+
+    before = (project / "lorebooks.json").read_text()
+    win._picker = lambda *a, **k: str(imports / "bad.json")
+    win.lore_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not valid JSON" in win.status.text()
+    assert (project / "lorebooks.json").read_text() == before, \
+        "invalid imports write nothing"
+
+    # a cancelled picker means no writes
+    win._picker = lambda *a, **k: None
+    win.lore_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "nothing was written" in win.status.text().lower(), \
+        "a cancelled picker means no writes"
+    assert (project / "lorebooks.json").read_text() == before
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -1166,6 +1282,7 @@ CASES = {
     "case_draft_candidate_tray": case_draft_candidate_tray,
     "case_draft_scene_context": case_draft_scene_context,
     "case_draft_edit_and_branches": case_draft_edit_and_branches,
+    "case_draft_lore": case_draft_lore,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,

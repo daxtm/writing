@@ -148,3 +148,27 @@ AttributeError: 'MainWindow' object has no attribute 'view_btn'  (editor/branch 
   "scene" key wedging buttons) is fixed in the ops results and the done
   handler is now exception-guarded.
 - Full suite: 240 passed.
+
+## 1.7 — lore listing, classification and import
+
+- Headless first (`tests/test_lore_ops.py`, 4 tests): CLI `lb`
+  toggle/all/alias/world flows match the shared operations byte-for-byte in
+  `lorebooks.json` AND in the next prepared prompt (matching/injected lore);
+  usage refusals; import rules through the existing parser/discovery for
+  World Info, V1/V2/V3 cards, PNG (tEXt chara) and valid-empty books;
+  invalid/unreadable/no-card inputs write nothing; collision offers
+  Replace/Cancel with the destination named, Replace re-verifies baselines
+  and preserves existing registry metadata.
+- Offscreen `case_draft_lore` written first; red run:
+```
+AttributeError: module 'longform_core.gui_window' has no attribute 'LORE'
+```
+- After implementing the Lore tab (tree listing with role classification,
+  individual toggle, All on/off, Character + name, aliases, Mark World,
+  picker import): the case passes — registry mutations match the ops, a
+  constant entry of an ABSENT character's book is (correctly) not injected
+  until reclassified World, the imported book appears classified via the
+  existing discovery, the collision dialog is offered, invalid imports leave
+  the registry and destination untouched, and a cancelled picker writes
+  nothing. Toggled-on lore reaches the inspected prompt without any call.
+- Full suite: 244 passed.

@@ -17,7 +17,7 @@ import httpx
 from .api import Api, HttpErr, NoAnswerErr
 from .cancel import Cancelled
 from .config import SAMPLING_KEYS
-from .lore import Lore, pov_name
+from .lore import is_present, Lore, pov_name
 from .prompt import build_writer_prompt, clean_continuation, format_card, writer_sampling
 from .reader_model import _no_symlink_below
 from .tree import Tree
@@ -32,11 +32,12 @@ class OpError(Exception):
     (e.g. "generation failed: ..."); `from_die` marks messages that a die()
     call already printed to stderr, so the CLI adapter must not print again."""
 
-    def __init__(self, msg, stale=False, soft=False, from_die=False):
+    def __init__(self, msg, stale=False, soft=False, from_die=False, collision=False):
         super().__init__(msg)
         self.stale = stale
         self.soft = soft
         self.from_die = from_die
+        self.collision = collision
 
 
 def _emit(events, kind, **payload):
@@ -457,6 +458,182 @@ def scene_overview(root):
     scenes = _scenes_or_error(p)
     return [{"id": s["id"], "status": s.get("status", ""), "title": s.get("title", "")}
             for s in scenes]
+
+
+# ------------------------------------------------------------------- lore
+
+def _lore_target(root, scene_id, k):
+    p, scenes, idx, sc = _session(root, scene_id)
+    lore = _lore(p, scenes)
+    books = lore.books()
+    if not isinstance(k, int) or not 1 <= k <= len(books):
+        raise OpError("no such lorebook number", soft=True)
+    return lore, books[k - 1], p, scenes
+
+
+def _save_registry(lore, p, baseline):
+    _stale_check(p, {"lorebooks.json": baseline["lorebooks.json"]})
+    lore.save()
+    _advance(p, baseline, "lorebooks.json")
+
+
+def lore_rows(root, scene_id):
+    """Every discovered book with on/kind/character/role/entries (CLI lb list)."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    lore = _lore(p, scenes)
+    present = sc.get("characters") or []
+    pov = pov_name(sc)
+    rows = []
+    for k, (fname, meta) in enumerate(lore.books(), 1):
+        role, who = "", ""
+        if meta.get("kind") == "character":
+            name = lore.char_name(fname, meta)
+            al = meta.get("aliases", [])
+            if is_present(name, al, [pov]):
+                role = "POV"
+            elif is_present(name, al, present):
+                role = "present"
+            else:
+                role = "not in scene"
+            who = name + (f" ({', '.join(al)})" if al else "")
+        rows.append({"n": k, "file": fname, "on": bool(meta.get("on")),
+                     "kind": meta.get("kind", "world"), "who": who, "role": role,
+                     "entries": len(lore.entries(fname))})
+    return rows
+
+
+def lore_toggle(root, scene_id, numbers, *, token=None):
+    """Toggle lorebooks by 1-based display numbers (CLI lb N [N ...])."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    lore = _lore(p, scenes)
+    books = lore.books()
+    valid = [int(x) for x in numbers if isinstance(x, int) and 1 <= x <= len(books)]
+    if not valid:
+        raise OpError("no such lorebook number", soft=True)
+    baseline = _capture(p, ["lorebooks.json"])
+    if token:
+        token.check()
+    for k in valid:
+        books[k - 1][1]["on"] = not books[k - 1][1].get("on")
+    _save_registry(lore, p, baseline)
+    return {"scene": scene_id, "rows": lore_rows(root, scene_id)}
+
+
+def lore_set_all(root, scene_id, on, *, token=None):
+    """Switch every lorebook on/off (CLI lb all on|off)."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    lore = _lore(p, scenes)
+    books = lore.books()
+    if not books:
+        raise OpError("no lorebooks to switch", soft=True)
+    baseline = _capture(p, ["lorebooks.json"])
+    if token:
+        token.check()
+    for _, meta in books:
+        meta["on"] = bool(on)
+    _save_registry(lore, p, baseline)
+    return {"scene": scene_id, "rows": lore_rows(root, scene_id)}
+
+
+def lore_set_char(root, scene_id, k, name, *, token=None):
+    """Mark book k as a character lorebook for NAME (CLI lb N char NAME)."""
+    lore, (fname, meta), p, scenes = _lore_target(root, scene_id, k)
+    if not name:
+        raise OpError("usage: lb N char NAME", soft=True)
+    baseline = _capture(p, ["lorebooks.json"])
+    if token:
+        token.check()
+    meta["kind"] = "character"
+    meta["character"] = name
+    _save_registry(lore, p, baseline)
+    return {"scene": scene_id, "rows": lore_rows(root, scene_id)}
+
+
+def lore_set_aliases(root, scene_id, k, names, *, token=None):
+    """Set other names the character goes by (CLI lb N alias A, B)."""
+    lore, (fname, meta), p, scenes = _lore_target(root, scene_id, k)
+    baseline = _capture(p, ["lorebooks.json"])
+    if token:
+        token.check()
+    meta["aliases"] = [a.strip() for a in (names or []) if a.strip()]
+    _save_registry(lore, p, baseline)
+    return {"scene": scene_id, "rows": lore_rows(root, scene_id)}
+
+
+def lore_set_world(root, scene_id, k, *, token=None):
+    """Mark book k as a world lorebook (CLI lb N world)."""
+    lore, (fname, meta), p, scenes = _lore_target(root, scene_id, k)
+    baseline = _capture(p, ["lorebooks.json"])
+    if token:
+        token.check()
+    meta["kind"] = "world"
+    _save_registry(lore, p, baseline)
+    return {"scene": scene_id, "rows": lore_rows(root, scene_id)}
+
+
+def lore_import(root, src, scene_id=None, replace=False, *, token=None, events=None):
+    """Import an external World Info/character-book file through the existing
+    parser/discovery: unchanged bytes into lorebooks/, existing classification,
+    registry metadata preserved on Replace, nothing written when invalid."""
+    import base64
+    from .lore import card_png_json, parse_book_data
+
+    p = _project_of(root)
+    scenes = _scenes_or_error(p)
+    src = Path(src)
+    if not src.is_file():
+        raise OpError(f"not a file: {src.name}", soft=True)
+    name = src.name
+    if not name.lower().endswith((".json", ".png")):
+        raise OpError(f"{name}: unsupported lorebook file type (use .json or .png)",
+                      soft=True)
+    try:
+        data = src.read_bytes()
+    except OSError as e:
+        raise OpError(f"{name} could not be read ({type(e).__name__})", soft=True) from None
+    if name.lower().endswith(".png"):
+        d = card_png_json(data)
+        if d is None:
+            raise OpError(f"{name}: no character card data found in this PNG", soft=True)
+        card_name, entries = parse_book_data(d, src.stem)
+    else:
+        try:
+            d = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise OpError(f"{name} is not valid JSON: {e}", soft=True) from None
+        if not isinstance(d, (dict, list)):
+            raise OpError(f"{name} is not a World Info export or character card",
+                          soft=True)
+        card_name, entries = parse_book_data(d, src.stem)
+    if not _no_symlink_below(p.root, "lorebooks", name):
+        raise OpError(f"lorebooks/{name} is a symlink; refusing to write", soft=True)
+    dest = p.f("lorebooks", name)
+    baseline = _capture(p, ["lorebooks.json", "lorebooks/*", f"lorebooks/{name}"])
+    if token:
+        token.check()
+    existed = baseline[f"lorebooks/{name}"] is not None
+    if existed and not replace:
+        raise OpError(f"destination exists: lorebooks/{name} — choose Replace "
+                      "or Cancel", soft=True, collision=True)
+    _stale_check(p, baseline)   # unchanged source/destination baselines
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, dest)
+    except OSError as e:
+        raise OpError(f"lorebooks/{name} could not be written "
+                      f"({type(e).__name__})", soft=True) from None
+    _advance(p, baseline, f"lorebooks/{name}")
+    _advance(p, baseline, "lorebooks/*")
+    lore = _lore(p, scenes)   # existing discovery/classification; known names keep their registry metadata
+    _advance(p, baseline, "lorebooks.json")
+    _emit(events, "imported", name=name)
+    out = {"imported": name, "card_name": card_name, "entries": len(entries),
+           "replaced": existed}
+    if scene_id:
+        out["scene"] = scene_id
+        out["rows"] = lore_rows(root, scene_id)
+    return out
 
 
 # ------------------------------------------------------ session/inspection
