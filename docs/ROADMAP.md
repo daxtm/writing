@@ -80,9 +80,9 @@ sacrificed even though the launcher command stays the same.
 
 ## Phase 4 — Native read-only desktop reader
 
-- [ ] add-desktop-reader — Read active manuscript, every saved branch, and supporting notes in a native Tkinter/ttk window with position-preserving refresh.
+- [x] add-desktop-reader — Read active manuscript, every saved branch, and supporting notes in a native Tkinter/ttk window with position-preserving refresh.
 
-After implementation, observe with
+Observe with
 `uv run --script longform.py gui /path/to/project`: a native project-titled
 read-only window opens and the command blocks until it closes. The left scene
 list includes ID, title, status, words, and a separate retained-tree group.
