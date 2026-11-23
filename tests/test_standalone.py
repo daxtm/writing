@@ -325,11 +325,16 @@ def built(tmp_path_factory, net_guard):
         pytest.fail(f"build script reported success but no artifact at {exe}")
     if not os.access(exe, os.X_OK):
         pytest.fail(f"{exe} is not executable")
+    venv_py = REPO / "build" / "standalone" / "venv" / "bin" / "python"
+    if not venv_py.is_file():
+        pytest.fail(f"build venv interpreter missing at {venv_py}; the build script did not "
+                    "provision its documented build environment")
     copied_dir = tmp_path_factory.mktemp("copied dir with spaces")
     copied = copied_dir / BINARY_NAME
     shutil.copy2(exe, copied)
     copied.chmod(0o755)
-    return types.SimpleNamespace(exe=exe, copied=copied, copied_dir=copied_dir)
+    return types.SimpleNamespace(exe=exe, copied=copied, copied_dir=copied_dir, venv_py=venv_py,
+                                 guard_so=net_guard.so)
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +350,7 @@ def test_copied_binary_runs_help_without_python_uv_or_checkout(built, tmp_path):
     another working directory with an empty PATH dir."""
     work = tmp_path / "work dir with spaces"
     work.mkdir()
-    env = frozen_env(tmp_path, net_guard.so)
+    env = frozen_env(tmp_path, built.guard_so)
     r = run_frozen(built.copied, ["--help"], env=env, cwd=work)
     assert r.returncode == 0, r.stderr
     for cmd in EXPECTED_COMMANDS:
@@ -355,7 +360,7 @@ def test_copied_binary_runs_help_without_python_uv_or_checkout(built, tmp_path):
 def test_copied_binary_init_creates_project_files(built, tmp_path):
     work = tmp_path / "also unrelated cwd"
     work.mkdir()
-    env = frozen_env(tmp_path, net_guard.so)
+    env = frozen_env(tmp_path, built.guard_so)
     proj = tmp_path / "demo project"
     r = run_frozen(built.copied, ["init", str(proj)], env=env, cwd=work)
     assert r.returncode == 0, r.stderr
@@ -368,3 +373,79 @@ def test_copied_binary_init_creates_project_files(built, tmp_path):
         assert (proj / d).is_dir(), d
     cfg = json.loads((proj / "project.json").read_text(encoding="utf-8"))
     assert cfg["title"] == "Untitled"
+
+
+# ---------------------------------------------------------------------------
+# Artifact inspection (tasks 1.2)
+# ---------------------------------------------------------------------------
+
+FORBIDDEN_ARCHIVE_FRAGMENTS = (
+    "myfic", "tests", ".env", "writer_prompt_fixture", "test_standalone",
+    "netguard", "sitecustomize", "56295265",
+)
+
+INSPECT_ARCHIVE_SCRIPT = textwrap.dedent("""
+    import json, sys, tempfile, os
+    from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
+    exe = sys.argv[1]
+    r = CArchiveReader(exe)
+    cnames = list(r.toc)
+    pyz_names = []
+    for n in cnames:
+        if n.endswith(".pyz"):
+            fd, path = tempfile.mkstemp(suffix=".pyz")
+            os.close(fd)
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(r.extract(n))
+                pyz_names = list(ZlibArchiveReader(path).toc)
+            finally:
+                os.unlink(path)
+    libpython_name = [n for n in cnames if n.startswith("libpython")][0]
+    libpython = r.extract(libpython_name)
+    cacert = r.extract("certifi/cacert.pem")
+    print(json.dumps({
+        "carchive": cnames,
+        "pyz": pyz_names,
+        "libpython_name": libpython_name,
+        "has_pyinit_ssl": b"PyInit__ssl" in libpython,
+        "cacert_size": len(cacert),
+        "cacert_head": cacert[:2048].decode("ascii", "replace"),
+    }))
+""")
+
+
+@pytest.fixture(scope="session")
+def archive_contents(built):
+    r = subprocess.run([str(built.venv_py), "-c", INSPECT_ARCHIVE_SCRIPT, str(built.exe)],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        pytest.fail("inspecting the built archive failed:\n" + r.stderr)
+    return json.loads(r.stdout)
+
+
+def test_archive_contains_runtime_modules_ssl_and_ca_data(archive_contents):
+    carchive, pyz = archive_contents["carchive"], archive_contents["pyz"]
+    assert "longform" in carchive, "launcher script not bundled"
+    assert "libpython" in archive_contents["libpython_name"]
+    for mod in ("longform_core", "longform_core.cli", "longform_core.commands",
+                "longform_core.utils", "ssl", "httpx", "httpcore", "anyio", "certifi"):
+        assert mod in pyz, f"{mod} not bundled in the PYZ archive"
+    # _ssl is statically compiled into the bundled libpython on this toolchain
+    assert archive_contents["has_pyinit_ssl"], "no bundled _ssl extension found"
+    assert archive_contents["cacert_size"] > 10000, "certifi CA data missing or empty"
+    assert "BEGIN CERTIFICATE" in archive_contents["cacert_head"]
+
+
+def test_archive_contains_no_private_or_test_inputs(archive_contents):
+    names = archive_contents["carchive"] + archive_contents["pyz"]
+    for fragment in FORBIDDEN_ARCHIVE_FRAGMENTS:
+        assert not any(fragment in n for n in names), f"private/test input {fragment!r} in bundle"
+
+
+def test_build_script_fails_without_uv(tmp_path):
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    r = subprocess.run(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
+                       capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode != 0, "build script must exit nonzero when uv is missing"
+    assert "uv not found" in (r.stderr + r.stdout)

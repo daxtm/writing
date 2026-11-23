@@ -5,6 +5,10 @@
 *.log
 .DS_Store
 
+# --- standalone build outputs (scripts/build-standalone.sh) ---
+/build/standalone/
+/dist/
+
 # --- python ---
 __pycache__/
 *.pyc

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Build the standalone native executable: dist/longform (+ informational sidecars).
+#
+# Supported build host: Linux x86_64, glibc. Build prerequisites: uv (with a
+# provisionable Python 3.11) and network access for provisioning build
+# dependencies. The built application never installs or provisions anything.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+ROOT="$PWD"
+REQ="scripts/standalone-requirements.txt"
+DIST="$ROOT/dist"
+WORK="$ROOT/build/standalone"
+
+err() {
+	echo "build-standalone: error: $*" >&2
+	exit 1
+}
+
+command -v uv >/dev/null 2>&1 || err "uv not found: install uv (https://docs.astral.sh/uv/) to provision the build environment"
+[ "$(uname -s)" = "Linux" ] || err "unsupported OS: $(uname -s) (this build targets Linux x86_64 glibc)"
+[ "$(uname -m)" = "x86_64" ] || err "unsupported architecture: $(uname -m) (this build targets Linux x86_64)"
+if ! { ldd --version 2>&1 | head -1 || true; } | grep -qi "glibc\|GNU libc"; then
+	err "unsupported libc: $(ldd --version 2>&1 | head -1) (this build targets glibc, not musl)"
+fi
+[ -f "$REQ" ] || err "missing pinned build requirements: $REQ"
+
+echo "== build-standalone: provisioning Python 3.11 + pinned build closure"
+# Provisioning may use the network; the built application cannot.
+uv venv --clear --python 3.11 "$WORK/venv" 1>&2 || err "could not provision a Python 3.11 build environment (uv venv failed)"
+PY="$WORK/venv/bin/python"
+uv pip install --python "$PY" -r "$REQ" 1>&2 || err "could not install pinned build requirements from $REQ"
+"$PY" -c 'import sys; assert sys.version_info[:2] == (3, 11), sys.version; import ssl' \
+	|| err "provisioned build Python is unusable"
+
+echo "== build-standalone: freezing longform.py with PyInstaller"
+"$PY" -m PyInstaller \
+	--onefile --console --name longform --clean --noconfirm --noupx --collect-data certifi \
+	--distpath "$DIST" --workpath "$WORK" --specpath "$WORK" \
+	longform.py 1>&2
+
+EXE="$DIST/longform"
+[ -f "$EXE" ] && [ -x "$EXE" ] || err "PyInstaller reported success but $EXE is missing or not executable"
+
+echo "== build-standalone: smoke test"
+"$EXE" --help >/dev/null || err "built executable failed to run --help"
+
+echo "$EXE"
