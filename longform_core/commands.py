@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 
+from . import draft_operations as dop
 from .api import Api, HttpErr, NoAnswerErr
 from .checks import check_report
 from .config import (BIBLE_TEMPLATE, CRITIC_SYSTEM, DEFAULT_CONFIG, EDITOR_SYSTEM, PLANNER_SYSTEM, SAMPLING_KEYS, STATE_TEMPLATE, SUMMARIZER_SYSTEM)
@@ -669,11 +670,14 @@ def pick_candidates(p, tree, sc, scenes, cands, seen, gen):
         m_del = re.fullmatch(r"d\s*(\d+)", c)
         if m_acc and 1 <= int(c) <= len(cands):
             nid = cands[int(c) - 1]
-            tree.head = nid
-            tree.save()
-            if sc["status"] == "planned":
-                sc["status"] = "drafting"
-                p.save_scenes(scenes)
+            try:
+                dop.accept_candidate(p.root, sc["id"], nid)
+            except dop.OpError as e:
+                _op_fail(e, soft_ok=True)
+                continue
+            tree = Tree(p, sc["id"])   # reload the op's own writes
+            scenes = p.scenes()
+            sc = scenes[p.scene_index(scenes, sc["id"])]
             print(f"accepted {nid}")
             if tree.node(nid).get("ended"):
                 if ask("the model signalled scene end. mark scene done? [y/N] ").strip().lower() == "y":
@@ -688,6 +692,7 @@ def pick_candidates(p, tree, sc, scenes, cands, seen, gen):
                 print("no such candidate")
                 continue
             new, streamed = gen(len(ks))
+            tree = Tree(p, sc["id"])
             seen |= set(streamed)
             for k, nid in zip(ks, new):
                 print(f"[{k}] {cands[k - 1]} rerolled -> {nid} (old text kept as a branch)")
@@ -697,6 +702,7 @@ def pick_candidates(p, tree, sc, scenes, cands, seen, gen):
             continue
         if m_add:
             new, streamed = gen(max(1, int(m_add.group(1) or 1)))
+            tree = Tree(p, sc["id"])
             seen |= set(streamed)
             cands.extend(new)
             continue
@@ -714,15 +720,42 @@ def pick_candidates(p, tree, sc, scenes, cands, seen, gen):
         print("unknown choice")
 
 
+def _cli_draft_events(ev):
+    """Print one shared-operation event exactly as cmd_draft always did."""
+    t = ev.get("type")
+    if t == "stream_start":
+        print(col("--- streaming ---", "2"))
+    elif t == "delta":
+        print(ev.get("text", ""), end="", flush=True)
+    elif t == "stream_end":
+        print()
+    elif t == "progress":
+        print(ev.get("msg", ""))
+    elif t in ("candidate_done", "candidate_failed"):
+        print(ev.get("msg", ""), flush=True)
+    elif t == "note":
+        warn(ev.get("text", ""))
+
+
+def _op_fail(e, soft_ok=False):
+    """CLI adapter for shared-operation failures.
+
+    soft failures report like gen() always did; die-originated messages are
+    already on stderr, so the adapter exits without printing twice."""
+    if getattr(e, "soft", False) and soft_ok:
+        print(col(str(e), "31"))
+        return
+    if getattr(e, "from_die", False):
+        raise SystemExit(1)
+    die(str(e))
+
+
 def cmd_draft(p, args):
     scenes = p.scenes()
     if not scenes:
         die(f"no scenes (run: scenes {p.root})")
     preset = p.preset()
     rc = p.cfg["roles"]["writer"]
-    stale = [k for k in SAMPLING_KEYS if k in rc]
-    if stale:
-        warn("writer keys " + ", ".join(stale) + " in project.json are ignored: writer samplers come from the preset")
     if args.scene:
         idx = p.scene_index(scenes, args.scene)
     else:
@@ -730,25 +763,29 @@ def cmd_draft(p, args):
         if idx is None:
             die("all scenes are done (use --scene ID to reopen one)")
     sc = scenes[idx]
-    sums = p.summaries()["scenes"]
-    for s in scenes[:idx]:
-        if s.get("status") != "done":
-            warn(f"earlier scene {s['id']} is not marked done")
-        elif s["id"] not in sums:
-            warn(f"earlier scene {s['id']} has no summary/state update (run: update-state {p.root} --scene {s['id']})")
+    try:
+        info = dop.session_info(p.root, sc["id"])
+    except dop.OpError as e:
+        _op_fail(e)
+    for w in info["warnings"]:
+        warn(w)
     tree = Tree(p, sc["id"])
     lore = Lore(p, scenes)
     passage_words = int(rc.get("passage_words", 220))
     steer = tree.d.get("steer", "")
     if steer:
         print(f"restored steering note: {steer}")
-    api = None
-    _prompt, _params, _extra, ignored, _rep = build_writer_prompt(p, preset, lore, scenes, idx, tree, steer, passage_words)
+    _api_holder = []
+
+    def provider_factory(pp):
+        """One Api per session keeps the sampler fallback across candidates."""
+        if not _api_holder:
+            _api_holder.append(Api(pp))
+        return _api_holder[0]
+
     print(f"writer preset: {preset['preset'].get('name', p.preset_path().name)}  temp {preset['preset'].get('temp')}")
-    if ignored:
-        warn("preset samplers with no Featherless parameter (not sent): " + ", ".join(ignored))
-    if preset["preset"].get("temperature_last"):
-        warn("preset has temperature_last; Featherless doesn't expose sampler order, so the server's default order applies")
+    for w in info["sampler_warnings"]:
+        warn(w)
     print(col(format_card(sc), "36"))
     show_lorebooks(lore, sc)
     if tree.head:
@@ -810,10 +847,13 @@ def cmd_draft(p, args):
                 lore.sync(scenes)
                 lb_command(lore, sc, arg)
             elif cmd in ("c", "cp"):
-                prompt, params, extra, _ig, rep = build_writer_prompt(p, preset, lore, scenes, idx, tree, steer, passage_words)
-                print_report(rep, params, extra)
+                try:
+                    prep = dop.prepare_report(p.root, sc["id"], steer=steer, passage_words=passage_words)
+                except dop.OpError as e:
+                    _op_fail(e)
+                print_report(prep["report"], prep["params"], prep["extra"])
                 if cmd == "cp":
-                    write_text(p.f("last_prompt.txt"), prompt)
+                    write_text(p.f("last_prompt.txt"), prep["prompt"])
                     print(f"wrote {p.f('last_prompt.txt')}")
             elif cmd == "g" or re.fullmatch(r"g\d+", cmd):
                 n = int(cmd[1:]) if len(cmd) > 1 else (int(arg) if arg.isdigit() else int(rc.get("swipes", 1)))
@@ -821,45 +861,28 @@ def cmd_draft(p, args):
                 head_at_start = tree.head
 
                 def gen(count, _head=head_at_start):
-                    """Generate count candidates after _head. One streams live; several run per max_parallel."""
-                    nonlocal api
-                    prompt, params, extra, _ig, rep = build_writer_prompt(p, preset, lore, scenes, idx, tree, steer, passage_words)
-                    for note in rep["notes"]:
-                        warn(note)
-                    if rep["over"]:
-                        print_report(rep, params, extra)
-                        return [], []
-                    api = api or Api(p)
-                    meta = {"scene": sc["id"], "head": _head, "lorebooks": lore.active(),
-                            "present": sc.get("characters") or [], "char": rep["char"], "steer": steer}
+                    """Generate count candidates after _head through the shared
+                    operation. One streams live; several run per max_parallel."""
                     try:
-                        if count == 1:
-                            print(col("--- streaming ---", "2"))
-                            text, finish, _ = api.complete("writer", prompt, params, extra,
-                                                           stream_cb=lambda t: print(t, end="", flush=True), meta=meta)
-                            print()
-                            results, live = [(text, finish, None)], True
-                        else:
-                            print(f"generating {count} candidates (max_parallel {p.cfg['max_parallel']})...")
-                            results = api.many(lambda: api.complete("writer", prompt, params, extra, meta=meta), count)
-                            live = False
-                    except (HttpErr, NoAnswerErr, httpx.HTTPError) as e:
-                        print(col(f"generation failed: {e}", "31"))
+                        r = dop.generate_candidates(
+                            p.root, sc["id"], count=count, parent=_head, steer=steer,
+                            passage_words=passage_words, provider_factory=provider_factory,
+                            events=_cli_draft_events)
+                    except dop.OpError as e:
+                        _op_fail(e, soft_ok=True)
                         return [], []
-                    ids = []
-                    for text, finish, _ in results:
-                        clean, ended, trimmed = clean_continuation(text, finish, rep["continuing"])
-                        if not clean.strip():
-                            continue
-                        ids.append(tree.add(
-                            _head, clean, source="model", sep="" if rep["continuing"] else "\n\n", model=rc["model"],
-                            steer=steer, ended=ended, trimmed=trimmed, finish=finish, lorebooks=lore.active(),
-                            present=sc.get("characters") or [], absent=lore.absent_mentions(sc, clean)))
-                    tree.save()
-                    return ids, (ids if live else [])
+                    if r.over:
+                        print_report(r.report, r.params, r.extra)
+                        return [], []
+                    return list(r.saved), (list(r.saved) if r.streamed else [])
 
                 cands, streamed = gen(n)
-                if pick_candidates(p, tree, sc, scenes, cands, set(streamed), gen) == "done":
+                tree = Tree(p, sc["id"])   # the operation saved candidates itself
+                outcome = pick_candidates(p, tree, sc, scenes, cands, set(streamed), gen)
+                tree = Tree(p, sc["id"])
+                scenes = p.scenes()
+                sc = scenes[p.scene_index(scenes, sc["id"])]
+                if outcome == "done":
                     sc["status"] = "done"
                     p.save_scenes(scenes)
                     print(f"scene {sc['id']} done. next step: update-state {p.root} --scene {sc['id']}")

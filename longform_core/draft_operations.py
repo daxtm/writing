@@ -29,12 +29,14 @@ class OpError(Exception):
 
     `stale` marks a detected external change (offer reload/retry, never
     overwrite); `soft` marks failures the CLI reports without exiting
-    (e.g. "generation failed: ...")."""
+    (e.g. "generation failed: ..."); `from_die` marks messages that a die()
+    call already printed to stderr, so the CLI adapter must not print again."""
 
-    def __init__(self, msg, stale=False, soft=False):
+    def __init__(self, msg, stale=False, soft=False, from_die=False):
         super().__init__(msg)
         self.stale = stale
         self.soft = soft
+        self.from_die = from_die
 
 
 def _emit(events, kind, **payload):
@@ -49,7 +51,7 @@ def _project_of(root):
     try:
         return Project(root)
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
 
 
 def _session(root, scene_id):
@@ -58,7 +60,7 @@ def _session(root, scene_id):
     try:
         scenes = p.scenes()
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
     if not scenes:
         raise OpError("no scenes (run: scenes)")
     idx = next((i for i, s in enumerate(scenes) if s.get("id") == scene_id), None)
@@ -71,28 +73,28 @@ def _tree(p, scene_id):
     try:
         return Tree(p, scene_id)
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
 
 
 def _lore(p, scenes):
     try:
         return Lore(p, scenes)
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
 
 
 def _preset(p):
     try:
         return p.preset()
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
 
 
 def _provider(p, factory):
     try:
         return (factory or (lambda pp: Api(pp)))(p)
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
 
 
 def _find_idx(scenes, scene_id):
@@ -215,7 +217,7 @@ def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
         prompt, params, extra, ignored, rep = build_writer_prompt(
             p, _preset(p), lore, scenes, idx, tree, steer, passage_words)
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
     except OSError as e:
         raise OpError(f"project source could not be read ({type(e).__name__})") from None
     for note in rep["notes"]:
@@ -239,6 +241,7 @@ def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
                                          stream_cb=(lambda t: _emit(events, "delta", text=t)) if events else None,
                                          meta=meta, token=token,
                                          on_retry_event=(lambda kind: _emit(events, kind)) if events else None)]
+            _emit(events, "stream_end")
             streamed = True
         else:
             _emit(events, "progress",
@@ -307,10 +310,13 @@ def accept_candidate(root, scene_id, nid, *, token=None, events=None):
 def session_info(root, scene_id=None):
     """Plain session defaults and prerequisite/warning report (no calls).
 
-    `warnings` mirrors the CLI draft prologue order: ignored project sampler
-    keys, earlier-scene warnings, then preset sampler notes."""
+    `warnings` holds ignored project sampler keys and earlier-scene warnings;
+    `sampler_warnings` holds preset sampler notes. The CLI prints warnings,
+    then its preset line, then sampler warnings — keep that order when
+    adapting; the GUI shows both lists combined."""
     info = {"swipes": 1, "passage_words": 220, "model": "", "preset_found": False,
-            "creds_ok": False, "api_key_env": "", "warnings": [], "scene_ok": False}
+            "creds_ok": False, "api_key_env": "", "warnings": [],
+            "sampler_warnings": [], "scene_ok": False}
     p = _project_of(root)
     scenes = _scenes_or_error(p)
     rc = p.cfg["roles"]["writer"]
@@ -346,14 +352,14 @@ def session_info(root, scene_id=None):
             try:
                 sums = p.summaries()["scenes"]
             except FatalError as e:
-                raise OpError(str(e.msg)) from None
+                raise OpError(str(e.msg), from_die=True) from None
             for s in scenes[:idx]:
                 if s.get("status") != "done":
                     info["warnings"].append(f"earlier scene {s['id']} is not marked done")
                 elif s["id"] not in sums:
                     info["warnings"].append(f"earlier scene {s['id']} has no summary/state update "
                                             f"(run: update-state {p.root} --scene {s['id']})")
-    info["warnings"] += sampler_notes
+    info["sampler_warnings"] = sampler_notes
     return info
 
 
@@ -361,7 +367,7 @@ def _scenes_or_error(p):
     try:
         return p.scenes()
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
 
 
 def prepare_report(root, scene_id, *, steer=None, passage_words=None):
@@ -376,7 +382,7 @@ def prepare_report(root, scene_id, *, steer=None, passage_words=None):
         prompt, params, extra, ignored, rep = build_writer_prompt(
             p, _preset(p), lore, scenes, idx, tree, steer, passage_words)
     except FatalError as e:
-        raise OpError(str(e.msg)) from None
+        raise OpError(str(e.msg), from_die=True) from None
     except OSError as e:
         raise OpError(f"project source could not be read ({type(e).__name__})") from None
     return {"prompt": prompt, "params": params, "extra": extra,
