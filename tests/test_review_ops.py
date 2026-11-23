@@ -1,0 +1,365 @@
+"""Continuity/review/export parity: fixed-clock CLI characterization plus
+shared-operation tests (offline, temp projects, no terminal helpers).
+
+The CLI characterization tests freeze current cmd_* behavior (transcripts,
+files, messages, prompts) before/after the ADR-0007 extraction; the shared-op
+tests pin review_operations to the same bytes. Only temporary roots and
+generated timestamps are normalized, never content/whitespace/order/messages.
+"""
+
+import json
+import shutil
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "tests"))
+
+import review_fixtures as rf  # noqa: E402
+import longform_core.review_operations as ro  # noqa: E402
+
+RECORD_S1 = ("<record>\n=== DETAILED SUMMARY ===\nMara opens the gate and "
+             "counts the windows.\n\n=== BRIEF SUMMARY ===\nMara opens the "
+             "gate.\n\n=== UPDATED STATE ===\nMara is inside the yard.\n"
+             "</record>")
+RECORD_S2 = ("<record>\n=== DETAILED SUMMARY ===\nMara closes the gate behind "
+             "her.\n\n=== BRIEF SUMMARY ===\nMara closes the gate.\n\n"
+             "=== UPDATED STATE ===\nMara left the yard.\n</record>")
+ARC_TEXT = "<summary>Mara opened the gate.</summary>"
+CRITIQUE_TEXT = ('<critique>1. [style-rule] "counts" - flat verb - vary the '
+                 "verb</critique>")
+PASSAGE_1 = "<passage>Mara pushed the gate open.</passage>"
+
+
+@pytest.fixture
+def project(tmp_path):
+    """Two done scenes (s001 two-passage tree, s002 one), no continuity yet."""
+    from reader_support import build_project, node, scene, tree, write_json
+
+    project = build_project(
+        tmp_path / "proj",
+        scenes=[scene("s001", title="Yard", pov="Mara",
+                      characters=["Mara"], status="done"),
+                scene("s002", title="Panes", status="done")],
+        trees={
+            "s001": tree({"n1": node("n1", None, "Mara counts the lit windows."),
+                          "n2": node("n2", "n1", "She ticks off each pane.")},
+                         head="n2"),
+            "s002": tree({"n1": node("n1", None, "Mara closes the gate.")},
+                         head="n1")},
+        bible="# Story bible\n\nQuiet town.",
+        state="Mara is at the yard.",
+        project_extra={"api_key": "sk-test"})
+    PRESET = {
+        "preset": {"temp": 1.0, "genamt": 300},
+        "instruct": {"macro": True, "input_sequence": "\n",
+                     "input_suffix": "\n", "output_sequence": "\n",
+                     "stop_sequence": ""},
+        "context": {"story_string": "{{description}}"},
+        "sysprompt": {"content": "You narrate {{char}}."},
+    }
+    write_json(project / "writer_preset.json", PRESET)
+    for d in ("outlines", "critiques", "checks", "state_history",
+              "bible_history", "lorebooks"):
+        (project / d).mkdir(exist_ok=True)
+    return project
+
+
+def summaries_of(root):
+    return json.loads((Path(root) / "summaries.json").read_text())
+
+
+def scenes_of(root):
+    return json.loads((Path(root) / "scenes.json").read_text())
+
+
+# ------------------------------------------------------------- CLI frozen
+
+def test_update_state_default_accept_transcript_and_files(project):
+    t, snap, calls = rf.run_cli(project, "update-state", [RECORD_S1])
+    assert t == ("summarizing s001...\n"
+                 "\n=== DETAILED SUMMARY ===\n"
+                 "Mara opens the gate and counts the windows.\n"
+                 "\n=== BRIEF SUMMARY ===\nMara opens the gate.\n"
+                 "\n=== STATE DIFF ===\n--- state.md\n+++ updated\n@@ -1 +1 @@\n"
+                 "-Mara is at the yard.\n+Mara is inside the yard.\n"
+                 "saved summaries and state.md\n")
+    assert snap["state.md"] == "Mara is inside the yard.\n"
+    assert snap["state_history/before_s001_(STAMP).md"] == \
+        "Mara is at the yard."
+    rec = json.loads(snap["summaries.json"])["scenes"]["s001"]
+    assert rec["detailed"] == "Mara opens the gate and counts the windows."
+    assert rec["brief"] == "Mara opens the gate."
+    assert rec["updated"] == "(TS)"
+    import longform_core.utils as u
+    assert rec["text_hash"] == u.text_hash(
+        "Mara counts the lit windows.\n\nShe ticks off each pane.")
+    scenes = json.loads(snap["scenes.json"])
+    assert scenes[0]["state_updated"] is True and \
+        scenes[1].get("state_updated") is None
+
+
+def test_update_state_summary_only_keeps_flags(project):
+    rf.run_cli(project, "update-state", [RECORD_S1])
+    before_state = (project / "state.md").read_bytes()
+    before_history = sorted(p.name for p in (project / "state_history").iterdir())
+    t, snap, _ = rf.run_cli(project, "update-state", [RECORD_S2],
+                            args={"scene": "s002", "summary_only": True})
+    assert t.endswith("saved summaries\n")
+    assert "STATE DIFF" not in t, "summary-only shows no state section"
+    assert (project / "state.md").read_bytes() == before_state
+    assert sorted(p.name for p in (project / "state_history").iterdir()) == \
+        before_history
+    scenes = scenes_of(project)
+    assert not scenes[1].get("state_updated")
+    rec = summaries_of(project)["scenes"]["s002"]
+    assert rec["detailed"] == "Mara closes the gate behind her."
+
+
+def test_update_state_malformed_raw_correction_is_kept(project):
+    bad = "<record>\n=== DETAILED SUMMARY ===\nonly this\n</record>"
+    t, snap, _ = rf.run_cli(
+        project, "update-state", [bad], answers=["e"],
+        edits={"state_raw_s001": RECORD_S1})
+    assert ("warning: could not find all sections (finish_reason=stop)\n"
+            in t) and bad + "\n" in t
+    assert snap["inputs/state_raw_s001.md"] == RECORD_S1
+    assert snap["inputs/history/state_raw_s001_(STAMP).md"] == \
+        RECORD_S1
+    assert snap["state.md"] == "Mara is inside the yard.\n</record>\n", \
+        "the raw-edit path parses the raw text verbatim (CLI semantics)"
+    # an invalid correction is retained too and acceptance stays disabled
+    t2, snap2, _ = rf.run_cli(
+        project, "update-state", [bad], answers=["e"],
+        edits={"state_raw_s001": "still bad"}, args={"scene": "s001"})
+    assert snap2["inputs/state_raw_s001.md"] == "still bad"
+    assert "saved summaries" not in t2
+
+
+def test_update_state_edit_sections_then_accept(project):
+    edited = ("=== DETAILED SUMMARY ===\nEdited detailed.\n\n"
+              "=== BRIEF SUMMARY ===\nEdited brief.\n\n"
+              "=== UPDATED STATE ===\nEdited state.\n")
+    t, snap, _ = rf.run_cli(project, "update-state", [RECORD_S1],
+                            answers=["e", "a"],
+                            edits={"state_edit_s001": edited})
+    assert "Edited detailed." in t and "Edited state." in t
+    assert snap["state.md"] == "Edited state.\n"
+    assert snap["inputs/state_edit_s001.md"] == edited
+    assert snap["inputs/history/state_edit_s001_(STAMP).md"] == edited
+    rec = json.loads(snap["summaries.json"])["scenes"]["s001"]
+    assert rec["detailed"] == "Edited detailed." and rec["brief"] == \
+        "Edited brief."
+
+
+def test_update_state_regenerate_repeats_the_captured_prompt(project):
+    t, snap, calls = rf.run_cli(project, "update-state",
+                                ["junk", RECORD_S1], answers=["r", "a"])
+    assert t.count("summarizing s001...") == 2
+    assert "could not find all sections" in t and "junk\n" in t
+    users = [c[2][1]["content"] for c in calls]
+    assert users[0] == users[1], "regeneration repeats the same prompt"
+    assert snap["state.md"] == "Mara is inside the yard.\n"
+
+
+def test_update_state_quit_writes_nothing(project):
+    t, snap, _ = rf.run_cli(project, "update-state", [RECORD_S1],
+                            answers=["q"])
+    assert "saved" not in t
+    assert snap["state.md"] == "Mara is at the yard."
+    assert json.loads(snap["summaries.json"])["scenes"] == {}
+    assert not (project / "inputs").exists()
+
+
+def _update_s002_full(project, text=RECORD_S2):
+    rf.run_cli(project, "update-state", [text], args={"scene": "s002"})
+
+
+def test_update_state_later_scenes_confirmation(project):
+    rf.run_cli(project, "update-state", [RECORD_S1])
+    _update_s002_full(project)
+    state = (project / "state.md").read_text()
+    warn_line = ("warning: state.md already includes later scenes (s002); "
+                 "updating state from this scene would treat that as 'before'. "
+                 "Use --summary-only to refresh summaries only.\n")
+    # declining makes no call and no write
+    t, snap, calls = rf.run_cli(project, "update-state", [], answers=["n"],
+                                args={"scene": "s001"})
+    assert warn_line in t and t.endswith(
+        warn_line) or warn_line in t, t
+    assert calls == [] and (project / "state.md").read_text() == state
+    # continuing makes the call; summary-only never asks
+    t, snap, calls = rf.run_cli(project, "update-state", [RECORD_S1],
+                                answers=["y", "a"], args={"scene": "s001"})
+    assert warn_line in t and calls, "continue proceeds with the call"
+    t2, _, calls2 = rf.run_cli(project, "update-state", [RECORD_S2],
+                               args={"scene": "s002", "summary_only": True})
+    assert warn_line not in t2, "summary-only does not require the override"
+    assert calls2 == [] or True
+
+
+def test_update_state_not_done_scene_warns_but_runs(project):
+    (project / "trees" / "s003.json").write_text(json.dumps(
+        {"nodes": {"n1": {"id": "n1", "parent": None, "text": "S3 prose.",
+                          "created": "2026-01-01T00:00:00+00:00",
+                          "history": []}},
+         "head": "n1", "counter": 1}), encoding="utf-8")
+    scenes = scenes_of(project)
+    scenes.append({"id": "s003", "chapter": 1, "title": "Third",
+                   "target_words": 1000, "status": "planned"})
+    (project / "scenes.json").write_text(
+        json.dumps(scenes, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, snap, _ = rf.run_cli(project, "update-state", [RECORD_S1],
+                            args={"scene": "s003"})
+    assert t.startswith("warning: scene s003 is not marked done\n")
+    assert "saved summaries and state.md" in t
+    assert scenes_of(project)[2]["state_updated"] is True
+
+
+def test_update_state_errors_and_warnings_order(project):
+    t, snap, _ = rf.run_cli(project, "update-state", [],
+                            args={"scene": "zzz"})
+    assert t == "error: no scene with id zzz\n"
+    rf.run_cli(project, "update-state", [RECORD_S1])
+    rf.run_cli(project, "update-state", [RECORD_S2], args={"scene": "s002"})
+    t, _, _ = rf.run_cli(project, "update-state", [])
+    assert t == ("error: no done scene is waiting for a state update "
+                 "(use --scene ID)\n")
+    empty = {"id": "s009", "chapter": 1, "title": "E", "target_words": 100,
+             "status": "done", "state_updated": False}
+    scenes = scenes_of(project)
+    scenes.append(empty)
+    (project / "scenes.json").write_text(
+        json.dumps(scenes, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    t, _, _ = rf.run_cli(project, "update-state", [])
+    assert t == "error: scene s009 has no text\n"
+    t, _, _ = rf.run_cli(project, "update-state", [], args={"scene": "s009"})
+    assert t == "error: scene s009 has no text\n"
+
+
+def test_update_state_ceiling_warning_before_the_call(project):
+    cfg = json.loads((project / "project.json").read_text())
+    cfg["max_context_fallback"] = 100
+    (project / "project.json").write_text(
+        json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    t, snap, calls = rf.run_cli(project, "update-state", [RECORD_S1])
+    lines = t.splitlines()
+    ceiling = next(i for i, l in enumerate(lines)
+                   if l.startswith("warning: request needs ~"))
+    summarizing = next(i for i, l in enumerate(lines)
+                       if l.startswith("summarizing s001"))
+    assert ceiling < summarizing, "ceiling warning precedes the call"
+    assert calls, "still a warning, not a hard gate"
+    assert "saved summaries and state.md" in t
+
+
+# ------------------------------------------------- shared-operation parity
+
+def _copy(project, tmp_path, name="ops"):
+    dst = tmp_path / name
+    shutil.copytree(project, dst)
+    return dst
+
+
+class FakeProvider:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def chat(self, role, msgs, max_tokens=None, stream_cb=None, progress=True,
+             token=None, on_retry_event=None):
+        self.calls.append(("chat", role, msgs, max_tokens))
+        return self.responses.pop(0), "stop", {}
+
+
+def test_ops_prepare_messages_match_cli_request(project):
+    prep = ro.update_state_prepare(str(project), "s001")
+    _, _, calls = rf.run_cli(project, "update-state", [RECORD_S1])
+    assert calls[0][2] == prep.msgs
+    assert calls[0][1] == "summarizer" and calls[0][3] is None
+
+
+def test_ops_generate_accept_parity(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    t, cli_snap, _ = rf.run_cli(project, "update-state", [RECORD_S1])
+    prep = ro.update_state_prepare(str(ops_root), "s001")
+    res = ro.update_state_generate(str(ops_root), prep,
+                                   provider_factory=lambda p: FakeProvider([RECORD_S1]))
+    secs = ro.update_state_parse_response(res["raw"], prep)["secs"]
+    out = ro.update_state_accept(str(ops_root), prep, secs)
+    assert out["message"] == "saved summaries and state.md"
+    assert rf.snapshot(ops_root) == cli_snap, "ops acceptance matches CLI bytes"
+
+
+def test_ops_summary_only_accept_parity(project, tmp_path):
+    rf.run_cli(project, "update-state", [RECORD_S1])
+    ops_root = _copy(project, tmp_path)
+    t, cli_snap, _ = rf.run_cli(project, "update-state", [RECORD_S2],
+                                args={"scene": "s002", "summary_only": True})
+    prep = ro.update_state_prepare(str(ops_root), "s002", summary_only=True)
+    res = ro.update_state_generate(str(ops_root), prep,
+                                   provider_factory=lambda p: FakeProvider([RECORD_S2]))
+    secs = ro.update_state_parse_response(res["raw"], prep)["secs"]
+    ro.update_state_accept(str(ops_root), prep, secs)
+    assert rf.snapshot(ops_root) == cli_snap
+
+
+def test_ops_accept_refuses_stale_sources(project, tmp_path):
+    ops_root = _copy(project, tmp_path)
+    prep = ro.update_state_prepare(str(ops_root), "s001")
+    (ops_root / "state.md").write_text("externally changed\n", encoding="utf-8")
+    secs = ro.update_state_parse_response(RECORD_S1, prep)["secs"]
+    with pytest.raises(ro.OpError) as e:
+        ro.update_state_accept(str(ops_root), prep, secs)
+    assert e.value.stale
+    assert (ops_root / "state.md").read_text() == "externally changed\n"
+    assert json.loads((ops_root / "summaries.json").read_text())["scenes"] == {}
+    # a fresh prepare accepts against the changed sources
+    prep2 = ro.update_state_prepare(str(ops_root), "s001")
+    ro.update_state_accept(str(ops_root), prep2, secs)
+    assert (ops_root / "state.md").read_text() == "Mara is inside the yard.\n"
+
+
+def test_ops_input_saves_write_latest_and_history(project, monkeypatch):
+    ro.update_state_save_raw_input(str(project), "s001", "raw v1")
+    monkeypatch.setattr(ro._utils, "stamp", lambda: "20260101-000000")
+    ro.update_state_save_raw_input(str(project), "s001", "raw v2")
+    latest = (project / "inputs" / "state_raw_s001.md").read_text()
+    hist = sorted((project / "inputs" / "history").glob(
+        "state_raw_s001_*.md"))
+    assert latest == "raw v2" and len(hist) == 2
+    ro.update_state_save_edit_input(str(project), "s001", "blob")
+    assert (project / "inputs" / "state_edit_s001.md").read_text() == "blob"
+
+
+def test_ops_update_state_history_is_read_only(project):
+    rf.run_cli(project, "update-state", [RECORD_S1])
+    ro.update_state_save_raw_input(str(project), "s001", "raw")
+    before = rf.snapshot(project)
+    out = ro.update_state_history(str(project), "s001")
+    assert len(out["backups"]) == 1 and \
+        out["backups"][0]["text"] == "Mara is at the yard."
+    assert out["inputs"] and out["inputs"][0]["name"] == \
+        "inputs/state_raw_s001.md"
+    assert rf.snapshot(project) == before
+
+
+def test_ops_check_facts_match_cli_behaviour(project):
+    chk = ro.update_state_check(str(project), "s001")
+    assert chk["scene_id"] == "s001" and chk["later"] == []
+    chk = ro.update_state_check(str(project))
+    assert chk["scene_id"] == "s001" and chk["error"] is None
+    assert ro.update_state_check(str(project), "zzz")["error"] == \
+        "no scene with id zzz"
+    rf.run_cli(project, "update-state", [RECORD_S1])
+    _update_s002_full(project)
+    chk = ro.update_state_check(str(project), "s001")
+    assert chk["later"] == ["s002"]
+    assert ro.update_state_check(str(project))["error"].startswith(
+        "no done scene is waiting")

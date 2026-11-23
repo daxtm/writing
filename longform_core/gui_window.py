@@ -25,6 +25,7 @@ from .utils import word_diff
 from . import draft_operations as dop
 from . import planning_operations as plan
 from . import reader_model as rm
+from . import review_operations as ro
 from . import scene_steering as ss
 from .cancel import CancellationToken
 from .draft_worker import OpThread
@@ -41,6 +42,7 @@ REFRESH_MS = 2000
 MANUSCRIPT, BRANCHES, DRAFT, SCENE, CONTEXT, LORE, NOTES = 0, 1, 2, 3, 4, 5, 6
 SETUP, BIBLE = 7, 8
 OUTLINE, SCENES = 9, 10
+CONTINUITY, REVIEW, REVISION, STATUS = 11, 12, 13, 14
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -96,7 +98,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, dir_path, *, load=None, timer_factory=None, choice=None,
                  provider_factory=None, picker=None, dir_picker=None,
-                 preset_picker=None):
+                 preset_picker=None, save_picker=None):
         super().__init__()
         self._root = Path(dir_path)
         self._load = load or rm.load_snapshot
@@ -107,6 +109,10 @@ class MainWindow(QMainWindow):
         self._picker = picker or self._default_picker
         self._dir_picker = dir_picker or self._default_dir_picker
         self._preset_picker = preset_picker or self._default_preset_picker
+        self._save_picker = save_picker or self._default_save_picker
+        self._cont = None            # continuity preview session (never a file)
+        self._cont_editing = None    # None | "raw" | "sections"
+        self._cont_history = False   # history view currently shown
         self._plan = plan.project_overview(self._root)
 
         self.snap = None              # last valid Snapshot
@@ -240,6 +246,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_bible_tab(), "Bible")
         self.tabs.addTab(self._build_outline_tab(), "Outline")
         self.tabs.addTab(self._build_scenes_tab(), "Scenes")
+        self.tabs.addTab(self._build_continuity_tab(), "Continuity")
+        self.tabs.addTab(self._build_review_tab(), "Review")
+        self.tabs.addTab(self._build_revision_tab(), "Revision")
+        self.tabs.addTab(self._build_status_tab(), "Status")
         right_l.addWidget(self.tabs, 1)
 
         steer_box = QGroupBox("Steering")
@@ -987,7 +997,414 @@ class MainWindow(QMainWindow):
         l.addWidget(holder, 2)
         return box
 
-    # ----------------------------------------------------------------- scenes
+    # ------------------------------------------------------------ continuity
+
+    def _build_continuity_tab(self):
+        """Update-state/summary-only previews; nothing is written until the
+        explicit Accept. Built-in raw/section editors replace the CLI's
+        external editor; history stays read-only."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.continuity_label = QLabel(
+            "Continuity — select a scene in the sidebar, then Update state, "
+            "Summary only, or Compress")
+        self.continuity_label.setWordWrap(True)
+        l.addWidget(self.continuity_label)
+        btns = QHBoxLayout()
+        self.update_state_btn = QPushButton("Update state")
+        self.update_state_btn.setToolTip(
+            "Full update for the selected scene: detailed/brief summaries and "
+            "a proposed state.md. Files change only on Accept.")
+        self.update_state_btn.clicked.connect(self.update_state)
+        btns.addWidget(self.update_state_btn)
+        self.update_state_default_btn = QPushButton("Update state (default)")
+        self.update_state_default_btn.setToolTip(
+            "Full update for the CLI default scene: the first done scene "
+            "without state_updated.")
+        self.update_state_default_btn.clicked.connect(
+            lambda: self.update_state(default_scene=True))
+        btns.addWidget(self.update_state_default_btn)
+        self.summary_only_btn = QPushButton("Summary only")
+        self.summary_only_btn.setToolTip(
+            "Refresh this scene's detailed/brief summaries only; state.md, "
+            "its history and scene flags stay unchanged.")
+        self.summary_only_btn.clicked.connect(
+            lambda: self.update_state(summary_only=True))
+        btns.addWidget(self.summary_only_btn)
+        self.continuity_history_btn = QPushButton("History")
+        self.continuity_history_btn.setToolTip(
+            "Read-only list of state backups and saved raw/section input "
+            "versions for the selected scene")
+        self.continuity_history_btn.clicked.connect(self.continuity_history)
+        btns.addWidget(self.continuity_history_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        l.addWidget(QLabel("Preview (nothing is written until you press "
+                           "Accept)"))
+        self.continuity_preview = QPlainTextEdit()
+        self.continuity_preview.setReadOnly(True)
+        self.continuity_preview.setPlaceholderText(
+            "Detailed/brief summaries, the proposed state and its diff "
+            "appear here after Update state; arc text appears here after "
+            "Compress.")
+        l.addWidget(self.continuity_preview, 1)
+        abtns = QHBoxLayout()
+        self.continuity_accept_btn = QPushButton("Accept")
+        self.continuity_accept_btn.setToolTip(
+            "Write the accepted continuity exactly like the CLI: state "
+            "backup, state.md, summaries.json and scene flags")
+        self.continuity_accept_btn.clicked.connect(self.continuity_accept)
+        abtns.addWidget(self.continuity_accept_btn)
+        self.continuity_edit_raw_btn = QPushButton("Edit raw")
+        self.continuity_edit_raw_btn.setToolTip(
+            "Built-in editor for the raw model output (CLI edit-raw; no "
+            "external editor)")
+        self.continuity_edit_raw_btn.clicked.connect(
+            lambda: self.continuity_open_edit("raw"))
+        abtns.addWidget(self.continuity_edit_raw_btn)
+        self.continuity_edit_sections_btn = QPushButton("Edit sections")
+        self.continuity_edit_sections_btn.setToolTip(
+            "Built-in editor for the parsed sections (CLI edit; no external "
+            "editor)")
+        self.continuity_edit_sections_btn.clicked.connect(
+            lambda: self.continuity_open_edit("sections"))
+        abtns.addWidget(self.continuity_edit_sections_btn)
+        self.continuity_save_edit_btn = QPushButton("Save edit")
+        self.continuity_save_edit_btn.setToolTip(
+            "Save the edited text to inputs/ with history; this never "
+            "accepts the proposal")
+        self.continuity_save_edit_btn.clicked.connect(self.continuity_save_edit)
+        abtns.addWidget(self.continuity_save_edit_btn)
+        self.continuity_regen_btn = QPushButton("Regenerate")
+        self.continuity_regen_btn.setToolTip(
+            "Repeat the provider call with the same captured prompt")
+        self.continuity_regen_btn.clicked.connect(self.continuity_regen)
+        abtns.addWidget(self.continuity_regen_btn)
+        self.continuity_quit_btn = QPushButton("Quit preview")
+        self.continuity_quit_btn.setToolTip(
+            "Close the preview without accepting anything")
+        self.continuity_quit_btn.clicked.connect(self.continuity_quit)
+        abtns.addWidget(self.continuity_quit_btn)
+        abtns.addStretch(1)
+        l.addLayout(abtns)
+        self.continuity_edit_label = QLabel("")
+        l.addWidget(self.continuity_edit_label)
+        self.continuity_edit = QPlainTextEdit()
+        self.continuity_edit.setPlaceholderText(
+            "Edit raw output or sections here; Save edit keeps it as input "
+            "history, Accept is still separate.")
+        self.continuity_edit.textChanged.connect(self._cont_edited)
+        l.addWidget(self.continuity_edit, 1)
+        return box
+
+    # ------------------------------------------------------ continuity ops
+
+    def _cont_edited(self):
+        if self._cont is not None and self._cont_editing is not None:
+            self._cont["dirty"] = True
+
+    def update_state(self, summary_only=False, default_scene=False):
+        """Continuity preview for the selected (or CLI-default) scene. The
+        later-scenes override is explicit; Accept is always separate; nothing
+        runs implicitly."""
+        if self._busy:
+            self._status("An operation is running; continuity actions are "
+                         "paused until it settles.", error=True)
+            return
+        if not self._resolve_review_dirty("opening a new continuity preview"):
+            return
+        target = None if default_scene else self._scene_sel
+        if not default_scene and target is None:
+            self._status("Select a scene in the sidebar for Update state.")
+            return
+        try:
+            chk = ro.update_state_check(self._root, target, summary_only)
+        except ro.OpError as e:
+            self._status(str(e), error=True)
+            return
+        if chk["error"]:
+            self._status(chk["error"], error=True)
+            return
+        for w in chk["warnings"]:
+            self._status("warning: " + w)
+        if chk["later"] and not summary_only:
+            pick = self._choice(
+                "Later scenes are in state.md",
+                ro.LATER_WARNING.format(later=", ".join(chk["later"]))
+                + "\n\nContinue anyway, or Cancel? Summary only refreshes "
+                "summaries without this override.",
+                ["Continue anyway", "Cancel"])
+            if pick != "Continue anyway":
+                self._status("Declined; no request was made and no "
+                             "continuity file changed.")
+                return
+        scene_id = chk["scene_id"]
+
+        def fn(sink, token):
+            prep = ro.update_state_prepare(self._root, scene_id, summary_only,
+                                           token=token)
+            res = ro.update_state_generate(
+                self._root, prep, provider_factory=self._provider_factory,
+                token=token, events=sink)
+            return {"prep": prep, "raw": res["raw"], "finish": res["finish"]}
+
+        self._dispatch(fn, kind="continuity_generate")
+
+    def continuity_open_edit(self, mode):
+        """Open the built-in raw or section editor on the open preview."""
+        if self._busy or self._cont is None:
+            if self._cont is None:
+                self._status("No continuity preview is open.")
+            return
+        if not self._resolve_review_dirty("switching the editor"):
+            return
+        prep = self._cont["prep"]
+        if mode == "raw":
+            self.continuity_edit.setPlainText(self._cont["raw"])
+            self.continuity_edit_label.setText(
+                f"Editing raw output for {prep.scene_id} — Save edit keeps "
+                "it in inputs/state_raw_*.md (with history); Accept is "
+                "still separate.")
+        else:
+            if not self._cont.get("secs"):
+                self._status("No parsed sections yet; use Edit raw.",
+                             error=True)
+                return
+            self.continuity_edit.setPlainText(
+                ro.edit_blob(prep, self._cont["secs"]))
+            self.continuity_edit_label.setText(
+                f"Editing sections for {prep.scene_id} — Save edit keeps "
+                "them in inputs/state_edit_*.md (with history); Accept is "
+                "still separate.")
+        self._cont_editing = mode
+        self._cont["dirty"] = False
+        self._update_continuity_ui()
+
+    def continuity_save_edit(self):
+        """Save the edited text as input history; never accepts."""
+        if self._busy or self._cont is None or self._cont_editing is None:
+            return
+        kind, text, scene = self._cont_editing, \
+            self.continuity_edit.toPlainText(), self._cont["prep"].scene_id
+
+        def fn(sink, token):
+            if kind == "raw":
+                return ro.update_state_save_raw_input(self._root, scene, text,
+                                                      token=token)
+            return ro.update_state_save_edit_input(self._root, scene, text,
+                                                   token=token)
+
+        self._dispatch(fn, kind="continuity_input")
+
+    def _cont_save_input_now(self):
+        """Synchronous input-history save for dirty transitions (no provider,
+        no acceptance)."""
+        kind = self._cont_editing
+        text = self.continuity_edit.toPlainText()
+        scene = self._cont["prep"].scene_id
+        try:
+            if kind == "raw":
+                return ro.update_state_save_raw_input(self._root, scene, text)
+            return ro.update_state_save_edit_input(self._root, scene, text)
+        except ro.OpError as e:
+            self._status(str(e), error=True)
+            return None
+
+    def _resolve_review_dirty(self, what):
+        """Save/Discard/Cancel an open continuity editor before a destructive
+        transition; Cancel keeps the edit and stops the transition."""
+        if self._cont is None or self._cont_editing is None or \
+                not self._cont.get("dirty"):
+            return True
+        pick = self._choice(
+            "Unsaved continuity edit",
+            f"The built-in continuity editor has unsaved changes. Save them "
+            f"to the existing input history before {what}?",
+            ["Save", "Discard", "Cancel"])
+        if pick == "Save":
+            ok = self._cont_save_input_now() is not None
+            if ok:
+                self._cont_after_edit(self.continuity_edit.toPlainText())
+            return ok
+        if pick == "Discard":
+            self._cont["dirty"] = False
+            return True
+        self._status("Cancelled; the edit is kept and nothing changed.")
+        return False
+
+    def _cont_after_edit(self, text):
+        """Re-parse a saved edit and return to the preview (CLI edit flow,
+        minus the CLI's edit-implies-accept)."""
+        prep = self._cont["prep"]
+        if self._cont_editing == "raw":
+            self._cont["raw"] = text
+        parsed = ro.update_state_parse_text(text, prep)
+        self._cont["secs"] = parsed["secs"]
+        self._cont_editing = None
+        self._cont["dirty"] = False
+        self._update_continuity_view()
+
+    def continuity_regen(self):
+        if self._busy or self._cont is None:
+            return
+        if not self._resolve_review_dirty("regenerating"):
+            return
+        prep = self._cont["prep"]
+
+        def fn(sink, token):
+            res = ro.update_state_generate(
+                self._root, prep, provider_factory=self._provider_factory,
+                token=token, events=sink)
+            return {"prep": prep, "raw": res["raw"], "finish": res["finish"]}
+
+        self._dispatch(fn, kind="continuity_generate")
+
+    def continuity_accept(self):
+        if self._busy or self._cont is None or not self._cont.get("secs"):
+            return
+        if not self._resolve_review_dirty("accepting"):
+            return
+        prep, secs = self._cont["prep"], self._cont["secs"]
+        baseline = dict(prep.baseline)
+
+        def fn(sink, token):
+            return ro.update_state_accept(self._root, prep, secs,
+                                          baseline=baseline, token=token,
+                                          events=sink)
+
+        self._dispatch(fn, kind="continuity_accept")
+
+    def continuity_quit(self):
+        if self._busy or self._cont is None:
+            return
+        if not self._resolve_review_dirty("quitting the preview"):
+            return
+        self._cont = None
+        self._cont_editing = None
+        self._update_continuity_view()
+        self._status("Quit; no summaries, state or scene flags changed.")
+
+    def continuity_history(self):
+        """Read-only state/input history for the selected scene."""
+        if self._busy:
+            return
+        scene = self._scene_sel
+        if scene is None:
+            self._status("Select a scene to view its continuity history.")
+            return
+        try:
+            out = ro.update_state_history(self._root, scene)
+        except ro.OpError as e:
+            self._status(str(e), error=True)
+            return
+        lines = [f"Continuity history for {scene} (read-only; nothing is "
+                 "restored or deleted here)", ""]
+        lines.append("state backups (state_history/):")
+        if out["backups"]:
+            for b in out["backups"]:
+                lines.append(f"- {b['name']} ({len(b['text'])} bytes)")
+        else:
+            lines.append("- (none)")
+        lines.append("")
+        lines.append("saved continuity inputs (inputs/):")
+        if out["inputs"]:
+            for e in out["inputs"]:
+                lines.append(f"- {e['name']} ({len(e['text'])} bytes)")
+        else:
+            lines.append("- (none)")
+        self._cont_history = True
+        self.continuity_preview.setPlainText("\n".join(lines))
+        self.continuity_label.setText(
+            f"History for {scene} — full text of each entry is shown below; "
+            "use Update state to prepare anything new.")
+        self._update_continuity_ui()
+
+    def _update_continuity_view(self):
+        self._cont_history = False
+        c = self._cont
+        if c is None:
+            self.continuity_label.setText(
+                "Continuity — select a scene in the sidebar, then Update "
+                "state or Summary only")
+            self.continuity_preview.setPlainText("")
+            self.continuity_edit.setPlainText("")
+            self.continuity_edit_label.setText("")
+        else:
+            prep = c["prep"]
+            if c.get("secs") is None:
+                self.continuity_label.setText(
+                    "warning: could not find all sections "
+                    f"(finish_reason={c['finish']}) — Edit raw or "
+                    "Regenerate; nothing is accepted")
+                self.continuity_preview.setPlainText(c["raw"])
+            else:
+                secs = c["secs"]
+                text = ("=== DETAILED SUMMARY ===\n" +
+                        secs["DETAILED SUMMARY"] +
+                        "\n\n=== BRIEF SUMMARY ===\n" + secs["BRIEF SUMMARY"])
+                if not prep.summary_only:
+                    text += ("\n\n=== STATE DIFF ===\n" +
+                             ro.line_diff(prep.state_text,
+                                          secs["UPDATED STATE"],
+                                          "state.md", "updated"))
+                self.continuity_preview.setPlainText(text)
+                self.continuity_label.setText(
+                    f"Preview for {prep.scene_id} "
+                    f"({'summary only' if prep.summary_only else 'full update'})"
+                    " — nothing is written until Accept")
+            if self._cont_editing is None:
+                self.continuity_edit.setPlainText("")
+                self.continuity_edit_label.setText("")
+        self._update_continuity_ui()
+
+    def _update_continuity_ui(self):
+        busy, c = self._busy, self._cont
+        has = c is not None
+        secs = has and bool(c.get("secs"))
+        self.update_state_btn.setEnabled(not busy)
+        self.update_state_default_btn.setEnabled(not busy)
+        self.summary_only_btn.setEnabled(not busy)
+        self.continuity_history_btn.setEnabled(not busy)
+        self.continuity_accept_btn.setEnabled(has and secs and not busy)
+        self.continuity_edit_raw_btn.setEnabled(has and not busy)
+        self.continuity_edit_sections_btn.setEnabled(has and secs and not busy)
+        self.continuity_save_edit_btn.setEnabled(
+            has and self._cont_editing is not None and not busy)
+        self.continuity_regen_btn.setEnabled(has and not busy)
+        self.continuity_quit_btn.setEnabled(has and not busy)
+
+    def _build_review_tab(self):
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.addWidget(QLabel("Critique and deterministic check reports are "
+                           "added by the review feature commit."))
+        l.addStretch(1)
+        return box
+
+    def _build_revision_tab(self):
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.addWidget(QLabel("Passage-by-passage revision is added by the "
+                           "revision feature commit."))
+        l.addStretch(1)
+        return box
+
+    def _build_status_tab(self):
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.addWidget(QLabel("Full read-only status and destination export are "
+                           "added by the status/export feature commit."))
+        l.addStretch(1)
+        return box
+
+    def _combo(self):
+        from PySide6.QtWidgets import QComboBox
+        combo = QComboBox()
+        return combo
 
     def _refresh_scenes_overview(self):
         try:
@@ -2155,6 +2572,8 @@ class MainWindow(QMainWindow):
         self._scenes_card_row = None
         self._scenes_preview_baseline = None
         self._scenes_force_once = False
+        self._cont = None
+        self._cont_editing = None
         self._bind_steering(None)
         self.refresh(force=True)
         self._autoselect()
@@ -2236,6 +2655,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, title, str(self._root),
                                               "Presets (*.json)")
         return path or None
+
+    def _default_save_picker(self, title, default):
+        """Export destination dialog; returns (path_or_empty, filter) like Qt."""
+        from PySide6.QtWidgets import QFileDialog
+        path, flt = QFileDialog.getSaveFileName(self, title, default)
+        return (path or "", flt)
 
     def _wire_tab_order(self):
         """Visible, predictable keyboard order: sidebar → reading → editor →
@@ -2515,6 +2940,7 @@ class MainWindow(QMainWindow):
         self.clear_btn.setEnabled(editable)
         self._update_draft_actions()
         self._update_steering_label()
+        self._update_continuity_ui()
 
     def _update_draft_actions(self):
         """Generate/Stop/Accept availability with recovery guidance."""
@@ -2650,6 +3076,13 @@ class MainWindow(QMainWindow):
                              error=True)
             self._update_steering_ui()
         elif outcome == "cancelled":
+            if self._op_kind in ("continuity_generate", "continuity_input",
+                                 "continuity_accept"):
+                self._update_steering_ui()
+                self._status("Stopped; nothing was accepted. Saved inputs "
+                             "and previously accepted continuity are "
+                             "unchanged.")
+                return
             self._update_steering_ui()
             self._preview_text = ""
             self.preview.setPlainText("")
@@ -2975,6 +3408,33 @@ class MainWindow(QMainWindow):
                 self._status(msg)
                 for w in value["warnings"]:
                     self._status("warning: " + w)
+        elif kind == "continuity_generate" and isinstance(value, dict):
+            self._cont = {"prep": value["prep"], "raw": value["raw"],
+                          "finish": value["finish"], "secs": None,
+                          "dirty": False}
+            self._cont_editing = None
+            parsed = ro.update_state_parse_response(value["raw"],
+                                                    value["prep"])
+            self._cont["secs"] = parsed["secs"]
+            self._update_continuity_view()
+            if self._cont["secs"] is None:
+                self._status("warning: could not find all sections "
+                             f"(finish_reason={value['finish']}); Edit raw "
+                             "or Regenerate; nothing is saved")
+            else:
+                self._status("Continuity preview ready; nothing is written "
+                             "until you press Accept.")
+        elif kind == "continuity_input" and isinstance(value, dict):
+            if self._cont is not None:
+                self._cont_after_edit(self.continuity_edit.toPlainText())
+            self._status(f"saved {value['saved']} (with input history); "
+                         "acceptance still requires Accept")
+        elif kind == "continuity_accept" and isinstance(value, dict):
+            self._cont = None
+            self._cont_editing = None
+            self.refresh(force=True)
+            self._update_continuity_view()
+            self._status(f"{value['message']} ({value['scene']})")
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""

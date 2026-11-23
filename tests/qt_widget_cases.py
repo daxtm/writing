@@ -2336,6 +2336,38 @@ REVIEW_PASSAGE = "<passage>Mara pushed the gate open.</passage>"
 REVIEW_EDIT_NOTE = "edited note"
 
 
+class ReviewChatFake:
+    """Scripted chat provider for the review operations (Api.chat surface).
+
+    `calls` records (role, msgs, max_tokens) so cases can prove no implicit
+    request happened; `gate` (threading.Event) can hold a call for Stop tests."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+        self.gate = None
+
+    def chat(self, role, msgs, max_tokens=None, stream_cb=None, progress=True,
+             token=None, on_retry_event=None):
+        self.calls.append(("chat", role, msgs, max_tokens))
+        if token is not None:
+            token.check()
+        if self.gate is not None and not self.gate.wait(10):
+            raise AssertionError("fake provider gate never opened")
+        return self.responses.pop(0), "stop", {}
+
+
+def _scripted_choice(answers):
+    """Choice dialog seam returning scripted answers in order."""
+    pending = list(answers)
+
+    def choose(title, text, options):
+        assert pending, f"unexpected modal choice: {title}"
+        return pending.pop(0)
+
+    return choose
+
+
 def _review_project(root, name):
     project = _build_project(
         root / name,
@@ -2346,7 +2378,7 @@ def _review_project(root, name):
             "s001": _tree({"n1": _node("n1", None,
                                        "Mara counts the lit windows."),
                            "n2": _node("n2", "n1", "She ticks off each pane.")},
-                          head="n1"),
+                          head="n2"),
             "s002": _tree({"n1": _node("n1", None, "Mara closes the gate.")},
                           head="n1")},
         bible="# Story bible\n\nQuiet town.",
@@ -2357,6 +2389,159 @@ def _review_project(root, name):
               "bible_history", "lorebooks"):
         (project / d).mkdir(exist_ok=True)
     return project
+
+
+def case_review_update_state(root):
+    """Update-state/summary-only controls through the real worker: default
+    and explicit scenes, not-done confirmation, summary-only flags, malformed
+    raw correction, edit/regenerate/quit, backups, stale refusal, explicit
+    acceptance (task 1.2)."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _review_project(root, "p")
+    # a not-done scene with text for the explicit-scene warning
+    _write_json(project / "trees" / "s003.json", _tree(
+        {"n1": _node("n1", None, "S3 prose.")}, head="n1"))
+    scenes = json.loads((project / "scenes.json").read_text())
+    scenes.append(_scene("s003", title="Third"))
+    scenes.append(_scene("s004", title="Later", status="done"))
+    scenes[3]["state_updated"] = True   # a later scene already in state.md
+    _write_json(project / "scenes.json", scenes)
+
+    fake = ReviewChatFake([
+        REVIEW_RECORD_S1,        # not-done s003 (Continue anyway)
+        REVIEW_RECORD_S1,        # default s001 accept
+        REVIEW_RECORD_S2,        # summary-only s002 accept
+        "junk",                  # malformed raw for s001 re-update
+        REVIEW_RECORD_S1,        # regenerate
+        REVIEW_RECORD_S1,        # next explicit preview (dirty Save first)
+        REVIEW_RECORD_S1,        # default preview after the dirty save
+        REVIEW_RECORD_S1,        # stale-preview attempt (refused later)
+    ])
+    choice = _scripted_choice(["Continue anyway", "Cancel", "Continue anyway",
+                               "Continue anyway", "Continue anyway", "Save",
+                               "Continue anyway", "Continue anyway"])
+    win = gw.MainWindow(str(project), choice=choice,
+                        provider_factory=lambda _p: fake)
+    win.show()
+
+    def click_done(btn, what):
+        before = len(fake.calls)
+        btn.click()
+        assert _pump(a, lambda: not win._busy), f"{what} settles"
+        return before
+
+    win.tabs.setCurrentIndex(gw.CONTINUITY)
+
+    # explicit not-done scene: warning, then explicit Continue anyway
+    win.select_item("manuscript", "s003", None)
+    n0 = len(fake.calls)
+    win.update_state_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == n0 + 1, "Continue anyway proceeds with the call"
+    assert win.continuity_accept_btn.isEnabled()
+    win.continuity_quit_btn.click()
+    assert win._cont is None
+    before_all = {f.relative_to(project): f.stat().st_mtime_ns
+                  for f in project.rglob("*") if f.is_file()}
+    win.select_item("manuscript", "s003", None)
+    win.update_state_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == n0 + 1, "decline makes no request"
+    assert win._cont is None
+    after = {f.relative_to(project): f.stat().st_mtime_ns
+             for f in project.rglob("*") if f.is_file()}
+    assert after == before_all, "declining writes nothing"
+
+    # default scene is the first done scene without state_updated
+    win.update_state_default_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._cont["prep"].scene_id == "s001"
+    assert "Mara opens the gate and counts the windows." in \
+        win.continuity_preview.toPlainText()
+    assert "STATE DIFF" in win.continuity_preview.toPlainText()
+    assert (project / "state.md").read_text() == "Mara is at the yard.", \
+        "preview writes nothing"
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._cont is None
+    assert (project / "state.md").read_text() == "Mara is inside the yard.\n"
+    backups = list((project / "state_history").glob("before_s001_*.md"))
+    assert len(backups) == 1 and \
+        backups[0].read_text(encoding="utf-8") == "Mara is at the yard."
+    scenes = json.loads((project / "scenes.json").read_text())
+    assert scenes[0]["state_updated"] is True
+
+    # summary-only for s002: flags and state stay untouched
+    state_mid = (project / "state.md").read_text()
+    flags_mid = json.loads((project / "scenes.json").read_text())[1].get(
+        "state_updated")
+    win.select_item("manuscript", "s002", None)
+    win.summary_only_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._cont["prep"].summary_only is True
+    assert "STATE DIFF" not in win.continuity_preview.toPlainText()
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((project / "scenes.json").read_text())
+    assert scenes[1].get("state_updated") == flags_mid, "flags unchanged"
+    assert (project / "state.md").read_text() == state_mid
+    assert len(list((project / "state_history").glob("*"))) == 1
+
+    # malformed raw: edit raw in the built-in editor, Save keeps input
+    # history, acceptance stays disabled until the parse accepts
+    win.select_item("manuscript", "s001", None)
+    win.update_state_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win.continuity_accept_btn.isEnabled() is False
+    assert "could not find all sections" in win.continuity_label.text()
+    win.continuity_edit_raw_btn.click()
+    assert win.continuity_edit.toPlainText() == "junk"
+    win.continuity_edit.setPlainText(REVIEW_RECORD_S1)
+    win.continuity_save_edit_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "inputs" / "state_raw_s001.md").read_text() == \
+        REVIEW_RECORD_S1
+    assert list((project / "inputs" / "history").glob(
+        "state_raw_s001_*.md")), "timestamped history version saved"
+    assert win.continuity_accept_btn.isEnabled(), \
+        "the corrected raw parses and enables Accept"
+    before_calls = len(fake.calls)
+    win.continuity_regen_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == before_calls + 1, \
+        "regenerate made exactly one new call"
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "state.md").read_text() == "Mara is inside the yard.\n"
+
+    # dirty editor is resolved explicitly (Save) before a new preview
+    win.update_state_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.continuity_edit_raw_btn.click()
+    win.continuity_edit.setPlainText("unsaved correction")
+    win.update_state_default_btn.click()   # scripted choice answers Save
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "inputs" / "state_raw_s001.md").read_text() == \
+        "unsaved correction"
+    assert win._cont is not None, "a fresh preview replaced the session"
+
+    # stale refusal: sources changed under the open preview
+    win.continuity_quit_btn.click()
+    win.update_state_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.calls, "preview regenerated for the stale case"
+    (project / "state.md").write_text("externally changed\n", encoding="utf-8")
+    state_now = (project / "state.md").read_text()
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "changed on disk" in win.status.text()
+    assert (project / "state.md").read_text() == state_now, \
+        "stale acceptance is refused without overwriting"
+    assert win._cont is not None and win._cont.get("secs"), \
+        "the local preview is kept for retry"
+    win.continuity_quit_btn.click()
+    win.close()
 
 
 def case_review_journey(root):
@@ -2417,18 +2602,7 @@ def case_review_journey(root):
 
         responses = [REVIEW_RECORD_S1, REVIEW_RECORD_S2, REVIEW_ARC,
                      REVIEW_CRITIQUE, REVIEW_PASSAGE, "NO CHANGES"]
-
-        class ReviewFake:
-            def __init__(self, p):
-                self.p = p
-
-            def chat(self, role, msgs, max_tokens=None, stream_cb=None,
-                     progress=True, token=None, on_retry_event=None):
-                if token is not None:
-                    token.check()
-                return responses.pop(0), "stop", {}
-
-        fake = ReviewFake(None)
+        fake = ReviewChatFake(responses)
         win = gw.MainWindow(
             str(gui), choice=_no_dialogs("review journey"),
             provider_factory=lambda _p: fake,
@@ -2475,7 +2649,8 @@ def case_review_journey(root):
         assert _pump(a, lambda: not win._busy)
         assert "Mara closes the gate behind her." in \
             win.continuity_preview.toPlainText()
-        assert "UPDATED STATE" not in win.continuity_preview.toPlainText()
+        assert "STATE DIFF" not in win.continuity_preview.toPlainText(), \
+            "summary-only previews no state section"
         win.continuity_accept_btn.click()
         assert _pump(a, lambda: not win._busy)
         scenes = json.loads((gui / "scenes.json").read_text())
@@ -2633,6 +2808,7 @@ CASES = {
     "case_planning_outline": case_planning_outline,
     "case_planning_scenes": case_planning_scenes,
     "case_planning_card_edit": case_planning_card_edit,
+    "case_review_update_state": case_review_update_state,
     "case_review_journey": case_review_journey,
 }
 

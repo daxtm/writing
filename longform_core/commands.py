@@ -979,70 +979,38 @@ def cmd_draft(p, args):
 
 
 def cmd_update_state(p, args):
-    scenes = p.scenes()
-    sums = p.summaries()
-    if args.scene:
-        idx = p.scene_index(scenes, args.scene)
-    else:
-        idx = next((i for i, s in enumerate(scenes) if s.get("status") == "done" and not s.get("state_updated")), None)
-        if idx is None:
-            die("no done scene is waiting for a state update (use --scene ID)")
-    sc = scenes[idx]
-    tree = Tree(p, sc["id"])
-    if not tree.head:
-        die(f"scene {sc['id']} has no text")
-    if sc.get("status") != "done":
-        warn(f"scene {sc['id']} is not marked done")
-    later = [s["id"] for s in scenes[idx + 1:] if s.get("state_updated")]
-    summary_only = args.summary_only
-    if later and not summary_only:
-        warn("state.md already includes later scenes (" + ", ".join(later) + "); "
-             "updating state from this scene would treat that as 'before'. Use --summary-only to refresh summaries only.")
+    """CLI adapter over the shared update-state operations: identical prompts,
+    warning order, ask points, parse and save order; printing/paging and the
+    external editor stay here."""
+    import longform_core.review_operations as ro
+
+    try:
+        prep = ro.update_state_prepare(p.root, args.scene, args.summary_only)
+    except ro.OpError as e:
+        _op_fail(e)
+    for w in prep.warnings:
+        warn(w)
+    if prep.later and not prep.summary_only:
+        warn(ro.LATER_WARNING.format(later=", ".join(prep.later)))
         if ask("continue anyway? [y/N] ").strip().lower() != "y":
             return
-    scene_text = tree.text()
-    bible = read_text(p.f("bible.md")).strip()
-    state = read_text(p.f("state.md")).strip()
-    cfg = p.cfg["summary"]
-    model = p.cfg["roles"]["summarizer"]["model"]
-    names = ["DETAILED SUMMARY", "BRIEF SUMMARY"] + ([] if summary_only else ["UPDATED STATE"])
-    instr = (
-        "Produce exactly these sections, each starting with its exact header line:\n"
-        "=== DETAILED SUMMARY ===\n"
-        f"(about {cfg['detailed_words']} words: what happens, in order, with concrete specifics: who did what, what was revealed, decisions made, how the scene ends)\n"
-        "=== BRIEF SUMMARY ===\n"
-        f"(about {cfg['brief_words']} words: key events and changes only)\n"
-    )
-    if not summary_only:
-        instr += (
-            "=== UPDATED STATE ===\n"
-            "(the full continuity state after this scene, in the same markdown structure as the state before it. "
-            "Keep every still-valid entry, update changed ones, add new ones; move finished threads to 'Resolved'. "
-            "Cover each character's location, condition, knowledge, goals and relationships; open threads and setups; "
-            "established facts and objects that must stay consistent.)\n"
-        )
-    instr += "Put all the sections between <record> and </record> tags, with nothing else inside them. Anything outside the tags is discarded."
-    user = (f"# Story bible\n{bible}\n\n# Scene card\n{format_card(sc)}\n\n"
-            + ("" if summary_only else f"# Continuity state BEFORE this scene\n{state}\n\n")
-            + f"# Full text of the scene\n{scene_text}\n\n{instr}")
-    msgs = [{"role": "system", "content": SUMMARIZER_SYSTEM}, {"role": "user", "content": user}]
-    ceil, _, src = p.ceiling(model)
-    need = p.est(model, SUMMARIZER_SYSTEM + user) + int(p.cfg["roles"]["summarizer"]["max_tokens"])
-    if need > ceil:
-        warn(f"request needs ~{need} tokens but ceiling is {ceil} ({src}); the call may fail")
-    api = Api(p)
+    for w in prep.call_warnings:
+        warn(w)
+    api = ro.provider_for(p.root, api_cls=Api)
+    finish, raw, secs = "stop", "", None
     while True:
-        print(f"summarizing {sc['id']}...")
-        text, finish, _ = api.chat("summarizer", msgs)
-        secs = parse_sections(extract_tagged(text, "record")[0], names)
+        print(f"summarizing {prep.scene_id}...")
+        res = ro.update_state_generate(p.root, prep, provider=api)
+        raw, finish = res["raw"], res["finish"]
+        secs = ro.update_state_parse_response(raw, prep)["secs"]
         while True:
             if secs is None:
                 warn(f"could not find all sections (finish_reason={finish})")
-                print(text)
+                print(raw)
                 c = ask("[e]dit raw / [r]egenerate / [q]uit: ").strip().lower()
                 if c.startswith("e"):
-                    text = edit_saved(p, f"state_raw_{sc['id']}", text)
-                    secs = parse_sections(text, names)
+                    raw = edit_saved(p, f"state_raw_{prep.scene_id}", raw)
+                    secs = ro.update_state_parse_text(raw, prep)["secs"]
                     continue
                 if c.startswith("r"):
                     break
@@ -1051,30 +1019,28 @@ def cmd_update_state(p, args):
             print(secs["DETAILED SUMMARY"])
             print(col("\n=== BRIEF SUMMARY ===", "36"))
             print(secs["BRIEF SUMMARY"])
-            if not summary_only:
+            if not prep.summary_only:
                 print(col("\n=== STATE DIFF ===", "36"))
-                print(line_diff(state, secs["UPDATED STATE"], "state.md", "updated"))
+                print(line_diff(prep.state_text, secs["UPDATED STATE"],
+                                "state.md", "updated"))
             c = ask("\n[a]ccept / [e]dit / [r]egenerate / [q]uit: ").strip().lower()
             if c.startswith("e"):
-                blob = "\n\n".join(f"=== {n} ===\n{secs[n]}" for n in names)
-                text = edit_saved(p, f"state_edit_{sc['id']}", blob)
-                secs = parse_sections(text, names)
+                blob = ro.edit_blob(prep, secs)
+                text = edit_saved(p, f"state_edit_{prep.scene_id}", blob)
+                secs = ro.update_state_parse_text(text, prep)["secs"]
                 continue
             if c.startswith("r"):
                 break
             if not c.startswith("a"):
                 return
-            if not summary_only:
-                shutil.copy2(p.f("state.md"), p.f("state_history", f"before_{sc['id']}_{stamp()}.md"))
-                write_text(p.f("state.md"), secs["UPDATED STATE"].strip() + "\n")
-                sc["state_updated"] = True
-            sums["scenes"][sc["id"]] = {
-                "detailed": secs["DETAILED SUMMARY"], "brief": secs["BRIEF SUMMARY"],
-                "updated": now(), "text_hash": text_hash(scene_text),
-            }
-            p.save_summaries(sums)
-            p.save_scenes(scenes)
-            print("saved summaries" + ("" if summary_only else " and state.md"))
+            try:
+                ro.update_state_accept(p.root, prep, secs,
+                                       baseline=prep.baseline)
+            except ro.OpError as e:
+                _op_fail(e, soft_ok=True)
+                return
+            print("saved summaries" + ("" if prep.summary_only
+                                       else " and state.md"))
             return
 
 
