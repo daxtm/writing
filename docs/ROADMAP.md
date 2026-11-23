@@ -6,11 +6,153 @@ Make `longform.py` safe to change through observable offline regression tests,
 then extract only the boundaries the prototype actually needs. Preserve
 `uv run --script longform.py …` and existing project files and reports.
 
+Extend that foundation into a polished Linux desktop writing workspace:
+run the existing planning, drafting, review, and export flow through buttons,
+with a persistent multiline steering box and native Wayland support. The CLI
+remains available and uses the same writing operations and project files.
+
 ## Out of scope
 
-New writing features, model/provider changes, live API tests, a web UI, private
-sample/preset fixtures, and speculative packaging. Dependency provisioning may
-use network; test execution must not.
+New model/provider capabilities, autonomous whole-book generation, browser/server
+interfaces, cloud accounts, collaborative concurrent editing, rich-text/DOCX
+editing, standalone installers, private sample/preset fixtures, and live API
+tests. Existing CLI capabilities becoming GUI controls are in scope; changing
+their prompts, sampling policy, or file formats is not. Dependency provisioning
+may use network; test execution must not.
+
+## Planning baseline
+
+This extends the completed foundation below; the GUI milestones are new,
+unimplemented plans, not OpenSpec changes. No change artifacts are created here.
+`origin/main` currently has the CLI but no `gui` command. The separate
+`feat/reader-gui` branch contains the Tkinter/ttk reader, UI-independent
+`reader_model` snapshots, and ADR-0004/0005; it is not yet on main.
+Reuse its safe reading/model behavior and tests when available, not a second
+reader or a second writing engine. Integrating that work is a prerequisite of
+GUI milestone 1, not an instruction to merge it here.
+
+The existing `cmd_*` commands already implement the flow, but their `ask`,
+`$EDITOR`, paging, printing, and blocking API calls prevent direct button
+invocation. Extract only the operation being exposed, keep the CLI as an adapter,
+and reuse `Project`, `Tree`, `Lore`, prompt/check helpers, and `Api`.
+New desktop controls are necessary because neither the CLI nor the separate
+read-only reader supplies editable, asynchronous workflow interactions.
+
+## GUI milestone 1 — Walking skeleton: steer, generate, accept on Wayland
+
+- [ ] gui-wayland-shell — Replace the pending Tk presentation with a PySide6/Qt Widgets workspace while retaining safe reader snapshots, all-branch navigation, notes, refresh, and the `gui DIR` entry point.
+- [ ] gui-steered-drafting — Extract shared draft operations and connect scene selection, saved steering, one-candidate generation, preview, acceptance, and cooperative stop to a responsive background worker.
+
+Depend on the reader baseline above; `gui-steered-drafting` depends on
+`gui-wayland-shell`. Start with an existing synthetic project containing a
+preset and one planned scene. The shell must have a resizable scene/branch
+sidebar, readable manuscript/candidate area, multiline steering box, a clear
+primary action, and a status/error area. Use consistent spacing and typography,
+system light/dark palette with readable contrast, keyboard focus, and adjustable
+prose size; do not postpone all visual work to a later polish phase.
+
+Steering is the existing per-scene `Tree.d["steer"]`: Save steering persists it,
+Clear saves an empty value, and Generate captures/saves the current box before
+building the existing writer prompt. It remains active until changed, survives
+reopening, and is recorded on each candidate exactly as in the CLI. Selection
+changes with unsaved text offer Save/Discard/Cancel. Generated candidates are
+saved branches, not accepted prose; only Accept moves the active head.
+
+One project operation runs at a time. Reading remains usable while generating;
+conflicting writes/project switches are disabled. Stop enters a visible
+stopping state and cancels cooperatively at an I/O boundary, not by killing a
+thread; network waits remain bounded by configured request timeouts. Keep
+already saved branches and accepted text; never save a partial streamed passage.
+Closing during work offers Stop and wait or Keep open, and closes only after
+the worker settles. Refresh must not overwrite dirty editors. Compare captured
+inputs before writes; external changes require reload/retry rather than a stale
+overwrite. Concurrent CLI/GUI writers are unsupported.
+
+Observe after implementation:
+`QT_QPA_PLATFORM=wayland uv run --script longform.py gui /path/to/project`.
+Without relying on XWayland, select the scene, type direction, Generate, scroll
+while text arrives, and Accept. Close/reopen: the accepted passage and steering
+remain; CLI status/export sees the same text. Inject a fake API failure: readable
+error, no active-head change, controls usable again.
+
+Accept this milestone only with offline fake-provider button-flow tests and a
+real Wayland smoke recording the compositor, Qt platform name (`wayland`),
+runtime version, and 100%/200% plus available fractional/mixed-monitor scaling,
+clipboard, focus, resize, and file-dialog results. Offscreen widget tests do not
+prove compositor integration. Missing Qt/Wayland support must produce an
+actionable diagnostic, not silently fall back in this explicit launch mode.
+
+Decisions forced now:
+[ADR-0006](adr/0006-wayland-writing-workspace.md) chooses the presentation toolkit
+and supersedes the reader's Tk/no-new-dependency restriction for this workspace;
+[ADR-0007](adr/0007-shared-writing-operations.md) fixes the shared-operation and
+background-execution boundary.
+
+## GUI milestone 2 — Set up, plan, and control drafting without a terminal
+
+- [ ] gui-project-planning — Add Create/Open, preset import, model/role settings, limits, bible question forms, outline notes/candidate choice, and scene generation/editing with overwrite confirmation.
+- [ ] gui-draft-controls — Add multi-candidate generation/reroll, manual passage entry/edit/history, rewind/jump/delete eligible branches, passage length, POV/cast, lorebook toggles/classification/aliases, prompt-budget inspection, and scene completion.
+
+Both depend on milestone 1; planning precedes the from-empty-project demo.
+Use existing initialization, bible forms/history, outline selection, scene
+validation, and draft semantics. A settings form edits only explicitly supported
+nonsecret configuration fields; obtain credentials through the existing
+environment-variable mechanism, display its variable name/missing-key status,
+and never display/log an existing key. Import presets/lore files through desktop
+file pickers with existing validation. Edit supported planning text in built-in
+plain-text panes with Save/Cancel, never launch `$EDITOR` or ask in a terminal.
+Outline regeneration/selection and scene replacement preserve existing
+confirmation and history behavior. Disabled controls explain missing
+prerequisites; no implicit paid call or automatic next command.
+
+Observe: launch `uv run --script longform.py gui /path/to/new-project` and use
+Create when the directory is absent. With credentials already in the environment,
+choose models/preset, fetch limits, fill the bible, choose an outline, create a
+scene, generate two candidates, reroll one, edit/accept one, explore the retained
+branch, and mark the scene done—all without terminal prompts or external editors.
+The offline test performs that same sequence with temporary files and fake
+responses, and compares CLI/GUI prompt and saved-tree behavior.
+
+## GUI milestone 3 — Finish continuity, review, revision, and export
+
+- [ ] gui-continuity-review — Add summary/state preview, edit/regenerate/accept, summary-only mode and earlier-scene warning, plus arc compression range/replace and preview/accept.
+- [ ] gui-check-revise-export — Add critique and deterministic checks, editable review notes, passage revision diffs with accept/skip/edit/regenerate/quit, project status, and manuscript export with destination selection.
+
+Both depend on milestone 2; they reuse the execution boundary already chosen,
+not a new job system. Preserve `state_history`, summaries, revision history,
+stale-summary warnings, arc overlap checks, and existing report/export formats.
+Status and notes remain visible alongside the writing pane; each save refreshes
+affected views without losing the current reading position. Destructive or
+replacement actions name their target and require the existing confirmation.
+
+Observe: from a completed scene, update continuity after reviewing its diff,
+compress a valid scene range, run critique/check, accept one revision and skip
+another, refresh stale summaries, then Export. The saved manuscript matches the
+CLI export for the same active paths; restart restores the saved project state.
+Offline end-to-end tests cover this full flow, including rejection/error paths,
+without credentials, `$EDITOR`, terminal input, or network access.
+
+## Delivery rules for every GUI change
+
+Create its OpenSpec proposal only when that change is selected for build. Keep
+each change to at most eight test-first tasks: the first proves the visible
+behavior and initially fails; the last makes `scripts/check.sh` run the new
+coverage. Preserve existing offline network guards and CLI parity tests. Model
+and operation tests always run headless; Qt widget tests use the offscreen
+platform in a subprocess with the GUI runtime installed and must not silently
+skip missing dependencies. Real Wayland checks are a separate required desktop
+acceptance step; document unavailable compositor coverage rather than claiming
+headless success proves it. No separate hardening/polish milestone is planned.
+
+## Open questions
+
+- Which compositor/distribution and monitor scaling form the owner's primary
+  acceptance setup? Native Wayland is the target, not merely an XWayland window.
+- Which compatible PySide6 release and Linux runtime libraries work in the
+  actual uv environment? Verify/pin the tested dependency range in
+  `gui-wayland-shell`; bundled Qt binaries alone do not establish that result.
+- Any visual reference or preferred reading font? Until supplied, use the
+  system palette, restrained controls, and adjustable prose typography above.
 
 ## Phase 0 — Walking skeleton: source, checks, and project facts
 
@@ -84,3 +226,8 @@ sacrificed even though the launcher command stays the same.
 - [ADR-0003: Split the CLI into a package now](adr/0003-split-into-package.md)
   records the owner's deliberate override of the ADR-0002 gate and the package
   layout.
+- [ADR-0006: Use Qt Widgets for the Wayland writing workspace](adr/0006-wayland-writing-workspace.md).
+- [ADR-0007: Share writing operations between CLI and an asynchronous GUI](adr/0007-shared-writing-operations.md).
+
+ADR-0004/0005 are already allocated on `feat/reader-gui`; keep those numbers
+and records when integrating it rather than reusing them on this roadmap branch.
