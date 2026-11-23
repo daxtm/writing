@@ -82,7 +82,8 @@ def api_env(monkeypatch):
     """Recorded no-op sleeps and captured warnings; returns (sleeps, warns)."""
     sleeps, warns = [], []
     monkeypatch.setattr(longform.time, "sleep", lambda s: sleeps.append(s))
-    monkeypatch.setattr(longform, "warn", warns.append)
+    # warn moved to the api module in the package split; patch it at its call site.
+    monkeypatch.setattr(longform.api, "warn", warns.append)
     return sleeps, warns
 
 
