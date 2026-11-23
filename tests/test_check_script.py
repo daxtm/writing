@@ -14,7 +14,9 @@ SCRIPT = REPO / "scripts" / "check.sh"
 EXPECTED_ORDER = [
     "python3 -m py_compile longform.py",
     "uv run --script longform.py --help",
-    "uv run --with pytest --with httpx pytest -q tests",
+    # the fake uv logs "$*" without shell quoting; the real command quotes the
+    # version range: uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests
+    "uv run --with pytest --with httpx --with pyside6>=6.12.0,<6.13 pytest -q tests",
 ]
 
 

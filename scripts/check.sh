@@ -23,7 +23,7 @@ if [ -d tests ]; then
 		exit 1
 	fi
 	echo "== tests"
-	uv run --with pytest --with httpx pytest -q tests
+	uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests
 else
 	echo "no tests/ yet: see docs/ROADMAP.md for the testing plan"
 fi
