@@ -65,14 +65,6 @@ Observe with `uv run --script longform.py --help`, then
 the same commands and regression outputs continue to work. A package sacrifices
 standalone one-file portability even though the launcher command stays the same.
 
-## Phase 4 — Hosted CI (dropped)
-
-- [x] install-ci-uv — **dropped, not implemented**: the GitHub Actions workflow was removed in `bb38069` after `ock ship` took over running `scripts/check.sh` locally before opening or updating a PR.
-
-There is no runner to provision and no hosted `check` job to observe. Reintroduce
-this phase only if hosted CI returns. The local commands remain
-`./scripts/check.sh` and `uv run --with pytest --with httpx pytest -q tests`.
-
 ## Decisions
 
 - [ADR-0001: Record architecture decisions](adr/0001-record-architecture-decisions.md).
