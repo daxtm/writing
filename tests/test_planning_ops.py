@@ -7,14 +7,20 @@ All offline: temp projects, synthetic presets, no network.
 """
 
 import json
+import types
 from pathlib import Path
 
 import pytest
+
+import reader_support as rs
 
 import longform_core.commands as commands
 import longform_core.planning_operations as plan
 from longform_core.draft_operations import OpError
 from longform_core.utils import stamp
+
+_write_json = rs.write_json
+_write_text = rs.write_text
 
 MASTER = {
     "preset": {"temp": 1.0, "genamt": 300},
@@ -40,6 +46,10 @@ def master_file(tmp_path):
     src.mkdir()
     (src / "master.json").write_text(json.dumps(MASTER), encoding="utf-8")
     return src / "master.json"
+
+
+_write_json = rs.write_json
+_write_text = rs.write_text
 
 
 def cli_init(root, preset=None, monkeypatch=None, capsys=None):
@@ -1045,3 +1055,246 @@ def test_outline_history_view_after_reopen(tmp_path):
         "saved candidates are listed after reopen"
     assert plan.read_outline_candidate(root, out["candidates"][0]).strip() \
         .endswith("OUTLINE ONE BODY")
+
+
+# ---------------------------------------------------------------- scenes
+
+SCENES_JSON = ('<scenes>[{"chapter": 1, "title": "Yard", "pov": "Mara", '
+               '"setting": "the yard", "characters": ["Mara"], "goal": '
+               '"count windows", "conflict": "wind", "outcome": "counted", '
+               '"beats": ["Mara counts."], "target_words": 1700}, '
+               '{"chapter": 1, "title": "Harbour", "pov": "Tom", "setting": '
+               '"the harbour", "characters": ["Tom"], "goal": "sail", '
+               '"conflict": "tide", "outcome": "sailed", "beats": '
+               '["Tom sails."], "target_words": 15300}]</scenes>')
+
+
+def scenes_project(tmp_path):
+    root = outline_project(tmp_path / "p")
+    (root / "outline.md").write_text("OUTLINE BODY\n", encoding="utf-8")
+    return root
+
+
+class FakeSceneProvider:
+    def __init__(self, p):
+        self.p = p
+        self.calls = []
+
+    def chat(self, role, messages, max_tokens=None, stream_cb=None,
+             progress=True, token=None, on_retry_event=None):
+        self.calls.append({"role": role, "messages": messages})
+        if token:
+            token.check()
+        return FakeSceneProvider.text, "stop", {}
+
+
+def test_scenes_cli_parity_files_and_prompt(tmp_path, monkeypatch, capsys):
+    import longform_core.commands as commands
+    from longform_core.project import Project
+    a, b = scenes_project(tmp_path / "cli"), scenes_project(tmp_path / "gui")
+    FakeSceneProvider.text = SCENES_JSON
+
+    seen = {}
+
+    def spy(self, role, messages, max_tokens=None, **kw):
+        seen["messages"] = messages
+        return FakeSceneProvider.text, "stop", {}
+
+    monkeypatch.setattr(commands.Api, "chat", spy)
+    answers = iter(["a"])
+    monkeypatch.setattr(commands, "ask", lambda *a2, **k: next(answers))
+    commands.cmd_scenes(Project(a), types.SimpleNamespace(force=False))
+
+    plan.generate_scene_cards(b, provider_factory=lambda p: FakeSceneProvider(p))
+    cards, _warn, _total = plan._normalize_scene_cards(
+        json.loads("[{\"chapter\": 1, \"title\": \"Yard\", \"pov\": \"Mara\", "
+                   "\"setting\": \"the yard\", \"characters\": [\"Mara\"], "
+                   "\"goal\": \"count windows\", \"conflict\": \"wind\", "
+                   "\"outcome\": \"counted\", \"beats\": [\"Mara counts.\"], "
+                   "\"target_words\": 1700}, {\"chapter\": 1, \"title\": "
+                   "\"Harbour\", \"pov\": \"Tom\", \"setting\": \"the "
+                   "harbour\", \"characters\": [\"Tom\"], \"goal\": \"sail\", "
+                   "\"conflict\": \"tide\", \"outcome\": \"sailed\", "
+                   "\"beats\": [\"Tom sails.\"], \"target_words\": 15300}]"),
+        17000)
+    plan.accept_scene_cards(b, cards, plan.scenes_baseline(b))
+    assert (a / "scenes.json").read_bytes() == (b / "scenes.json").read_bytes()
+    assert "Yard" in (b / "scenes.json").read_text()
+    cli_scenes = json.loads((a / "scenes.json").read_text())
+    assert cli_scenes[0]["id"] == "s01" and cli_scenes[1]["id"] == "s02"
+    assert cli_scenes[0]["status"] == "planned"
+    assert cli_scenes[0]["state_updated"] is False
+    assert cli_scenes[0]["notes"] == ""
+    # exact CLI messages (bible + outline + card schema)
+    prov = FakeSceneProvider(b)
+    from longform_core.commands import extract_json_array
+    gen = plan.generate_scene_cards(b, provider_factory=lambda p: prov)
+    assert prov.calls[0]["messages"] == seen["messages"]
+
+
+def test_scenes_cli_transcript_frozen(tmp_path, monkeypatch, capsys):
+    import longform_core.commands as commands
+    from longform_core.project import Project
+    a = scenes_project(tmp_path / "cli")
+    FakeSceneProvider.text = SCENES_JSON
+    monkeypatch.setattr(commands.Api, "chat",
+                        lambda self, role, messages, max_tokens=None, **kw:
+                        (FakeSceneProvider.text, "stop", {}))
+    answers = iter(["v", "a"])
+    monkeypatch.setattr(commands, "ask", lambda *a2, **k: next(answers))
+    commands.cmd_scenes(Project(a), types.SimpleNamespace(force=False))
+    out = capsys.readouterr().out
+    assert "generating scene cards..." in out
+    assert "2 scenes, 17000 target words (project target 17000)" in out
+    assert "wrote " in out and "scenes.json" in out
+
+
+def test_scenes_force_protection(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    _write_json(root / "scenes.json", [{
+        "id": "s001", "chapter": 1, "title": "Yard", "target_words": 100,
+        "status": "drafting"}])
+    calls = []
+    prov = FakeSceneProvider(root)
+
+    def counting(p):
+        calls.append(1)
+        return prov
+
+    with pytest.raises(OpError) as e:
+        plan.generate_scene_cards(root, provider_factory=counting)
+    assert "confirm the force equivalent" in str(e.value)
+    assert getattr(e.value, "collision", False), "GUI offers confirmation"
+    assert calls == [], "declining runs no request"
+
+    # a planned-only list previews without force (accept confirms replacement)
+    _write_json(root / "scenes.json", [{
+        "id": "s001", "chapter": 1, "title": "Yard", "target_words": 100,
+        "status": "planned"}])
+    out = plan.generate_scene_cards(root, provider_factory=counting)
+    assert out["cards"][0]["id"] == "s01"
+
+    # trees existing alone require force
+    (root / "trees" / "s001.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.generate_scene_cards(root, provider_factory=counting)
+    assert "trees are kept" in str(e.value)
+    # with force=True the call happens
+    out = plan.generate_scene_cards(root, force=True,
+                                    provider_factory=counting)
+    assert out["cards"]
+
+
+def test_scenes_missing_outline(tmp_path):
+    root = bible_project(tmp_path / "p")
+    with pytest.raises(OpError) as e:
+        plan.generate_scene_cards(root, provider_factory=FakeSceneProvider)
+    assert "outline.md is empty or missing" in str(e.value)
+
+
+def test_scenes_invalid_output_saves_raw(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    FakeSceneProvider.text = "no json here at all"
+    out = plan.generate_scene_cards(root, provider_factory=lambda p:
+                                    FakeSceneProvider(p))
+    assert out["raw"] == FakeSceneProvider.text
+    raws = list((root / "outlines").glob("scenes_raw_*.txt"))
+    assert len(raws) == 1 and raws[0].read_text() == FakeSceneProvider.text
+    assert json.loads((root / "scenes.json").read_text()) == [], \
+        "invalid output never replaces scenes.json"
+
+
+def test_scenes_fenced_json_array(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    FakeSceneProvider.text = ("```json\n<scenes>[{\"chapter\": 1, "
+                              "\"title\": \"Yard\"}]</scenes>\n```")
+    out = plan.generate_scene_cards(root, provider_factory=lambda p:
+                                    FakeSceneProvider(p))
+    assert out["cards"][0]["title"] == "Yard"
+
+
+def test_scenes_normalization_defaults_and_ids(tmp_path):
+    cards, warnings, total = plan._normalize_scene_cards([
+        {"title": "Only"}, {"title": "Two", "chapter": "2", "target_words":
+                            "300"}], 0)
+    assert cards[0]["id"] == "s01" and cards[1]["id"] == "s02"
+    assert cards[0]["chapter"] == 1 and cards[0]["target_words"] == 0
+    assert cards[0]["notes"] == "" and cards[0]["status"] == "planned"
+    assert cards[0]["state_updated"] is False
+    assert cards[1]["chapter"] == 2 and cards[1]["target_words"] == 300
+    assert any("targets 0 words" in w for w in warnings)
+
+
+def test_scenes_normalization_more_than_99(tmp_path):
+    arr = [{"title": f"c{k}"} for k in range(100)]
+    cards, _w, _t = plan._normalize_scene_cards(arr, 0)
+    assert cards[99]["id"] == "s100"
+
+
+def test_scenes_validation_refuses_bad_values(tmp_path):
+    bad_arrays = [
+        [{"title": "x", "chapter": "abc"}],
+        [{"title": "x", "chapter": 0}],
+        [{"title": "x", "target_words": "abc"}],
+        [{"title": "x", "target_words": -5}],
+        [{"title": "x", "target_words": 1.5}],
+        [{"title": "x", "characters": ["Mara", 3]}],
+        [{"title": "x", "beats": "not a list"}],
+        ["not an object"],
+        [],
+    ]
+    for arr in bad_arrays:
+        with pytest.raises(OpError) as e:
+            plan._normalize_scene_cards(arr, 0)
+        assert "scenes" in str(e.value) or "card" in str(e.value), arr
+
+
+def test_scenes_accept_backs_up_and_keeps_trees(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    _write_json(root / "scenes.json", [{
+        "id": "s001", "chapter": 1, "title": "Old", "target_words": 100,
+        "status": "planned"}])
+    (root / "trees" / "s001.json").write_text(
+        json.dumps({"nodes": {}, "head": None, "counter": 0}) + "\n",
+        encoding="utf-8")
+    tree_before = (root / "trees" / "s001.json").read_bytes()
+    base = plan.scenes_baseline(root)
+    cards = [{"id": "s01", "chapter": 1, "title": "New", "pov": "Mara",
+              "setting": "", "characters": [], "goal": "", "conflict": "",
+              "outcome": "", "beats": [], "notes": "", "target_words": 100,
+              "status": "planned", "state_updated": False}]
+    plan.accept_scene_cards(root, cards, base)
+    saved = json.loads((root / "scenes.json").read_text())
+    assert saved[0]["title"] == "New" and saved[0]["id"] == "s01"
+    prevs = list((root / "outlines").glob("scenes_prev_*.json"))
+    assert prevs and json.loads(prevs[0].read_text())[0]["title"] == "Old"
+    assert (root / "trees" / "s001.json").read_bytes() == tree_before, \
+        "trees are never touched"
+
+
+def test_scenes_accept_stale_refusal(tmp_path):
+    root = scenes_project(tmp_path / "p")
+    base = plan.scenes_baseline(root)
+    _write_json(root / "scenes.json", [{"id": "s001", "title": "external"}])
+    cards = [{"id": "s01", "chapter": 1, "title": "New", "pov": "",
+              "setting": "", "characters": [], "goal": "", "conflict": "",
+              "outcome": "", "beats": [], "notes": "", "target_words": 0,
+              "status": "planned", "state_updated": False}]
+    with pytest.raises(OpError) as e:
+        plan.accept_scene_cards(root, cards, base)
+    assert getattr(e.value, "stale", False)
+    assert json.loads((root / "scenes.json").read_text())[0]["title"] == \
+        "external"
+
+
+def test_scenes_generation_stop_saves_nothing(tmp_path):
+    from longform_core.cancel import CancellationToken
+    root = scenes_project(tmp_path / "p")
+    tok = CancellationToken()
+    tok.cancel()
+    with pytest.raises(Exception):
+        plan.generate_scene_cards(root, token=tok,
+                                  provider_factory=lambda p:
+                                  FakeSceneProvider(p))
+    assert json.loads((root / "scenes.json").read_text()) == []
+    assert not list((root / "outlines").glob("scenes_raw_*"))

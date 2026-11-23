@@ -14,9 +14,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSplitter,
-    QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QSpinBox, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from .prompt import tail_trim_chars
@@ -149,6 +150,11 @@ class MainWindow(QMainWindow):
         self._outline_candidates = []   # candidate names generated this session
         self._outline_notes_loaded = None
         self._outline_body_loaded = None
+        self._scenes_overview = None
+        self._scene_cards = None      # working preview card list
+        self._scenes_card_row = None
+        self._scenes_preview_baseline = None
+        self._scenes_force_once = False
         try:
             self._session = dop.session_info(self._root)
         except dop.OpError as e:
@@ -233,6 +239,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_setup_tab(), "Setup")
         self.tabs.addTab(self._build_bible_tab(), "Bible")
         self.tabs.addTab(self._build_outline_tab(), "Outline")
+        self.tabs.addTab(self._build_scenes_tab(), "Scenes")
         right_l.addWidget(self.tabs, 1)
 
         steer_box = QGroupBox("Steering")
@@ -897,6 +904,240 @@ class MainWindow(QMainWindow):
         notes_split.setStretchFactor(0, 1)
         notes_split.setStretchFactor(1, 2)
         return notes_split
+
+    def _build_scenes_tab(self):
+        """Scenes pane: generate from the saved outline, inspect/edit the
+        validated preview, confirmed replacement with backups, then the
+        existing draft loop reads the saved cards."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.scenes_note = QLabel("")
+        self.scenes_note.setWordWrap(True)
+        l.addWidget(self.scenes_note)
+        sbtns = QHBoxLayout()
+        self.scenes_generate_btn = QPushButton("Generate cards")
+        self.scenes_generate_btn.setToolTip("Break the saved outline into "
+                                            "scene cards on the worker; "
+                                            "needs a nonempty outline, a "
+                                            "planner model and credentials")
+        self.scenes_generate_btn.clicked.connect(self.scenes_generate)
+        sbtns.addWidget(self.scenes_generate_btn)
+        self.scenes_accept_btn = QPushButton("Accept preview")
+        self.scenes_accept_btn.setToolTip("Save the previewed cards as "
+                                          "scenes.json (backs up a previous "
+                                          "nonempty list; trees are kept; "
+                                          "never automatic)")
+        self.scenes_accept_btn.clicked.connect(self.scenes_accept)
+        sbtns.addWidget(self.scenes_accept_btn)
+        self.scenes_cancel_btn = QPushButton("Cancel preview")
+        self.scenes_cancel_btn.clicked.connect(self.scenes_cancel)
+        sbtns.addWidget(self.scenes_cancel_btn)
+        sbtns.addStretch(1)
+        l.addLayout(sbtns)
+        l.addWidget(QLabel("Previewed cards (select one to edit its fields)"))
+        self.scenes_list = QListWidget()
+        self.scenes_list.currentRowChanged.connect(self._on_scenes_selected)
+        l.addWidget(self.scenes_list, 3)
+        self.scenes_preview = QPlainTextEdit()
+        self.scenes_preview.setReadOnly(True)
+        self.scenes_preview.setPlaceholderText(
+            "The generated cards appear here; editing fields below updates "
+            "the preview. scenes.json is replaced only on explicit Accept.")
+        l.addWidget(self.scenes_preview, 3)
+        l.addWidget(QLabel("Selected card fields"))
+        grid = QGridLayout()
+        grid.setVerticalSpacing(2)
+        self._card_field_editors = {}
+        fields = (("chapter", "Chapter"), ("title", "Title"), ("pov", "POV"),
+                  ("setting", "Setting"), ("characters", "Characters "
+                  "(comma)"), ("goal", "Goal"), ("conflict", "Conflict"),
+                  ("outcome", "Outcome"), ("target_words", "Target words"),
+                  ("beats", "Beats (one per line)"), ("notes", "Notes"))
+        for row, (key, label) in enumerate(fields):
+            grid.addWidget(QLabel(label), row, 0)
+            if key in ("beats", "characters", "notes"):
+                w = QPlainTextEdit()
+                w.setFixedHeight(40)
+            else:
+                w = self._line()
+            w.textChanged.connect(self._card_field_changed) \
+                if hasattr(w, "textChanged") else None
+            if key not in ("beats", "characters", "notes"):
+                w.textEdited.connect(self._card_field_changed)
+            self._card_field_editors[key] = w
+            grid.addWidget(w, row, 1)
+        grid.setColumnStretch(1, 1)
+        holder = QWidget()
+        holder.setLayout(grid)
+        l.addWidget(holder, 2)
+        return box
+
+    # ----------------------------------------------------------------- scenes
+
+    def _refresh_scenes_overview(self):
+        try:
+            self._scenes_overview = plan.scenes_overview(self._root)
+        except dop.OpError as e:
+            self._scenes_overview = {"scenes": [], "outline": "", "trees": [],
+                                     "target_words": 0, "error": str(e)}
+        bits = []
+        if self._scenes_overview.get("error"):
+            bits.append("scenes unavailable: " + self._scenes_overview["error"])
+        else:
+            n = len(self._scenes_overview.get("scenes", []))
+            bits.append(f"{n} saved scene card(s)")
+            if not self._scenes_overview.get("outline"):
+                bits.append("scene generation needs a nonempty outline.md "
+                            "(generate and choose an outline first)")
+        self.scenes_note.setText("; ".join(bits))
+
+    def _update_scenes_tab(self):
+        if self._scenes_overview is None:
+            self._refresh_scenes_overview()
+
+    def scenes_generate(self):
+        """Generate cards from the saved outline (worker); force-equivalent
+        confirmation is offered through the worker error path."""
+        if self._busy:
+            return
+        over = self._scenes_overview or {}
+        if over.get("error") or not over.get("outline"):
+            self._status("Scene generation needs a nonempty outline.md; "
+                         "generate and choose an outline first.", error=True)
+            return
+        root = plan.canonical_root(self._root)
+        force = bool(self._scenes_force_once)
+        self._scenes_force_once = False
+
+        def fn(sink, token):
+            return plan.generate_scene_cards(
+                root, force=force,
+                provider_factory=self._provider_factory, token=token,
+                events=sink)
+
+        self._dispatch(fn, kind="scenes_generate")
+
+    def _on_scenes_selected(self, row):
+        cards = self._scene_cards or []
+        if not (0 <= row < len(cards)):
+            return
+        card = cards[row]
+        self._scenes_card_row = row
+        for key, w in self._card_field_editors.items():
+            v = card.get(key, "")
+            if key in ("beats", "characters"):
+                text = "\n".join(v) if isinstance(v, list) else str(v or "")
+            elif key == "notes":
+                text = str(v or "")
+            else:
+                text = "" if v is None else str(v)
+            w.blockSignals(True)
+            if hasattr(w, "setPlainText"):
+                w.setPlainText(text)
+            else:
+                w.setText(text)
+            w.blockSignals(False)
+
+    def _card_field_changed(self):
+        row = getattr(self, "_scenes_card_row", None)
+        cards = self._scene_cards or []
+        if row is None or not (0 <= row < len(cards)):
+            return
+        card = dict(cards[row])
+        for key, w in self._card_field_editors.items():
+            if key in ("beats", "characters"):
+                card[key] = [x.strip() for x in w.toPlainText().splitlines()
+                             if x.strip()] if key == "beats" else \
+                    [x.strip() for x in w.toPlainText().replace("\n", ",")
+                     .split(",") if x.strip()]
+            elif key == "notes":
+                card[key] = w.toPlainText()
+            else:
+                text = w.text().strip() if hasattr(w, "text") else \
+                    w.toPlainText().strip()
+                card[key] = text
+        self._scene_cards[row] = card
+        self._rebuild_scenes_preview()
+
+    def _rebuild_scenes_preview(self):
+        cards = self._scene_cards or []
+        self.scenes_list.blockSignals(True)
+        self.scenes_list.clear()
+        for k, s in enumerate(cards, 1):
+            self.scenes_list.addItem(QListWidgetItem(
+                f"[{k}] ch {s.get('chapter', '?')}  {s.get('target_words', 0)}w"
+                f"  {s.get('title', '')}"))
+        self.scenes_list.blockSignals(False)
+        self.scenes_preview.setPlainText(
+            plan._scenes_cards_text(cards) if cards else "")
+        self._update_scenes_note_counts()
+
+    def _update_scenes_note_counts(self):
+        cards = self._scene_cards or []
+        if cards:
+            total = sum(int(c.get("target_words") or 0) for c in cards)
+            tw = (self._scenes_overview or {}).get("target_words", 0)
+            self.scenes_note.setText(
+                f"preview: {len(cards)} scenes, {total} target words "
+                f"(project target {tw}); scenes.json unchanged until Accept")
+
+    def scenes_accept(self):
+        """Confirmed replacement through the shared accept operation."""
+        if self._busy:
+            return
+        cards = self._scene_cards
+        if not cards:
+            self._status("Generate cards first; nothing is saved without an "
+                         "explicit preview.", error=True)
+            return
+        over = self._scenes_overview or {}
+        if over.get("scenes"):
+            pick = self._choice(
+                "Replace saved scenes",
+                f"This replaces {len(over['scenes'])} saved scene card(s) "
+                "in scenes.json; the previous list is copied to outlines/"
+                "scenes_prev_<stamp>.json and every tree is kept. Continue?",
+                ["Replace", "Cancel"])
+            if pick != "Replace":
+                self._status("Replace declined; scenes.json is unchanged.")
+                return
+        base = self._scenes_preview_baseline
+        if not base:
+            self._status("Reload (Refresh) and accept again: the acceptance "
+                         "needs a captured baseline.", error=True)
+            return
+        root = plan.canonical_root(self._root)
+
+        def fn(sink, token):
+            return plan.accept_scene_cards(root, [dict(c) for c in cards],
+                                           dict(base), token=token,
+                                           events=sink)
+
+        self._dispatch(fn, kind="scenes_accept")
+
+    def scenes_cancel(self):
+        """Cancel: the preview is discarded; scenes.json is unchanged."""
+        self._scene_cards = []
+        self._scenes_preview_baseline = None
+        self._scenes_card_row = None
+        self._rebuild_scenes_preview()
+        self.scenes_note.setText("; ".join([
+            "preview cancelled; scenes.json unchanged"]))
+
+    def set_card_field(self, row, key, text):
+        """Test/keyboard helper: edit one previewed card field."""
+        cards = self._scene_cards or []
+        if not (0 <= row < len(cards)):
+            self._status(f"no previewed card {row}", error=True)
+            return
+        self._on_scenes_selected(row)
+        w = self._card_field_editors[key]
+        if hasattr(w, "setPlainText"):
+            w.setPlainText(str(text))
+        else:
+            w.setText(str(text))
+        self._card_field_changed()
 
     def _build_outline_tab(self):
         """Outline pane: multiline notes, N competing planner candidates,
@@ -1856,6 +2097,11 @@ class MainWindow(QMainWindow):
         self._outline_candidates = []
         self._outline_notes_loaded = None
         self._outline_body_loaded = None
+        self._scenes_overview = None
+        self._scene_cards = None
+        self._scenes_card_row = None
+        self._scenes_preview_baseline = None
+        self._scenes_force_once = False
         self._bind_steering(None)
         self.refresh(force=True)
         self._autoselect()
@@ -2025,6 +2271,7 @@ class MainWindow(QMainWindow):
             self._plan = plan.project_overview(self._root)
             self._refresh_bible_overview()
             self._refresh_outline_overview()
+            self._refresh_scenes_overview()
         self._update_setup_tab()
         try:
             res = self._load(self._root, cache=self._cache, force=force)
@@ -2255,7 +2502,9 @@ class MainWindow(QMainWindow):
                   self.bible_history_btn, self.outline_generate_btn,
                   self.outline_reroll_btn, self.outline_view_btn,
                   self.outline_choose_btn, self.outline_edit_btn,
-                  self.outline_save_btn, self.outline_cancel_btn):
+                  self.outline_save_btn, self.outline_cancel_btn,
+                  self.scenes_generate_btn, self.scenes_accept_btn,
+                  self.scenes_cancel_btn):
             b.setEnabled(not self._busy)
         has_batch = bool(self._batch and self._batch.get("saved"))
         for b in (self.accept_btn, self.view_btn, self.reroll_btn,
@@ -2352,7 +2601,22 @@ class MainWindow(QMainWindow):
             self._update_steering_ui()
             self._pending_action = None   # a failed save never continues a
             self._pending_root = None     # deferred transition
-            if getattr(value, "collision", False) and self._op_kind == "import":
+            if getattr(value, "collision", False) and \
+                    self._op_kind in ("import", "scenes_generate"):
+                if self._op_kind == "scenes_generate":
+                    pick = self._choice(
+                        "Replace drafted scenes?",
+                        str(value) + "\n\nConfirming makes the provider call "
+                        "and previews replacement candidates; scenes.json "
+                        "and every tree file stay unchanged until you accept "
+                        "a preview.", ["Generate (force)", "Cancel"])
+                    if pick == "Generate (force)":
+                        self._scenes_force_once = True
+                        self.scenes_generate()
+                    else:
+                        self._status("Force declined; no request was made "
+                                     "and no scene or tree file changed.")
+                    return
                 self._on_import_collision(value)
                 return
             self._status(str(value), error=True)
@@ -2609,6 +2873,34 @@ class MainWindow(QMainWindow):
             self._status("saved the edited outline to outline.md (previous "
                          "outline backed up); the candidate file is "
                          "unchanged")
+        elif kind == "scenes_generate" and isinstance(value, dict):
+            self._scenes_preview_baseline = dict(value.get("baseline") or {})
+            if value.get("raw") is not None:
+                self._scene_cards = []
+                self._rebuild_scenes_preview()
+                self.scenes_preview.setPlainText(value["raw"])
+                self._status("warning: " + "; ".join(value["warnings"])
+                             + f" — raw output saved at outlines/"
+                               f"{value['raw_path']}; Regenerate or Cancel")
+            else:
+                self._scene_cards = list(value["cards"])
+                self._rebuild_scenes_preview()
+                msg = (f"{len(value['cards'])} scene card(s) previewed; "
+                       "scenes.json is unchanged until Accept")
+                for w in value["warnings"]:
+                    msg += "\nwarning: " + w
+                self._status(msg)
+        elif kind == "scenes_accept" and isinstance(value, dict):
+            self._scene_cards = []
+            self._scenes_preview_baseline = None
+            self._scenes_card_row = None
+            self._rebuild_scenes_preview()
+            self.refresh(force=True)
+            msg = (f"saved {value['saved']} scene card(s) to scenes.json"
+                   + (f"; previous list backed up to {value['backup']}"
+                      if value.get("backup") else "")
+                   + "; trees were kept and the draft scene list refreshed")
+            self._status(msg)
 
     def _merge_batch(self, value):
         """Reroll replaces only returned slots; add appends returned slots."""
@@ -3095,6 +3387,7 @@ class MainWindow(QMainWindow):
         self._update_setup_tab()
         self._update_bible_tab()
         self._update_outline_tab()
+        self._update_scenes_tab()
         self._update_steering_ui()
 
     def _reconcile_selection(self):

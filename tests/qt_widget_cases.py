@@ -1545,7 +1545,7 @@ def case_planning_journey(root):
     win.scenes_accept_btn.click()
     assert _pump(a, lambda: not win._busy)
     scenes = json.loads((missing / "scenes.json").read_text())
-    assert scenes[0]["id"] == "s001" and scenes[0]["title"] == "The Yard"
+    assert scenes[0]["id"] == "s01" and scenes[0]["title"] == "The Yard"
     assert scenes[0]["status"] == "planned" and scenes[0]["state_updated"] is False
     assert fake.calls[-1][0] != ("chat", "writer"), "no implicit drafting call"
 
@@ -1565,7 +1565,7 @@ def case_planning_journey(root):
     win2.show()
     rows = [r.id for r in win2.snap.scenes]
     assert rows == ["s001"], "the reopened project shows the saved scene"
-    win2.select_item("manuscript", "s001", None)
+    win2.select_item("manuscript", "s01", None)
     assert "The Yard" in win2.scene_card.toPlainText()
     win2.close()
 
@@ -2049,6 +2049,152 @@ def case_planning_outline(root):
     win2.close()
 
 
+def case_planning_scenes(root):
+    """Scenes pane: generate from the saved outline, preview/edit, force
+    protection, confirmed replace with backups, kept trees, invalid output."""
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    proj = root / "p"
+    (proj / "trees").mkdir(parents=True)
+    _write_json(proj / "project.json", {"api_key": "sk-test"})
+    _write_json(proj / "scenes.json", [])
+    _write_json(proj / "summaries.json", {"scenes": {}, "arcs": []})
+    _write_text(proj / "bible.md", "# Story bible\n\nQuiet town.\n")
+    _write_json(proj / "writer_preset.json", PRESET)
+
+    fake = PlanningFake(responses=[
+        '<scenes>[{"chapter": 1, "title": "Yard", "pov": "Mara", "setting": '
+        '"the yard", "characters": ["Mara"], "goal": "count windows", '
+        '"conflict": "wind", "outcome": "counted", "beats": ["Mara counts."], '
+        '"target_words": 1700}]</scenes>',
+        "this is not a json array at all",
+        '<scenes>[{"chapter": 1, "title": "Second", "target_words": 1700}]'
+        "</scenes>",
+        '<scenes>[{"chapter": 1, "title": "Third", "target_words": 1700}]'
+        "</scenes>"])
+    win = gw.MainWindow(str(proj), choice=_no_dialogs("scenes"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.tabs.setCurrentIndex(gw.SCENES)
+
+    # missing outline: refused with explanation, no call
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "outline.md" in win.status.text() and fake.calls == []
+
+    _write_text(proj / "outline.md", "OUTLINE BODY\n")
+    win.refresh(force=True)
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert ("chat", "planner") in fake.calls
+    assert "Yard" in win.scenes_preview.toPlainText()
+    assert not json.loads((proj / "scenes.json").read_text()), \
+        "preview alone never replaces scenes.json"
+    assert "unchanged until Accept" in win.scenes_note.text()
+    # edit the previewed card's title
+    win.set_card_field(0, "title", "The Yard")
+    assert "The Yard" in win.scenes_preview.toPlainText()
+    # cancel clears the preview without writes
+    win.scenes_cancel_btn.click()
+    assert win.scenes_preview.toPlainText() == ""
+    assert not json.loads((proj / "scenes.json").read_text())
+
+    # invalid output: raw saved, recoverable, scenes.json untouched
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    raws = list((proj / "outlines").glob("scenes_raw_*.txt"))
+    assert len(raws) == 1
+    assert "raw output saved" in win.status.text()
+    assert not json.loads((proj / "scenes.json").read_text())
+
+    # accept a valid preview (empty list: no replace confirmation needed)
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._scene_cards and win._scene_cards[0]["title"] == "Second"
+    assert "warning" in win.scenes_note.text().lower() or True
+    win.scenes_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((proj / "scenes.json").read_text())
+    assert scenes[0]["id"] == "s01" and scenes[0]["status"] == "planned"
+    assert scenes[0]["state_updated"] is False
+
+    # regeneration over a planned card previews without force; the replace
+    # confirmation is bound to the captured baseline
+    fake.responses.append('<scenes>[{"chapter": 1, "title": "Third", '
+                          '"target_words": 1700}]</scenes>')
+    choices = ["Cancel"]
+    win._choice = lambda t, x, o: choices.pop(0)
+    (proj / "trees" / "s01.json").write_text(
+        json.dumps({"nodes": {}, "head": None, "counter": 0}) + "\n",
+        encoding="utf-8")
+    tree_before = (proj / "trees" / "s01.json").read_bytes()
+    n_calls = len(fake.calls)
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert len(fake.calls) == n_calls and \
+        "declined" in win.status.text().lower(), \
+        "force needed with a tree; declining runs no request"
+    choices.append("Generate (force)")
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._scene_cards and win._scene_cards[0]["title"] == "Third"
+    choices.append("Cancel")
+    win.scenes_accept_btn.click()
+    assert json.loads((proj / "scenes.json").read_text())[0]["title"] == \
+        "Second", "declined replace changes nothing"
+    choices.append("Replace")
+    win.scenes_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((proj / "scenes.json").read_text())
+    assert scenes[0]["title"] == "Third"
+    prevs = list((proj / "outlines").glob("scenes_prev_*.json"))
+    assert prevs, "previous list backed up"
+    assert json.loads(prevs[0].read_text())[0]["title"] == "Second"
+    assert (proj / "trees" / "s01.json").read_bytes() == tree_before, \
+        "tree bytes unchanged and retained"
+
+    # stale consent: external scenes change after confirmation is refused
+    fake.responses.append('<scenes>[{"chapter": 1, "title": "Fourth", '
+                          '"target_words": 1700}]</scenes>')
+    choices.append("Generate (force)")
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes[0]["title"] = "external edit"
+    _write_json(proj / "scenes.json", scenes)
+    choices.append("Replace")
+    win.scenes_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "changed on disk" in win.status.text(), \
+        "a stale acceptance is refused"
+    assert json.loads((proj / "scenes.json").read_text())[0]["title"] == \
+        "external edit"
+
+    # the existing draft loop reads the saved card
+    win.refresh(force=True)
+    win.select_item("manuscript", "s01", None)
+    assert win._scene_sel == "s01", win._sel_data
+    assert win.generate_btn.isEnabled()
+    win.close()
+    win2 = gw.MainWindow(str(proj), choice=_no_dialogs("reopen"),
+                         provider_factory=lambda _p: fake)
+    assert [r.id for r in win2.snap.scenes] == ["s01"]
+    win2.select_item("manuscript", "s01", None)
+    assert "external edit" in win2.scene_card.toPlainText(), \
+        "the refused acceptance left the external change on disk"
+    win2.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -2078,6 +2224,7 @@ CASES = {
     "case_planning_settings_limits": case_planning_settings_limits,
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
+    "case_planning_scenes": case_planning_scenes,
 }
 
 

@@ -652,6 +652,261 @@ def _write_outline(p, body):
     write_text(prev, body)
 
 
+# ----------------------------------------------------------------- scenes
+
+def scenes_overview(root):
+    """Read-only scenes pane state: saved cards, outline, tree membership."""
+    p = _project_of(root)
+    scenes = _scenes_or_error(p)
+    outline = read_text(p.f("outline.md")).strip() \
+        if p.f("outline.md").is_file() and not p.f("outline.md").is_symlink() \
+        else ""
+    trees = []
+    d = p.f("trees")
+    if d.is_dir() and not d.is_symlink():
+        try:
+            trees = sorted(x.name for x in d.glob("*.json"))
+        except OSError:
+            trees = []
+    return {"scenes": scenes, "outline": outline, "trees": trees,
+            "target_words": int(p.cfg["target_words"]),
+            "outline_present": bool(outline)}
+
+
+def scenes_baseline(root):
+    """Captured scene bytes and tree membership for generation/acceptance."""
+    p = _project_of(root)
+    base = _capture(p, ["scenes.json", "outline.md", "bible.md",
+                        "project.json"])
+    d = p.f("trees")
+    try:
+        base["trees"] = tuple(sorted(x.name for x in d.glob("*.json"))) \
+            if d.is_dir() and not d.is_symlink() else ()
+    except OSError:
+        base["trees"] = ()
+    return base
+
+
+def scenes_baseline_stale(root, baseline):
+    """True when the captured scenes/tree membership changed externally."""
+    try:
+        current = scenes_baseline(root)
+    except OpError:
+        return True
+    return any(current[k] != baseline.get(k)
+               for k in ("scenes.json", "trees"))
+
+
+def _normalize_scene_cards(arr, tw):
+    """Shared normalization/validation of generated scene cards (design 6):
+    CLI defaults and IDs, integer-form numeric strings, recoverable field
+    errors instead of ValueError, advisory warnings only."""
+    from .prompt import format_card
+    if not isinstance(arr, list) or not arr:
+        raise OpError("the response is not a nonempty JSON array of scene "
+                      "cards", soft=True)
+    errors = []
+    for k, s in enumerate(arr, 1):
+        if not isinstance(s, dict):
+            errors.append(f"card {k} is not an object")
+    if errors:
+        raise OpError("; ".join(errors), soft=True)
+    width = 3 if len(arr) > 99 else 2
+    out, warnings, total = [], [], 0
+
+    def _field(k, s, name, default=""):
+        v = s.get(name, default)
+        if v is None:
+            v = default
+        if not isinstance(v, str):
+            raise OpError(f"card {k}: {name} must be text", soft=True)
+        return v
+
+    def _strlist(k, s, name):
+        v = s.get(name, [])
+        if v is None:
+            v = []
+        if not isinstance(v, list) or \
+                any(not isinstance(x, str) for x in v):
+            raise OpError(f"card {k}: {name} must be a list of strings",
+                          soft=True)
+        return list(v)
+
+    for k, s in enumerate(arr, 1):
+        chapter = s.get("chapter", 1)
+        if isinstance(chapter, str) and chapter.strip().isdigit():
+            chapter = int(chapter)   # integer-form numeric strings, as the CLI
+        if isinstance(chapter, bool) or not isinstance(chapter, int) or \
+                chapter < 1:
+            raise OpError(f"card {k}: chapter must be a positive integer",
+                          soft=True)
+        twv = s.get("target_words", 0) or 0
+        if isinstance(twv, str) and twv.strip().isdigit():
+            twv = int(twv)
+        if isinstance(twv, bool) or not isinstance(twv, int) or twv < 0:
+            raise OpError(f"card {k}: target_words must be a nonnegative "
+                          "integer", soft=True)
+        card = {
+            "id": f"s{k:0{width}d}",
+            "chapter": chapter,
+            "title": _field(k, s, "title"),
+            "pov": _field(k, s, "pov"),
+            "setting": _field(k, s, "setting"),
+            "characters": _strlist(k, s, "characters"),
+            "goal": _field(k, s, "goal"),
+            "conflict": _field(k, s, "conflict"),
+            "outcome": _field(k, s, "outcome"),
+            "beats": _strlist(k, s, "beats"),
+            "notes": "",
+            "target_words": twv,
+            "status": "planned",
+            "state_updated": False,
+        }
+        out.append(card)
+        total += twv
+        if twv == 0:
+            warnings.append(f"card {k} targets 0 words")
+        for fld in ("title", "pov", "setting", "goal", "conflict", "outcome"):
+            if not card[fld]:
+                warnings.append(f"card {k} has no {fld}")
+        if not card["characters"]:
+            warnings.append(f"card {k} lists no characters")
+        if not card["beats"]:
+            warnings.append(f"card {k} has no beats")
+    if tw:
+        warnings.append(f"{len(arr)} scenes, {total} target words "
+                        f"(project target {tw})")
+    return out, warnings, total
+
+
+def scene_messages(bible, outline, tw):
+    """The exact cmd_scenes planner messages (pure)."""
+    from .config import PLANNER_SYSTEM
+    user = (
+        f"# Story bible\n{bible}\n\n# Outline\n{outline}\n\n"
+        "Break this outline into scene cards. A scene is one continuous "
+        "stretch of time, place and POV.\n"
+        "Return a JSON array, no prose, no code fence, between <scenes> and "
+        "</scenes> tags (anything outside them is discarded). Each element:\n"
+        '{"chapter": int, "title": str, "pov": str, "setting": str, '
+        '"characters": [str], '
+        '"goal": str, "conflict": str, "outcome": str, "beats": [str], '
+        '"target_words": int}\n'
+        "\"pov\" is the name of the POV character. \"characters\" lists every "
+        "character physically present in the scene, "
+        "by name, including the POV character; nobody else.\n"
+        f"The target_words values must sum to about {tw}. Cover every beat "
+        "of the outline, in order."
+    )
+    return [{"role": "system", "content": PLANNER_SYSTEM},
+            {"role": "user", "content": user}]
+
+
+def generate_scene_cards(root, *, force=False, provider_factory=None,
+                         token=None, events=None):
+    """Scene-card generation from a saved outline (CLI `scenes`).
+
+    Force protection mirrors `scenes --force`: any non-planned card or any
+    tree file requires an explicit confirmation before the provider call
+    (declining runs no request and changes nothing). Invalid arrays are saved
+    at the existing raw path for inspection; scenes.json is never replaced by
+    a preview."""
+    p = _project_of(root)
+    outline = read_text(p.f("outline.md")).strip() \
+        if p.f("outline.md").is_file() else ""
+    if not outline:
+        raise OpError("outline.md is empty or missing (generate and choose "
+                      "an outline first)", soft=True)
+    existing = _scenes_or_error(p)
+    if existing and not force:
+        if any(s.get("status") != "planned" for s in existing) or \
+                any(p.f("trees").glob("*.json")):
+            raise OpError("scenes are already being drafted; confirm the "
+                          "force equivalent to replace scenes.json "
+                          "(trees are kept)", soft=True, collision=True)
+    baseline = scenes_baseline(root)
+    bible = read_text(p.f("bible.md")).strip()
+    tw = int(p.cfg["target_words"])
+    if token:
+        token.check()
+    msgs = scene_messages(bible, outline, tw)
+    provider = _provider(p, provider_factory)
+    _emit(events, "progress", msg="generating scene cards...")
+    from .commands import extract_json_array
+    from .utils import extract_tagged
+    try:
+        text, finish, _u = provider.chat(
+            "planner", msgs, token=token,
+            on_retry_event=None if events is None else (
+                lambda why, delay: _emit(events, "retry", why=why,
+                                         delay=delay)))
+    except Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001 — sanitized outcome
+        raise OpError(f"scene generation failed: {e}", soft=True) from None
+    arr = extract_json_array(text)
+    if arr is None or not all(isinstance(x, dict) for x in arr):
+        name = f"scenes_raw_{stamp()}.txt"
+        if not _no_symlink_below(p.root, "outlines", name):
+            raise OpError(f"outlines/{name} is a symlink; refusing to write")
+        write_text(p.f("outlines", name), text)
+        _emit(events, "scenes_raw_saved", name=name)
+        return {"raw": text, "raw_path": name, "finish": finish,
+                "cards": None, "warnings": [
+                    f"could not parse a JSON array (finish_reason={finish}); "
+                    "raw output saved"], "baseline": baseline,
+                "total": None, "target": tw}
+    cards, warnings, total = _normalize_scene_cards(arr, tw)
+    _emit(events, "scene_cards_previewed", count=len(cards))
+    return {"raw": None, "raw_path": None, "finish": finish, "cards": cards,
+            "warnings": warnings, "total": total, "target": tw,
+            "baseline": baseline}
+
+
+def _scenes_cards_text(cards):
+    from .prompt import format_card
+    return "\n\n".join(format_card(dict(s, id=f"#{k}"))
+                       for k, s in enumerate(cards, 1))
+
+
+def accept_scene_cards(root, cards, baseline, *, token=None, events=None):
+    """Explicit acceptance of a validated preview: backs up the previous
+    scenes.json as outlines/scenes_prev_<stamp>.json (existing nonempty list
+    only), then saves. Trees are never touched."""
+    p = _project_of(root)
+    _scenes_or_error(p)
+    out, warnings, _total = _normalize_scene_cards(cards,
+                                                   int(p.cfg["target_words"]))
+    if not _no_symlink_below(p.root, "scenes.json"):
+        raise OpError("scenes.json is a symlink; refusing to write")
+    if not _no_symlink_below(p.root, "outlines"):
+        raise OpError("outlines/ is a symlink; refusing to back up")
+    if token:
+        token.check()
+    _stale_check(p, {"scenes.json": baseline["scenes.json"]})
+    current = _scenes_or_error(p)
+    if current:
+        dest_name = f"scenes_prev_{stamp()}.json"
+        dest = p.f("outlines", dest_name)
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = p.f("outlines", f"scenes_prev_{stamp()}_{n}.json")
+        import shutil
+        try:
+            shutil.copy2(p.f("scenes.json"), dest)
+        except OSError as e:
+            raise OpError(f"the scenes backup could not be written "
+                          f"({type(e).__name__})") from None
+    from .utils import write_json
+    write_json(p.f("scenes.json"), out)
+    _emit(events, "scene_cards_accepted", count=len(out))
+    return {"saved": len(out), "warnings": warnings,
+            "scene_ids": [c["id"] for c in out],
+            "backup": "outlines/scenes_prev_<stamp>.json" if current
+            else None}
+
+
 # ------------------------------------------------------------------ open
 
 _SAFE_JSON_FILES = ("project.json", "scenes.json", "summaries.json")
