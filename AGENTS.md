@@ -23,13 +23,18 @@ recorded for `gui-wayland-shell` (KWin 6.8.3, PySide6 6.12.0, DPR 1.0; interacti
 still pending with the owner).
 
 ## Planned desktop workspace
-`docs/ROADMAP.md` extends the completed CLI foundation with three GUI milestones:
-Wayland steer/generate/accept, setup/planning and draft controls, then continuity/
-review/revision/export. M1's first change, `openspec/changes/gui-wayland-shell/`,
+`docs/ROADMAP.md` requires every CLI/TUI feature in the GUI, start to finish;
+no individual change completes the workspace. Three changes remain in order:
+`gui-drafting-workspace`, `gui-project-planning`, then
+`gui-continuity-review-export`. M1's first change, `openspec/changes/gui-wayland-shell/`,
 is implemented on `feat/gui-wayland-shell`: the `gui` command opens the Qt
 Widgets reading/steering shell over `longform_core.reader_model` snapshots with
-per-scene steering via `longform_core.scene_steering`; generation, acceptance,
-and the background worker remain for `gui-steered-drafting` (do not create it yet).
+per-scene steering via `longform_core.scene_steering`; the implemented shell is
+unshipped. `openspec/changes/gui-drafting-workspace/` is now proposed for the
+entire draft loop, consolidating the former `gui-steered-drafting` and
+`gui-draft-controls`. Do not create the setup/planning or review changes yet.
+Full completion requires setup through export, all draft actions, offline
+CLI/GUI parity and separate real Wayland acceptance; this plan does not authorize shipping.
 ADR-0004/0005 (integrated from the reader baseline; 0005 superseded by ADR-0006)
 select PySide6/Qt Widgets for the expanded native Wayland workspace;
 ADR-0007 selects incremental shared operations and one background GUI worker.
