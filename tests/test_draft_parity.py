@@ -122,6 +122,8 @@ def _norm_tree(root):
     t = json.loads((Path(root) / "trees" / "s001.json").read_text(encoding="utf-8"))
     for n in t["nodes"].values():
         n.pop("created", None)
+        for h in n.get("history", []):
+            h.pop("time", None)
     return t
 
 
@@ -352,6 +354,69 @@ def test_prompt_dump_parity(tmp_path, monkeypatch, capsys):
     res = dop.dump_prompt(root2, "s001")
     assert (root2 / "last_prompt.txt").read_bytes() == dumped
     assert res["path"].endswith("last_prompt.txt")
+
+
+def test_manual_edit_branch_parity(tmp_path, monkeypatch, capsys):
+    """w/e/r/j CLI semantics match the shared operations, histories included."""
+    import stat
+    editor = tmp_path / "ed.sh"
+    editor.write_text('#!/bin/sh\nprintf %s "$NEW" > "$1"\n', encoding="utf-8")
+    editor.chmod(0o755)
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.setenv("VISUAL", str(editor))
+
+    def run(root, manual, edited):
+        monkeypatch.setenv("NEW", manual)
+        out = run_cli(root, ["w\n", "q\n"], monkeypatch, capsys)
+        assert f"added {out and '' or ''}" or True
+        monkeypatch.setenv("NEW", edited)
+        out2 = run_cli_after = None
+        return out
+
+    root = build(tmp_path / "p")
+    monkeypatch.setenv("NEW", "Manual passage by the author.")
+    run_cli(root, ["w\n", "q\n"], monkeypatch, capsys)
+    monkeypatch.setenv("NEW", "Manual passage, then revised.")
+    out = run_cli(root, ["e\n", "r\n", "j n2\n", "q\n"], monkeypatch, capsys)
+    tree = _norm_tree(root)
+    assert tree["head"] == "n2"
+    n4 = tree["nodes"]["n2"]
+    assert n4["source"] == "user" and n4["sep"] == "\n\n"
+    assert n4["text"] == "Manual passage, then revised."
+    assert n4["history"][-1]["by"] == "user-edit"
+    assert "head -> n1" in out and "head -> n2" in out
+    scenes = json.loads((root / "scenes.json").read_text(encoding="utf-8"))
+    assert scenes[0]["status"] == "drafting"
+
+    root2 = build(tmp_path / "p2")
+    dop.append_manual(root2, "s001", "Manual passage by the author.")
+    dop.edit_head(root2, "s001", "Manual passage, then revised.")
+    dop.rewind(root2, "s001")
+    dop.jump(root2, "s001", "n2")
+    assert _norm_tree(root2) == tree
+    assert json.loads((root2 / "scenes.json").read_text(encoding="utf-8")) == scenes
+
+
+def test_edit_noop_and_keep_lead_rules(tmp_path):
+    """Empty/unchanged edits are no-ops; continuation leading whitespace is
+    preserved for sep=\"\" nodes."""
+    root = build(tmp_path / "p")
+    res = dop.append_manual(root, "s001", "   ")
+    assert res["added"] is None
+    res = dop.edit_head(root, "s001", "   ")
+    assert not res["changed"]
+    res = dop.edit_head(root, "s001", "Mara counts the lit windows.")
+    assert not res["changed"], "unchanged edit is a no-op"
+
+    root2 = build(tmp_path / "p2")
+    t = json.loads((root2 / "trees" / "s001.json").read_text(encoding="utf-8"))
+    t["nodes"]["n1"]["text"] = "  indented continuation"
+    (root2 / "trees" / "s001.json").write_text(json.dumps(t), encoding="utf-8")
+    res = dop.edit_head(root2, "s001", "revised words")
+    assert res["changed"]
+    after = json.loads((root2 / "trees" / "s001.json").read_text(encoding="utf-8"))
+    assert after["nodes"]["n1"]["text"] == "  revised words", \
+        "continuation-leading whitespace preserved"
 
 
 def test_accept_matches_shared_operation(tmp_path, monkeypatch, capsys):

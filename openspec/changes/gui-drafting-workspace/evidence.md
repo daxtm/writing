@@ -125,3 +125,26 @@ AttributeError: module 'longform_core.gui_window' has no attribute 'SCENE'
   post-accept status, and missing credentials disable only generation while
   inspection stays usable.
 - Full suite: 238 passed.
+
+## 1.6 — built-in editors and branch navigation
+
+- Headless parity first (`tests/test_draft_parity.py`, +2 tests): CLI
+  `w`/`e`/`r`/`j` route through `append_manual`/`edit_head`/`rewind`/`jump`
+  with identical trees, histories (by=user-edit) and planned->drafting;
+  empty/unchanged edits are no-ops and `keep_lead` preserves
+  continuation-leading whitespace for sep="" nodes.
+- Offscreen `case_draft_edit_and_branches` written first; red run:
+```
+AttributeError: 'MainWindow' object has no attribute 'view_btn'  (editor/branch buttons missing)
+```
+- After implementing the built-in editor (New passage / Edit head with
+  Save/Cancel, diff label, no $EDITOR) and the Branches bar (Rewind, Use as
+  head, Delete leaf, Marked manuscript, Tail N): the case passes — manual
+  append (source=user, sep "\n\n", planned->drafting), empty/cancel no-ops,
+  edit history+diff, rewind keeps branches, explicit jump, nonleaf deletion
+  refused with tree unchanged, leaf deleted, marked view and tail match CLI
+  semantics. reader_model now carries the sanitized `absent` mentions for
+  node warnings. A settlement-slot bug found by the case (KeyError on missing
+  "scene" key wedging buttons) is fixed in the ops results and the done
+  handler is now exception-guarded.
+- Full suite: 240 passed.

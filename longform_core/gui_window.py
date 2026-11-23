@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from .prompt import tail_trim_chars
+from .utils import word_diff
 from . import draft_operations as dop
 from . import reader_model as rm
 from . import scene_steering as ss
@@ -119,6 +121,7 @@ class MainWindow(QMainWindow):
         self._op_rows = None
         self._view_override = None    # (label, text) shown until cleared
         self._scene_edit_dirty = {}   # scene -> user edited pov/cast fields
+        self._editor_target = None
         try:
             self._session = dop.session_info(self._root)
         except dop.OpError as e:
@@ -177,7 +180,12 @@ class MainWindow(QMainWindow):
         self.metadata = QPlainTextEdit()
         self.metadata.setReadOnly(True)
         self.tabs.addTab(self.reading, "Manuscript")
-        self.tabs.addTab(self.metadata, "Branches")
+        branch_widget = QWidget()
+        branch_l = QVBoxLayout(branch_widget)
+        branch_l.setContentsMargins(0, 0, 0, 0)
+        branch_l.addLayout(self._build_branches_controls())
+        branch_l.addWidget(self.metadata, 1)
+        self.tabs.addTab(branch_widget, "Branches")
         self.tabs.addTab(self._build_draft_tab(), "Draft")
         self.tabs.addTab(self._build_scene_tab(), "Scene")
         self.tabs.addTab(self._build_context_tab(), "Context")
@@ -395,7 +403,202 @@ class MainWindow(QMainWindow):
         self.discard_btn.clicked.connect(lambda: self.close_tray("Discard preview"))
         tbtns.addWidget(self.discard_btn)
         l.addLayout(tbtns)
+        ebtns = QHBoxLayout()
+        self.new_passage_btn = QPushButton("New passage")
+        self.new_passage_btn.setToolTip(
+            "Open the built-in editor to write a passage yourself; it is "
+            "appended after the head as a new paragraph (no external editor)")
+        self.new_passage_btn.clicked.connect(self.new_passage)
+        ebtns.addWidget(self.new_passage_btn)
+        self.edit_head_btn = QPushButton("Edit head")
+        self.edit_head_btn.setToolTip(
+            "Open the built-in editor on the head passage; history and the "
+            "diff are recorded (no external editor)")
+        self.edit_head_btn.clicked.connect(self.edit_head)
+        ebtns.addWidget(self.edit_head_btn)
+        self.editor_save_btn = QPushButton("Save")
+        self.editor_save_btn.clicked.connect(self.save_editor)
+        ebtns.addWidget(self.editor_save_btn)
+        self.editor_cancel_btn = QPushButton("Cancel")
+        self.editor_cancel_btn.clicked.connect(self.cancel_editor)
+        ebtns.addWidget(self.editor_cancel_btn)
+        ebtns.addStretch(1)
+        l.addLayout(ebtns)
+        self.editor_label = QLabel("Editor (no external editor is started)")
+        l.addWidget(self.editor_label)
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText(
+            "Write here; Save applies through the shared operations, Cancel "
+            "discards. Empty or unchanged input makes no change.")
+        l.addWidget(self.editor, 1)
+        self.editor_diff = QLabel("")
+        self.editor_diff.setWordWrap(True)
+        l.addWidget(self.editor_diff)
         return box
+
+    def _build_branches_controls(self):
+        """Branch bar for the Branches tab: rewind/jump/delete/marked/tail."""
+        bar = QHBoxLayout()
+        self.rewind_btn = QPushButton("Rewind")
+        self.rewind_btn.setToolTip("Move head to its parent; the branch is kept")
+        self.rewind_btn.clicked.connect(self.rewind)
+        bar.addWidget(self.rewind_btn)
+        self.use_as_head_btn = QPushButton("Use as head")
+        self.use_as_head_btn.setToolTip(
+            "Switch the accepted path to the selected saved node (explicit, "
+            "like CLI j ID)")
+        self.use_as_head_btn.clicked.connect(self.use_as_head)
+        bar.addWidget(self.use_as_head_btn)
+        self.delete_node_btn = QPushButton("Delete leaf")
+        self.delete_node_btn.setToolTip("Delete the selected node only if it "
+                                        "has no children")
+        self.delete_node_btn.clicked.connect(self.delete_selected_node)
+        bar.addWidget(self.delete_node_btn)
+        self.marked_btn = QPushButton("Marked manuscript")
+        self.marked_btn.setToolTip("Show the active path with node markers "
+                                   "(CLI v)")
+        self.marked_btn.clicked.connect(self.show_marked)
+        bar.addWidget(self.marked_btn)
+        bar.addWidget(QLabel("Tail"))
+        self.tail_spin = QSpinBox()
+        self.tail_spin.setRange(1, 100000)
+        self.tail_spin.setValue(600)
+        bar.addWidget(self.tail_spin)
+        self.tail_btn = QPushButton("Tail N")
+        self.tail_btn.setToolTip("Show the last N characters of the current "
+                                 "scene (CLI tail, default 600)")
+        self.tail_btn.clicked.connect(self.show_tail)
+        bar.addWidget(self.tail_btn)
+        bar.addStretch(1)
+        return bar
+
+    def new_passage(self):
+        if self._busy:
+            return
+        self._editor_target = ("new", None)
+        self.editor_label.setText(
+            f"New passage for {self._scene_sel} — appended after the head as "
+            "a new paragraph (source=user)")
+        self.editor.setPlainText("")
+        self.editor_diff.setText("")
+
+    def edit_head(self):
+        if self._busy or self._scene_sel is None:
+            return
+        view = self.snap.trees.get(self._scene_sel) if self.snap else None
+        if view is None or view.head is None:
+            self._status("nothing to edit", error=True)
+            return
+        self._editor_target = ("edit", view.head)
+        self.editor_label.setText(f"Editing head {view.head} — history keeps "
+                                  "the old text (by user-edit)")
+        self.editor.setPlainText(view.nodes[view.head].text)
+        self.editor_diff.setText("")
+
+    def save_editor(self):
+        if self._busy or self._scene_sel is None:
+            return
+        target = getattr(self, "_editor_target", None)
+        if target is None:
+            self._status("Open New passage or Edit head first.")
+            return
+        text = self.editor.toPlainText()
+        scene = self._scene_sel
+        self._op_scene = scene
+        if target[0] == "new":
+            if not text.strip():
+                self._status("Empty input: no passage added.")
+                return
+
+            def fn(sink, token):
+                return dop.append_manual(self._root, scene, text, token=token)
+
+        else:
+            def fn(sink, token):
+                return dop.edit_head(self._root, scene, text, token=token)
+
+        self._dispatch(fn, kind="editor", rows=target)
+
+    def cancel_editor(self):
+        self._editor_target = None
+        self.editor.setPlainText("")
+        self.editor_diff.setText("")
+        self.editor_label.setText("Editor (no external editor is started)")
+
+    def _branch_node_selected(self):
+        kind, tree_id, node_id = self._sel_data or (None, None, None)
+        if kind in (KIND_NODE, KIND_RETAINED_NODE) and node_id:
+            return tree_id, node_id
+        return None
+
+    def rewind(self):
+        if self._busy or self._scene_sel is None:
+            return
+        scene = self._scene_sel
+        self._op_scene = scene
+
+        def fn(sink, token):
+            return dop.rewind(self._root, scene, token=token)
+
+        self._dispatch(fn, kind="branch")
+
+    def use_as_head(self):
+        if self._busy:
+            return
+        sel = self._branch_node_selected()
+        if sel is None:
+            self._status("Select a node in the sidebar to use it as head.")
+            return
+        tree_id, nid = sel
+        self._op_scene = tree_id
+
+        def fn(sink, token):
+            return dop.jump(self._root, tree_id, nid, token=token)
+
+        self._dispatch(fn, kind="branch")
+
+    def delete_selected_node(self):
+        if self._busy:
+            return
+        sel = self._branch_node_selected()
+        if sel is None:
+            self._status("Select a node in the sidebar to delete it.")
+            return
+        tree_id, nid = sel
+        self._op_scene = tree_id
+
+        def fn(sink, token):
+            return dop.delete_leaf(self._root, tree_id, nid, token=token)
+
+        self._dispatch(fn, kind="branch")
+
+    def show_marked(self):
+        """CLI `v`: the active path with node markers (view-only)."""
+        if self.snap is None or self._scene_sel is None:
+            return
+        view = self.snap.trees.get(self._scene_sel)
+        if view is None or view.active_ids is None:
+            self._status("active text unavailable; saved nodes remain "
+                         "readable in the sidebar", error=True)
+            return
+        text = "\n\n".join(f"--- {i} ---\n{view.nodes[i].text.strip()}"
+                           for i in view.active_ids)
+        self._view_override = (f"marked manuscript for {self._scene_sel}", text)
+        self._update_panes()
+
+    def show_tail(self):
+        """CLI `tail [N]`: the last N characters of the active path."""
+        if self.snap is None or self._scene_sel is None:
+            return
+        view = self.snap.trees.get(self._scene_sel)
+        if view is None or view.active_text is None:
+            self._status("(empty)")
+            return
+        n = self.tail_spin.value()
+        text = tail_trim_chars(n, view.active_text, marker="…")
+        self._view_override = ("tail", f"last {n} chars (head "
+                                       f"{view.head or '-'}):\n{text}")
+        self._update_panes()
 
     def _build_notes_tab(self):
         notes_split = QSplitter(Qt.Orientation.Horizontal)
@@ -711,8 +914,18 @@ class MainWindow(QMainWindow):
         has_batch = bool(self._batch and self._batch.get("saved"))
         for b in (self.accept_btn, self.view_btn, self.reroll_btn,
                   self.reroll_all_btn, self.add_btn, self.delete_btn,
-                  self.keep_btn, self.discard_btn):
-            b.setEnabled(has_batch and not self._busy)
+                  self.keep_btn, self.discard_btn, self.new_passage_btn,
+                  self.edit_head_btn, self.editor_save_btn,
+                  self.editor_cancel_btn, self.rewind_btn,
+                  self.use_as_head_btn, self.delete_node_btn,
+                  self.save_pov_btn, self.save_cast_btn,
+                  self.mark_done_btn, self.save_prompt_btn):
+            b.setEnabled(not self._busy and
+                         (has_batch if b in (self.accept_btn, self.view_btn,
+                                             self.reroll_btn, self.reroll_all_btn,
+                                             self.add_btn, self.delete_btn,
+                                             self.keep_btn, self.discard_btn)
+                          else self._scene_sel is not None))
 
     # -------------------------------------------------------------- worker
 
@@ -772,7 +985,12 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._thread = None
         if outcome == "ok":
-            self._on_op_ok(value)
+            try:
+                self._on_op_ok(value)
+            except Exception as e:  # noqa: BLE001 — a settlement bug must
+                self._busy = False  # never wedge the window's controls
+                self._status(f"settlement error: {type(e).__name__}: {e}",
+                             error=True)
             self._update_steering_ui()
         elif outcome == "cancelled":
             self._update_steering_ui()
@@ -788,9 +1006,10 @@ class MainWindow(QMainWindow):
                              error=True)
 
     def _on_op_ok(self, value):
+        kind = self._op_kind
         if isinstance(value, dop.GenerateResult):
             note = None
-            if self._op_kind in ("reroll", "add") and self._batch:
+            if kind in ("reroll", "add") and self._batch:
                 note = self._merge_batch(value)
             else:
                 self._batch = {"scene": self._op_scene, "parent": value.parent,
@@ -802,14 +1021,14 @@ class MainWindow(QMainWindow):
                              "context ceiling (trim bible/state/lore or lower "
                              "budgets in project.json). No provider call ran.",
                              error=True)
-            elif self._op_kind == "reroll":
+            elif kind == "reroll":
                 self.refresh(force=True)
                 msg = (f"Rerolled {len(value.saved)} slot(s); originals stay "
                        "saved as branches and the head is unchanged.")
                 if note:
                     msg = f"warning: {note}"
                 self._status(msg)
-            elif self._op_kind == "add":
+            elif kind == "add":
                 self.refresh(force=True)
                 self._status(
                     f"Added {len(value.saved)} candidate(s) to the batch; "
@@ -823,7 +1042,7 @@ class MainWindow(QMainWindow):
             else:
                 self._status("No complete candidate came back; head and "
                              "saved branches are unchanged.")
-        elif isinstance(value, dict) and "head" in value:
+        elif kind == "accept" and isinstance(value, dict):
             self._batch = None
             self.tray.clear()
             self._preview_text = ""
@@ -844,7 +1063,7 @@ class MainWindow(QMainWindow):
                                  "post-accept status is unchanged")
                 return
             self._status(msg)
-        elif isinstance(value, dict) and "deleted" in value:
+        elif kind == "delete" and isinstance(value, dict):
             nid = value["deleted"]
             if self._batch and nid in self._batch["saved"]:
                 self._batch["saved"].remove(nid)
@@ -854,7 +1073,7 @@ class MainWindow(QMainWindow):
             self.refresh(force=True)
             self._status(f"deleted {nid}" +
                          (f"; head moved to {value['head']}" if value.get("head") is not None else ""))
-        elif isinstance(value, dict) and "status" in value and value.get("scene"):
+        elif kind == "scene" and isinstance(value, dict):
             # scene field writes (pov/cast/mark done)
             self._scene_edit_dirty[value["scene"]] = False
             self.refresh(force=True)
@@ -863,7 +1082,34 @@ class MainWindow(QMainWindow):
                              "separate step, not run here)")
             else:
                 self._status("Scene fields saved")
-        elif isinstance(value, dict) and "path" in value:
+        elif kind == "editor" and isinstance(value, dict):
+            self.refresh(force=True)
+            if "added" in value:
+                self.cancel_editor()
+                if value.get("added"):
+                    self._status(
+                        f"added {value['added']}"
+                        + ("; planned became drafting"
+                           if value.get("status_changed") else ""))
+                else:
+                    self._status("empty input: no passage added")
+            else:
+                if value.get("changed"):
+                    self.cancel_editor()
+                    self.editor_diff.setText(word_diff(value["old"], value["new"]))
+                    self._status(f"edited {value['head']}; old text kept in "
+                                 "history")
+                else:
+                    self._status("no changes (empty or unchanged input)")
+        elif kind == "branch" and isinstance(value, dict):
+            self.refresh(force=True)
+            if "deleted" in value:
+                self._status(f"deleted {value['deleted']}"
+                             + (f"; head moved to {value['head']}"
+                                if value.get("head") is not None else ""))
+            else:
+                self._status(f"head -> {value.get('head') or '(scene start)'}")
+        elif kind == "dump" and isinstance(value, dict):
             self._status(f"wrote {value['path']} (exact prompt bytes; "
                          "no provider call)")
 
@@ -1165,7 +1411,7 @@ class MainWindow(QMainWindow):
             return dop.accept_candidate(self._root, batch["scene"], nid,
                                         token=token, events=sink)
 
-        self._dispatch(fn)
+        self._dispatch(fn, kind="accept")
 
     def stop(self):
         """Cooperative Stop: the token is observed at request/chunk/save

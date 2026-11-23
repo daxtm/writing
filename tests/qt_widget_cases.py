@@ -1068,6 +1068,95 @@ def case_draft_scene_context(root):
     win.close(); win2.close(); win3.close()
 
 
+def case_draft_edit_and_branches(root):
+    """Built-in Save/Cancel editors (no $EDITOR), diff/history rules, rewind,
+    jump/use-as-head, delete leaf rules, marked manuscript and Tail N."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _build_project(root / "p", scenes=[_scene("s001")], trees={
+        "s001": _tree({"n1": _node("n1", None, "First passage."),
+                       "n2": _node("n2", "n1", "Sibling branch."),
+                       "n3": _node("n3", "n1", "A leaf to delete.")},
+                      head="n1")}, bible="B",
+        project_extra={"api_key": "sk-test"})
+    _write_json(project / "writer_preset.json", PRESET)
+    win = gw.MainWindow(str(project), choice=_no_dialogs("edit"),
+                        provider_factory=lambda _p: FakeProvider())
+    win.show()
+    win.select_item("manuscript", "s001", None)
+
+    # New passage: Save appends source=user paragraph and moves head
+    win.new_passage_btn.click()
+    win.editor.setPlainText("Written by hand.")
+    win.editor_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["head"] == "n4" and t["nodes"]["n4"]["source"] == "user"
+    assert t["nodes"]["n4"]["sep"] == "\n\n"
+    scenes = json.loads((project / "scenes.json").read_text())
+    assert scenes[0]["status"] == "drafting", "planned -> drafting on manual save"
+
+    # Empty save and Cancel make no change
+    before = (project / "trees" / "s001.json").read_text()
+    win.new_passage_btn.click()
+    win.editor.setPlainText("   ")
+    win.editor_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.editor_cancel_btn.click()
+    assert win.editor.toPlainText() == "" and not win._busy
+    assert (project / "trees" / "s001.json").read_text() == before, \
+        "empty/unchanged input is a no-op"
+
+    # Edit head: loads the text, records history, shows a diff
+    win.edit_head_btn.click()
+    assert "Written by hand." in win.editor.toPlainText()
+    win.editor.setPlainText("Written by hand, then revised.")
+    win.editor_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["nodes"]["n4"]["text"] == "Written by hand, then revised."
+    assert t["nodes"]["n4"]["history"][-1]["by"] == "user-edit"
+    assert "revised" in win.editor_diff.text(), "the diff is shown"
+    # unchanged edit is a no-op
+    win.edit_head_btn.click()
+    win.editor_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t2 = json.loads((project / "trees" / "s001.json").read_text())
+    assert t2["nodes"]["n4"]["history"] == t["nodes"]["n4"]["history"]
+
+    # Rewind keeps branches; Use as head switches explicitly; delete rules
+    win.rewind_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["head"] == "n1" and "n4" in t["nodes"], "rewind keeps the branch"
+    win.select_item("node", "s001", "n2")
+    win.use_as_head_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert json.loads((project / "trees" / "s001.json").read_text())["head"] == "n2"
+    win.select_item("node", "s001", "n1")
+    win.delete_node_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert "n1" in t["nodes"], "a node with children is refused"
+    assert "has children" in win.status.text()
+    win.select_item("node", "s001", "n3")
+    win.delete_node_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert "n3" not in t["nodes"], "a leaf is deleted"
+
+    # Marked manuscript view and Tail N
+    win.select_item("manuscript", "s001", None)
+    win.marked_btn.click()
+    assert "--- n1 ---" in win.reading.toPlainText()
+    assert "--- n4 ---" not in win.reading.toPlainText(), \
+        "the marked view shows the active path"
+    win.tail_spin.setValue(20)
+    win.tail_btn.click()
+    assert "last 20 chars" in win.reading.toPlainText()
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -1076,6 +1165,7 @@ CASES = {
     "case_draft_stale_refusal": case_draft_stale_refusal,
     "case_draft_candidate_tray": case_draft_candidate_tray,
     "case_draft_scene_context": case_draft_scene_context,
+    "case_draft_edit_and_branches": case_draft_edit_and_branches,
     "owner_flow_steering": case_owner_flow_steering,
     "case_navigation_no_writes": case_navigation_no_writes,
     "case_reading_states": case_reading_states,

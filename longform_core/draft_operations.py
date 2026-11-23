@@ -21,7 +21,7 @@ from .lore import Lore, pov_name
 from .prompt import build_writer_prompt, clean_continuation, format_card, writer_sampling
 from .reader_model import _no_symlink_below
 from .tree import Tree
-from .utils import FatalError, write_text
+from .utils import FatalError, keep_lead, now, write_text
 
 
 class OpError(Exception):
@@ -332,7 +332,7 @@ def set_cast(root, scene_id, names, *, token=None):
     if names:
         sc["characters"] = names
         _save_scenes(scenes, p, baseline)
-    return {"cast": sc.get("characters") or []}
+    return {"scene": scene_id, "cast": sc.get("characters") or []}
 
 
 def set_pov(root, scene_id, name, *, token=None):
@@ -344,7 +344,7 @@ def set_pov(root, scene_id, name, *, token=None):
     if name:
         sc["pov"] = name
         _save_scenes(scenes, p, baseline)
-    return {"pov": sc.get("pov", ""), "char": pov_name(sc)}
+    return {"scene": scene_id, "pov": sc.get("pov", ""), "char": pov_name(sc)}
 
 
 def mark_done(root, scene_id, *, token=None):
@@ -357,6 +357,88 @@ def mark_done(root, scene_id, *, token=None):
     _save_scenes(scenes, p, baseline)
     return {"status": "done", "scene": scene_id,
             "hint": f"scene {scene_id} done. next step: update-state {p.root} --scene {scene_id}"}
+
+
+def append_manual(root, scene_id, text, *, token=None, events=None):
+    """Append a manual passage after head as a new paragraph (CLI `w`).
+
+    Empty input is a no-op; a saved passage moves head and planned becomes
+    drafting."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    text = (text or "").strip()
+    if not text:
+        return {"added": None, "head": None}
+    tree = _tree(p, scene_id)
+    baseline = _capture(p, baseline_keys(p, [scene_id]))
+    if token:
+        token.check()
+    tree.head = tree.add(tree.head, text, source="user", sep="\n\n")
+    _save_tree(tree, p, scene_id, baseline)
+    status_changed = False
+    if sc.get("status") == "planned":
+        sc["status"] = "drafting"
+        _save_scenes(scenes, p, baseline)
+        status_changed = True
+    _emit(events, "added", nid=tree.head)
+    return {"added": tree.head, "head": tree.head, "status_changed": status_changed}
+
+
+def edit_head(root, scene_id, new_text, *, token=None, events=None):
+    """Edit the head passage in place (CLI `e`).
+
+    Preserves continuation-leading whitespace (`keep_lead`), records
+    time/old-text/by=user-edit history; empty or unchanged input is a no-op."""
+    from .utils import keep_lead
+
+    p, scenes, idx, sc = _session(root, scene_id)
+    tree = _tree(p, scene_id)
+    if not tree.head:
+        raise OpError("nothing to edit", soft=True)
+    baseline = _capture(p, baseline_keys(p, [scene_id]))
+    if token:
+        token.check()
+    n = tree.node(tree.head)
+    old = n["text"]
+    new = (new_text or "").rstrip()
+    if n.get("sep") == "":
+        new = keep_lead(old, new)
+    if not new.strip() or new == old:
+        return {"changed": False, "old": old, "new": old, "head": tree.head}
+    n["history"].append({"time": now(), "text": old, "by": "user-edit"})
+    n["text"] = new
+    _save_tree(tree, p, scene_id, baseline)
+    _emit(events, "edited", nid=tree.head)
+    return {"changed": True, "old": old, "new": new, "head": tree.head}
+
+
+def rewind(root, scene_id, *, token=None, events=None):
+    """Move head to its parent without deleting text (CLI `r`)."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    tree = _tree(p, scene_id)
+    if not tree.head:
+        return {"head": None}
+    baseline = _capture(p, baseline_keys(p, [scene_id]))
+    if token:
+        token.check()
+    tree.head = tree.node(tree.head)["parent"]
+    _save_tree(tree, p, scene_id, baseline)
+    _emit(events, "rewound", head=tree.head)
+    return {"head": tree.head}
+
+
+def jump(root, scene_id, nid, *, token=None, events=None):
+    """Explicitly switch the accepted path to a saved node (CLI `j ID`)."""
+    p, scenes, idx, sc = _session(root, scene_id)
+    tree = _tree(p, scene_id)
+    if nid not in tree.d["nodes"]:
+        raise OpError("no such node", soft=True)
+    baseline = _capture(p, baseline_keys(p, [scene_id]))
+    if token:
+        token.check()
+    tree.head = nid
+    _save_tree(tree, p, scene_id, baseline)
+    _emit(events, "jumped", head=nid)
+    return {"head": nid}
 
 
 def scene_card(root, scene_id):

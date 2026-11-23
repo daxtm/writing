@@ -898,36 +898,49 @@ def cmd_draft(p, args):
             elif cmd == "w":
                 txt = edit_saved(p, f"passage_{sc['id']}", "").strip()
                 if txt:
-                    tree.head = tree.add(tree.head, txt, source="user", sep="\n\n")
-                    tree.save()
-                    if sc["status"] == "planned":
-                        sc["status"] = "drafting"
-                        p.save_scenes(scenes)
-                    print(f"added {tree.head}")
+                    try:
+                        res = dop.append_manual(p.root, sc["id"], txt)
+                    except dop.OpError as e:
+                        _op_fail(e, soft_ok=True)
+                        res = None
+                    if res and res.get("added"):
+                        tree = Tree(p, sc["id"])
+                        scenes = p.scenes()
+                        sc = scenes[p.scene_index(scenes, sc["id"])]
+                        print(f"added {res['added']}")
             elif cmd == "e":
                 if not tree.head:
                     print("nothing to edit")
                     continue
                 n = tree.node(tree.head)
                 new = edit_saved(p, f"edit_{sc['id']}_{tree.head}", n["text"]).rstrip()
-                if n.get("sep") == "":
-                    new = keep_lead(n["text"], new)
-                if new.strip() and new != n["text"]:
-                    n["history"].append({"time": now(), "text": n["text"], "by": "user-edit"})
-                    n["text"] = new
-                    tree.save()
-                    print(word_diff(n["history"][-1]["text"], new))
+                try:
+                    res = dop.edit_head(p.root, sc["id"], new)
+                except dop.OpError as e:
+                    _op_fail(e, soft_ok=True)
+                    res = None
+                if res and res["changed"]:
+                    tree = Tree(p, sc["id"])
+                    print(word_diff(res["old"], res["new"]))
             elif cmd == "r":
                 if tree.head:
-                    tree.head = tree.node(tree.head)["parent"]
-                    tree.save()
-                    print(f"head -> {tree.head or '(scene start)'}")
+                    try:
+                        res = dop.rewind(p.root, sc["id"])
+                    except dop.OpError as e:
+                        _op_fail(e, soft_ok=True)
+                        res = None
+                    if res:
+                        tree = Tree(p, sc["id"])
+                        print(f"head -> {res['head'] or '(scene start)'}")
             elif cmd == "t":
                 show_tree(tree)
             elif cmd == "j":
                 if arg in tree.d["nodes"]:
-                    tree.head = arg
-                    tree.save()
+                    try:
+                        dop.jump(p.root, sc["id"], arg)
+                    except dop.OpError as e:
+                        _op_fail(e, soft_ok=True)
+                    tree = Tree(p, sc["id"])
                     print(f"head -> {arg}")
                 else:
                     print("no such node")

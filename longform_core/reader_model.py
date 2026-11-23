@@ -44,6 +44,7 @@ class NodeInfo:
     steer: str | None = None
     ended: bool | None = None
     trimmed: bool | None = None
+    absent: tuple[str, ...] = ()   # absent-character mentions (warnings)
     history: list[dict] = field(default_factory=list)  # {time, by, text}
     sep: str = "\n\n"
     link_ok: bool = True
@@ -390,6 +391,9 @@ def _parse_node(nid, rec, warnings, label):
     for name in ("ended", "trimmed"):
         value = rec.get(name)
         setattr(info, name, value if isinstance(value, bool) else None)
+    absent = rec.get("absent")
+    if isinstance(absent, list) and all(isinstance(x, str) for x in absent):
+        info.absent = tuple(absent)
     return info
 
 
