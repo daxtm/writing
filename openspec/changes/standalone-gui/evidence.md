@@ -111,11 +111,11 @@ widget cases and synthetic missing-socket startup failures only.
   command order, that failing frozen tests/builds/missing uv exit nonzero
   without skipping, and that the real script runs the mandatory frozen GUI test
   functions with no skip/importorskip path.
-- Final `./scripts/check.sh`: `== syntax`, `== cli smoke`, `== standalone`
-  → **40 passed in 19.70s**, `== tests` → **392 passed in 4.89s**, exit 0.
-  Artifact: 88,636,960 bytes, SHA-256
-  `d4a83900b47299fa22265e3a250ba52a4a54cd15436ff3542e1354160f7205ac`;
-  `dist/longform-build.json` 36K, `dist/THIRD-PARTY-NOTICES.txt` 207K.
+- Final `./scripts/check.sh` at source revision `44bdaf8` (clean tree):
+  `== syntax`, `== cli smoke`, `== standalone` → **40 passed in 19.29s**,
+  `== tests` → **392 passed in 4.88s**, exit 0. Artifact: 88,637,776 bytes,
+  SHA-256 `11a56ba9b0cc6fb04041ac2689694789fb9ee995698c8eab651879df37fbdba3`;
+  `dist/longform-build.json` 35K, `dist/THIRD-PARTY-NOTICES.txt` 207K.
 - Direct documented invocation from a clean state, with the fresh artifact
   reused rather than rebuilt: `uv run --with pytest --with httpx --with
   'pyside6>=6.12.0,<6.13' pytest -q tests` → **432 passed in 24.10s**.
