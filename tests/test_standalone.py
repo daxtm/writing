@@ -449,3 +449,103 @@ def test_build_script_fails_without_uv(tmp_path):
                        capture_output=True, text=True, env=env, timeout=300)
     assert r.returncode != 0, "build script must exit nonzero when uv is missing"
     assert "uv not found" in (r.stderr + r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Sidecars: build identity and third-party notices (tasks 1.3)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def build_json(built):
+    path = REPO / "dist" / "longform-build.json"
+    if not path.is_file():
+        pytest.fail("dist/longform-build.json missing; the build must record its identity")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_build_json_records_source_platform_interpreter_deps(built, build_json):
+    src = build_json["source"]
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(REPO),
+                          capture_output=True, text=True).stdout.strip()
+    assert src["commit"] == head
+    status = subprocess.run(["git", "status", "--porcelain", "-uno"], cwd=str(REPO),
+                            capture_output=True, text=True).stdout
+    assert src["dirty"] == bool(status.strip())
+
+    plat = build_json["platform"]
+    assert plat["os"] == "Linux"
+    assert plat["arch"] == "x86_64"
+    assert re.search(r"\d+\.\d+", plat["glibc"])
+
+    interp = build_json["interpreter"]
+    assert interp["implementation"] == "CPython"
+    assert interp["version"].startswith("3.11.")
+
+    deps = build_json["dependencies"]
+    for name, version in (("pyinstaller", "6.22.3"), ("pyinstaller-hooks-contrib", "2026.10"),
+                          ("httpx", "0.28.1"), ("certifi", None)):
+        actual = next((v for k, v in deps.items() if k.lower().replace("_", "-") == name), None)
+        assert actual is not None, f"{name} not recorded"
+        if version:
+            assert actual == version, f"{name}: expected {version}, recorded {actual}"
+
+    host = build_json["host_libraries"]
+    assert "libc.so.6" in host["ldd_artifact"], "artifact ldd boundary not recorded"
+    assert host["ldd_version"] == plat["glibc"]
+
+    art = build_json["artifact"]
+    assert art["bytes"] == built.exe.stat().st_size
+    import hashlib
+    assert art["sha256"] == hashlib.sha256(built.exe.read_bytes()).hexdigest()
+
+
+def test_third_party_notices_cover_bundled_licenses(built):
+    path = REPO / "dist" / "THIRD-PARTY-NOTICES.txt"
+    if not path.is_file():
+        pytest.fail("dist/THIRD-PARTY-NOTICES.txt missing; the build must record license texts")
+    text = path.read_text(encoding="utf-8")
+    assert "PSF" in text, "Python runtime license text missing"
+    assert "Bootloader Exception" in text, "PyInstaller bootloader exception missing"
+    assert "Mozilla Public License" in text, "certifi (CA data) license text missing"
+    for name, version in (("httpx", "0.28.1"), ("certifi", None), ("anyio", None),
+                          ("pyinstaller", "6.22.3"), ("pyinstaller-hooks-contrib", "2026.10")):
+        assert f"{name} {version}  (" in text if version else f"{name} " in text, \
+            f"license section for {name} missing"
+
+
+def test_copied_binary_runs_without_sidecars(built, tmp_path):
+    """The copied executable is alone in its directory: neither sidecar present."""
+    assert not (built.copied_dir / "longform-build.json").exists()
+    assert not (built.copied_dir / "THIRD-PARTY-NOTICES.txt").exists()
+    env = frozen_env(tmp_path, built.guard_so)
+    r = run_frozen(built.copied, ["--help"], env=env)
+    assert r.returncode == 0, r.stderr
+    assert "usage:" in r.stdout
+
+
+def test_extracted_certifi_data_loads_into_verifying_ssl_context(built, tmp_path):
+    """Packaging/trust evidence: the bundled CA data parses into a verifying SSL
+    context without an HTTPS call."""
+    script = textwrap.dedent("""
+        import json, ssl, tempfile, os, sys
+        from PyInstaller.archive.readers import CArchiveReader
+        r = CArchiveReader(sys.argv[1])
+        data = r.extract("certifi/cacert.pem")
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        os.close(fd)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(data)
+            ctx = ssl.create_default_context(cafile=path)
+        finally:
+            os.unlink(path)
+        print(json.dumps({"verify_mode": ctx.verify_mode, "ca_certs": len(ctx.get_ca_certs())}))
+    """)
+    r = subprocess.run([str(built.venv_py), "-c", script, str(built.exe)],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        pytest.fail("loading bundled CA data into an SSL context failed:\n" + r.stderr)
+    result = json.loads(r.stdout)
+    import ssl as _ssl
+    assert result["verify_mode"] == _ssl.CERT_REQUIRED, "verification must stay enabled"
+    assert result["ca_certs"] > 50, "certifi CA bundle did not load any certificates"
