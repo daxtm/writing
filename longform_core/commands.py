@@ -486,7 +486,8 @@ def cmd_scenes(p, args):
 
 DRAFT_HELP = """generation:
   g [N]        generate N candidate passages (default: writer.swipes; N=1 streams live)
-  s TEXT       set steering note (persists until changed); 's' edits it, 's -' clears it
+  s TEXT       set steering note (persists until changed); 's -' clears it
+  se           edit the current steering note in $EDITOR
   l N          set target passage length in words for this session (also caps max_tokens)
 scene cast:
   who A, B     set the characters physically present in this scene (saved to scenes.json)
@@ -782,12 +783,12 @@ def cmd_draft(p, args):
             elif cmd == "card":
                 print(format_card(sc))
             elif cmd == "s":
-                if arg == "-":
-                    steer = ""
-                elif arg:
-                    steer = arg
-                else:
-                    steer = edit_saved(p, f"steer_{sc['id']}", steer).strip()
+                steer = "" if arg in ("", "-") else arg
+                tree.d["steer"] = steer
+                tree.save()
+                print("steer cleared" if not steer else f"steer set: {steer[:200]}")
+            elif cmd == "se":
+                steer = edit_saved(p, f"steer_{sc['id']}", steer).strip()
                 tree.d["steer"] = steer
                 tree.save()
                 print("steer cleared" if not steer else f"steer set: {steer[:200]}")

@@ -94,6 +94,15 @@ def test_v_by_id_and_tail_command(tmp_path, net_guard_env):
     assert OPENING not in r.stdout
 
 
+def test_bare_s_still_clears_the_steering_note(tmp_path, net_guard_env):
+    root = make_project(tmp_path / "proj")
+    r = draft(root, "s\nq\n", net_guard_env)
+    assert r.returncode == 0, r.stderr
+    assert "steer cleared" in r.stdout
+    saved = json.loads((root / "trees" / "s001.json").read_text(encoding="utf-8"))
+    assert saved["steer"] == ""
+
+
 def test_steering_note_can_be_edited_in_editor(tmp_path, net_guard_env):
     root = make_project(tmp_path / "proj")
     editor = tmp_path / "editor.sh"
@@ -104,7 +113,7 @@ def test_steering_note_can_be_edited_in_editor(tmp_path, net_guard_env):
     env["VISUAL"] = str(editor)
     env["STEER_NEW"] = "edited in the editor\nsecond line"
 
-    r = draft(root, "s\nq\n", env)
+    r = draft(root, "se\nq\n", env)
     assert r.returncode == 0, r.stderr
     assert "steer set: edited in the editor" in r.stdout
     saved = json.loads((root / "trees" / "s001.json").read_text(encoding="utf-8"))
