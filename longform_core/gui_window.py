@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QLineEdit,
 )
 
 from .prompt import tail_trim_chars
@@ -3297,6 +3297,41 @@ class MainWindow(QMainWindow):
         self.setup_note.setWordWrap(True)
         l.addWidget(self.setup_note)
 
+        l.addWidget(QLabel("Credentials (masked entry; availability only is "
+                           "shown, never a value)"))
+        self.credential_entry = QLineEdit()
+        self.credential_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.credential_entry.setPlaceholderText(
+            "Paste a key to act on; it is never displayed or prefilled")
+        self.credential_entry.setToolTip(
+            "Password-mode entry, empty on load. Nothing happens until you "
+            "press an action button; the value is trimmed of outer "
+            "whitespace and never echoed back.")
+        self.credential_entry.returnPressed.connect(self.credential_use)
+        l.addWidget(self.credential_entry)
+        self.credential_status = QLabel("")
+        self.credential_status.setWordWrap(True)
+        l.addWidget(self.credential_status)
+        cbtns = QHBoxLayout()
+        self.credential_use_btn = QPushButton("Use for this session")
+        self.credential_use_btn.setToolTip(
+            "Activate the pasted key for this window only (ADR-0011): it "
+            "overrides project.json and the environment for every provider "
+            "action here, is cleared on close or when another project "
+            "opens, and project.json is never written.")
+        self.credential_use_btn.clicked.connect(self.credential_use)
+        cbtns.addWidget(self.credential_use_btn)
+        self.credential_clear_session_btn = QPushButton("Clear session key")
+        self.credential_clear_session_btn.setToolTip(
+            "Remove this window's session credential; the effective "
+            "credential falls back to project.json, then the environment, "
+            "then missing. project.json is never written.")
+        self.credential_clear_session_btn.clicked.connect(
+            self.credential_clear_session)
+        cbtns.addWidget(self.credential_clear_session_btn)
+        cbtns.addStretch(1)
+        l.addLayout(cbtns)
+
         l.addWidget(QLabel("Settings (supported nonsecret project.json "
                            "fields; unknown fields and any existing key are "
                            "preserved)"))
@@ -3656,7 +3691,11 @@ class MainWindow(QMainWindow):
     def _rebind_root(self, root):
         """Bind a new project root; clear caches, baselines and planning
         state, then reload the views."""
+        if Path(root) != self._root:
+            self._session_key = None      # a session never crosses projects
         self._root = Path(root)
+        if hasattr(self, "credential_entry"):
+            self.credential_entry.clear()
         self._cache = SourceCache()
         self.snap = None
         self._sel_data = None
@@ -3745,6 +3784,61 @@ class MainWindow(QMainWindow):
         for w in p["warnings"]:
             lines.append("warning: " + w)
         self.setup_status.setText("\n".join(lines))
+        self.credential_status.setText(self._credential_status_text())
+
+    def _credential_status_text(self):
+        """Availability, winning source and environment name only (ADR-0011)."""
+        p = self._plan
+        src = p.get("cred_source", "missing")
+        env = p.get("api_key_env") or "FEATHERLESS_API_KEY"
+        if src == "session":
+            return ("Available — session key for this window; it overrides "
+                    f"project.json and environment {env} for every provider "
+                    "action here and is cleared on close.")
+        if src == "project":
+            return ("Available — saved project.json api_key"
+                    + (f" (environment {env} also set)" if p.get("env_set")
+                       else ""))
+        if src == "environment":
+            return f"Available — environment {env}"
+        return ("Missing — no session key, no saved api_key and environment "
+                f"{env} not set; paste a key and press Use for this session, "
+                'or set "api_key" in project.json (plaintext).')
+
+    def credential_use(self):
+        """Activate the pasted key for this window only; nothing is written."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        val = self.credential_entry.text().strip()
+        if not val:
+            self._status("Enter a credential first; an empty entry changes "
+                         "nothing.", error=True)
+            return
+        self._session_key = val
+        self.credential_entry.clear()
+        self.refresh(force=True)
+        self._status("Credential set for this session; project.json is "
+                     "unchanged. Activation is not a validity check — use "
+                     "Test connection.")
+
+    def credential_clear_session(self):
+        """Remove the window override; project.json and the environment keep
+        their values and the effective credential falls back to them."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        if not self._session_key:
+            self._status("No session credential is active.")
+            return
+        self._session_key = None
+        self.credential_entry.clear()
+        self.refresh(force=True)
+        self._status("Session credential cleared; the saved project key, "
+                     "then the environment, applies again. project.json is "
+                     "unchanged.")
 
     # ------------------------------------------------------------ preset import
 
@@ -4104,6 +4198,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(self._busy)
         for b in (self.create_btn, self.open_btn, self.preset_import_btn,
                   self.settings_save_btn, self.settings_cancel_btn,
+                  self.credential_use_btn, self.credential_clear_session_btn,
                   self.fetch_limits_btn, self.bible_begin_btn,
                   self.bible_save_btn, self.bible_accept_btn,
                   self.bible_edit_btn, self.bible_skip_btn,
@@ -5365,3 +5460,4 @@ class MainWindow(QMainWindow):
             ev.ignore()
             return
         ev.accept()
+        self._session_key = None   # lifecycle: the session never survives close

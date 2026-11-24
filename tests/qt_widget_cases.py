@@ -3834,7 +3834,7 @@ def case_credentials_session(root):
 
     # typing alone is inert: no effective credential change, no request
     entry.setText(SESSION_SENTINEL + " ")
-    assert json.loads((fresh / "project.json").read_bytes()) == before
+    assert (fresh / "project.json").read_bytes() == before
     assert fake.calls == [] and fake.started == 0, "typing makes no request"
     assert "missing" in win.credential_status.text().lower()
 
@@ -3846,7 +3846,7 @@ def case_credentials_session(root):
     status = win.credential_status.text()
     assert "Available" in status and "session" in status, status
     _assert_no_sentinel(win)
-    assert json.loads((fresh / "project.json").read_bytes()) == before, \
+    assert (fresh / "project.json").read_bytes() == before, \
         "session use never writes project.json"
 
     # prerequisites: the session credential satisfies readiness
@@ -3871,7 +3871,8 @@ def case_credentials_session(root):
         "outline generation ran with the session credential active"
     assert win._outline_overview.get("candidates"), "candidates were generated"
     _assert_no_sentinel(win)
-    assert json.loads((fresh / "project.json").read_bytes()) == before
+    assert (fresh / "project.json").read_bytes() == before, \
+        "outline generation never writes project.json"
 
     # lifecycle: closing clears the session; a new window never inherits it
     win.close()
