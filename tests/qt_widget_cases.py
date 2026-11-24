@@ -3975,6 +3975,61 @@ def case_credentials_storage(root):
     win.close()
 
 
+def case_credentials_connection(root):
+    """gui-api-key-setup: Test connection is explicit and non-generative —
+    one /plan lookup per click, no generation, no limits.json, sanitized
+    success/failure naming the source without a value."""
+    import longform_core.gui_window as gw
+    a = app()
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+    fake = PlanningFake(plan={"max_context_length": 8192, "concurrency": 2},
+                        models=_credential_models())
+    proj = _credential_project(root, "conn", cfg={})
+    win = gw.MainWindow(str(proj), choice=_no_dialogs("credentials"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.tabs.setCurrentIndex(gw.SETUP)
+
+    # missing credentials: recovery guidance, no request, no factory call
+    win.credential_test_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.calls == [] and fake.started == 0
+    err = win.status.text()
+    assert "no API key" in err and "Use for this session" in err, \
+        f"recovery guidance: {err!r}"
+    assert not (proj / "limits.json").exists()
+    _assert_no_sentinel(win)
+
+    # session credential: one plan lookup, source named, nothing written
+    win.credential_entry.setText(SESSION_SENTINEL)
+    win.credential_use_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    before = (proj / "project.json").read_bytes()
+    fake.calls.clear()
+    win.credential_test_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.calls == [("GET", "/plan")], "exactly one plan lookup"
+    assert fake.started == 0, "the connection test never generates"
+    assert not (proj / "limits.json").exists()
+    assert (proj / "project.json").read_bytes() == before
+    msg = win.status.text()
+    assert "succeeded" in msg.lower() and "session" in msg.lower(), msg
+    _assert_no_sentinel(win)
+
+    # a failing lookup reports a sanitized failure and writes nothing
+    fake.calls.clear()
+    fake.get_fail_on = {0}
+    fake.gets = 1   # the fake checks (gets - 1) before its own increment
+    win.credential_test_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.calls == [("GET", "/plan")]
+    msg = win.status.text()
+    assert "failed" in msg.lower(), msg
+    _assert_no_sentinel(win)
+    assert not (proj / "limits.json").exists()
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -4005,6 +4060,7 @@ CASES = {
     "case_planning_settings_limits": case_planning_settings_limits,
     "case_credentials_session": case_credentials_session,
     "case_credentials_storage": case_credentials_storage,
+    "case_credentials_connection": case_credentials_connection,
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
     "case_planning_scenes": case_planning_scenes,

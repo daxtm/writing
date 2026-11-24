@@ -690,6 +690,52 @@ def test_save_credential_stop_writes_nothing(tmp_path):
     assert (root / "project.json").read_bytes() == before
 
 
+# ------------------------------------------------------------ test_connection
+
+def test_connection_succeeds_discarding_content(tmp_path, monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    root = tmp_path / "p"
+    plan.init_project(root)
+    prov = FakeLimitsProvider(PLAN, {})
+    out = plan.test_connection(root, provider_factory=lambda p: prov,
+                               session=True)
+    assert out["ok"] is True and out["cred_source"] == "session"
+    assert ("GET", "/plan") in prov.calls
+    blob = json.dumps(out)
+    assert "max_context_length" not in blob, "response content is discarded"
+    assert not (root / "limits.json").exists(), "nothing is written"
+
+
+def test_connection_saved_key_and_missing_credentials(tmp_path, monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    root = init_p(tmp_path / "p")
+    prov = FakeLimitsProvider(PLAN, {})
+    out = plan.test_connection(root, provider_factory=lambda p: prov)
+    assert out["cred_source"] == "project"
+    assert out["ok"] is True
+
+    empty = tmp_path / "e"
+    plan.init_project(empty)
+    prov2 = FakeLimitsProvider(PLAN, {})
+    with pytest.raises(OpError) as e:
+        plan.test_connection(empty, provider_factory=lambda p: prov2)
+    assert "no API key" in str(e.value) and "Use for this session" in \
+        str(e.value)
+    assert prov2.calls == [], "missing credentials never construct a request"
+
+
+def test_connection_failure_is_sanitized(tmp_path):
+    root = init_p(tmp_path / "p")   # inline credential is "sk-test"
+    prov = FakeLimitsProvider(PLAN, {}, fail={
+        "plan": RuntimeError("fake provider failed with sk-test echoed")})
+    with pytest.raises(OpError) as e:
+        plan.test_connection(root, provider_factory=lambda p: prov)
+    assert "connection test failed" in str(e.value)
+    assert "sk-test" not in str(e.value), "the credential echo is scrubbed"
+    assert "[redacted]" in str(e.value)
+    assert not (root / "limits.json").exists()
+
+
 # ---------------------------------------------------------------- limits
 
 class FakeLimitsProvider:

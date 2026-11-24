@@ -3345,6 +3345,13 @@ class MainWindow(QMainWindow):
         self.credential_clear_saved_btn.clicked.connect(
             self.credential_clear_saved)
         cbtns.addWidget(self.credential_clear_saved_btn)
+        self.credential_test_btn = QPushButton("Test connection")
+        self.credential_test_btn.setToolTip(
+            "One /plan lookup through the effective credential (session, "
+            "then project, then environment); never generates anything, "
+            "keeps no response content and writes nothing.")
+        self.credential_test_btn.clicked.connect(self.credential_test)
+        cbtns.addWidget(self.credential_test_btn)
         cbtns.addStretch(1)
         l.addLayout(cbtns)
 
@@ -3951,6 +3958,21 @@ class MainWindow(QMainWindow):
 
         self._dispatch(fn, kind="credential_save")
 
+    def credential_test(self):
+        """Explicit non-generative connection test on the worker."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        root = plan.canonical_root(self._root)
+
+        def fn(sink, token):
+            return plan.test_connection(root, provider_factory=self._seam(),
+                                        session=self._availability(),
+                                        token=token, events=sink)
+
+        self._dispatch(fn, kind="credential_test")
+
     # ------------------------------------------------------------ preset import
 
     def import_preset(self):
@@ -4311,6 +4333,7 @@ class MainWindow(QMainWindow):
                   self.settings_save_btn, self.settings_cancel_btn,
                   self.credential_use_btn, self.credential_clear_session_btn,
                   self.credential_save_btn, self.credential_clear_saved_btn,
+                  self.credential_test_btn,
                   self.fetch_limits_btn, self.bible_begin_btn,
                   self.bible_save_btn, self.bible_accept_btn,
                   self.bible_edit_btn, self.bible_skip_btn,
@@ -4716,6 +4739,11 @@ class MainWindow(QMainWindow):
                 if value["action"] != "clear" else
                 "Cleared the saved project credential; availability "
                 "refreshed.")
+        elif kind == "credential_test" and isinstance(value, dict):
+            self._status(
+                "Connection succeeded using "
+                f"{value['cred_source']} credentials; the response content "
+                "was discarded and nothing was written.")
         elif kind == "limits" and isinstance(value, dict):
             self.limits_view.setPlainText(self._limits_text(value["view"]))
             msg = ("limits fetched and saved to limits.json"

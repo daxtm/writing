@@ -1675,6 +1675,39 @@ def _first_int(d, keys):
     return None
 
 
+def test_connection(root, *, provider_factory=None, token=None, events=None,
+                    session=False):
+    """Explicit non-generative connection test (ADR-0011): one /plan lookup
+    through the effective credential chain, reusing the shared Api retry and
+    timeout behavior. The response content is discarded and nothing is
+    written (limits.json stays untouched); a failure is a sanitized OpError.
+    `session` is the GUI's window-credential availability input."""
+    p = _project_of(root)
+    creds = credential_state(p.cfg, session=session)
+    if not creds["available"]:
+        env = creds["api_key_env"]
+        raise OpError(
+            f'no API key: set "api_key" in project.json, or export {env}=...'
+            " (paste a key and press Use for this session, or set api_key "
+            "in project.json)", soft=True)
+    provider = _provider(p, provider_factory)
+    if token:
+        token.check()
+    try:
+        provider.get("/plan", token=token,
+                     on_retry_event=None if events is None else (
+                         lambda why, delay: _emit(events, "retry",
+                                                  why=why, delay=delay)))
+    except Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001 — sanitized outcome, file untouched
+        raise OpError("connection test failed: "
+                      f"{scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
+    return {"ok": True, "cred_source": creds["source"],
+            "api_key_env": creds["api_key_env"]}
+
+
 def fetch_limits(root, *, provider_factory=None, token=None, events=None,
                  session=False):
     """Explicit limits fetch through the shared Api (CLI `limits`).
