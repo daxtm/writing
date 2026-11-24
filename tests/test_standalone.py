@@ -17,6 +17,7 @@ is never skipped.
 """
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -335,6 +336,7 @@ def built(tmp_path_factory, net_guard):
     venv_py = REPO / "build" / "standalone" / "venv" / "bin" / "python"
     inputs = [BUILD_SCRIPT, REPO / "scripts" / "standalone-requirements.txt", REPO / "longform.py"]
     inputs += sorted((REPO / "longform_core").glob("*.py"))
+    inputs += sorted((REPO / "longform_core" / "resources").glob("*.json"))
     inputs += [REPO / "scripts" / "standalone_sidecars.py"]
     inputs += sorted((REPO / "scripts" / "standalone-licenses").glob("*"))
     fresh = (exe.is_file() and venv_py.is_file()
@@ -406,12 +408,85 @@ def test_copied_binary_init_creates_project_files(built, tmp_path):
     assert f"project: {proj}" in r.stdout
     made = r.stdout.splitlines()[1]
     assert made.startswith("created: ")
-    for name in ("project.json", "bible.md", "state.md", "scenes.json", "summaries.json"):
+    assert made == "created: project.json, bible.md, state.md, scenes.json, " \
+        "summaries.json, writer_preset.json", made
+    for name in ("project.json", "bible.md", "state.md", "scenes.json",
+                 "summaries.json", "writer_preset.json"):
         assert (proj / name).is_file(), name
-    for d in ("trees", "outlines", "critiques", "checks", "state_history", "lorebooks", "bible_history"):
+    for d in ("trees", "outlines", "critiques", "checks", "state_history",
+              "lorebooks", "bible_history"):
         assert (proj / d).is_dir(), d
     cfg = json.loads((proj / "project.json").read_text(encoding="utf-8"))
     assert cfg["title"] == "Untitled"
+    # The bundled defaults match the reviewed repository assets byte for byte.
+    assert (proj / "writer_preset.json").read_bytes() == \
+        (REPO / "longform_core" / "resources" / "writer_preset.json").read_bytes(), \
+        "the copied executable must ship the reviewed preset verbatim"
+    defaults = json.loads(
+        (REPO / "longform_core" / "resources" / "project_defaults.json")
+        .read_text(encoding="utf-8"))
+    for key, value in defaults.items():
+        if key == "api_key":
+            assert cfg.get("api_key", "") == "", "no credential is initialized"
+            continue
+        assert cfg.get(key) == value, \
+            f"project.json field {key} not taken from the bundled defaults"
+
+
+def test_copied_binary_init_repeat_and_preset_override(built, tmp_path):
+    """create-missing-only semantics and explicit override precedence agree
+    between the copied executable and the source launcher, with the owner's
+    originals inaccessible and no checkout adjacency supplying defaults."""
+    work = tmp_path / "repeat work dir"
+    work.mkdir()
+    env = frozen_env(tmp_path, built.guard_so)
+    proj = tmp_path / "repeat project"
+    assert run_frozen(built.copied, ["init", str(proj)], env=env, cwd=work).returncode == 0
+
+    preset = proj / "writer_preset.json"
+    preset.write_text('{"custom": true}\n', encoding="utf-8")
+    before = preset.read_bytes()
+    r = run_frozen(built.copied, ["init", str(proj)], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert "nothing; all files already exist" in r.stdout, r.stdout
+    assert preset.read_bytes() == before, "repeat init overwrote an existing preset"
+
+    # an explicit synthetic preset wins for a missing destination
+    synthetic = tmp_path / "synthetic override.json"
+    synthetic.write_text(json.dumps(WRITER_PRESET) + "\n", encoding="utf-8")
+    other = tmp_path / "override project"
+    r = run_frozen(built.copied, ["init", str(other), "--preset", str(synthetic)],
+                   env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert (other / "writer_preset.json").read_bytes() == synthetic.read_bytes()
+    # an existing destination is preserved and the override is refused
+    r = run_frozen(built.copied, ["init", str(other), "--preset", str(synthetic)],
+                   env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert "not overwritten" in r.stdout or "not-overwritten" in r.stdout, r.stdout
+    assert (other / "writer_preset.json").read_bytes() == synthetic.read_bytes()
+
+    # an invalid explicit preset fails closed with a diagnostic, exit nonzero
+    bad = tmp_path / "bad preset.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+    fresh = tmp_path / "fresh failclosed"
+    r = run_frozen(built.copied, ["init", str(fresh), "--preset", str(bad)],
+                   env=env, cwd=work)
+    assert r.returncode != 0, r.stdout
+    blob = r.stdout + r.stderr
+    assert "error: the selected preset is not valid JSON" in blob, blob
+    assert "created before the error" in blob, \
+        "partial work must be reported truthfully"
+    assert not (fresh / "writer_preset.json").exists(), \
+        "an invalid preset must not produce a preset"
+    # an unreadable explicit source names the supplied path, as in source
+    gone = tmp_path / "unreadable preset.json"
+    fresh2 = tmp_path / "fresh unreadable"
+    r = run_frozen(built.copied, ["init", str(fresh2), "--preset", str(gone)],
+                   env=env, cwd=work)
+    assert r.returncode != 0, r.stdout
+    assert str(gone) in r.stdout + r.stderr, "the diagnostic must name the path"
+    assert not (fresh2 / "writer_preset.json").exists()
 
 
 def test_copied_binary_headless_cli_without_display_variables(built, tmp_path):
@@ -487,6 +562,13 @@ INSPECT_ARCHIVE_SCRIPT = textwrap.dedent("""
     libpython_name = [n for n in cnames if n.startswith("libpython")][0]
     libpython = r.extract(libpython_name)
     cacert = r.extract("certifi/cacert.pem")
+    import hashlib
+    resources = {}
+    for n in cnames:
+        if n.startswith("longform_core/resources/"):
+            data = r.extract(n)
+            resources[n] = {"bytes": len(data),
+                            "sha256": hashlib.sha256(data).hexdigest()}
     print(json.dumps({
         "carchive": cnames,
         "pyz": pyz_names,
@@ -494,6 +576,7 @@ INSPECT_ARCHIVE_SCRIPT = textwrap.dedent("""
         "has_pyinit_ssl": b"PyInit__ssl" in libpython,
         "cacert_size": len(cacert),
         "cacert_head": cacert[:2048].decode("ascii", "replace"),
+        "resources": resources,
     }))
 """)
 
@@ -548,6 +631,25 @@ def test_archive_contains_no_private_or_test_inputs(archive_contents):
     names = archive_contents["carchive"] + archive_contents["pyz"]
     for fragment in FORBIDDEN_ARCHIVE_FRAGMENTS:
         assert not any(fragment in n for n in names), f"private/test input {fragment!r} in bundle"
+
+
+def test_archive_bundles_reviewed_resources_exactly(archive_contents):
+    """Only the two reviewed defaults assets are packaged, byte-identical to the
+    repository copies; any missing/stale/corrupt packaged resource breaks the
+    frozen suite instead of producing a silently incomplete executable."""
+    resources = archive_contents["resources"]
+    assert set(resources) == {"longform_core/resources/project_defaults.json",
+                              "longform_core/resources/writer_preset.json"}, \
+        f"unexpected packaged resource set: {sorted(resources)}"
+    for name, info in resources.items():
+        repo_bytes = (REPO / name).read_bytes()
+        assert info["bytes"] == len(repo_bytes), name
+        assert info["sha256"] == hashlib.sha256(repo_bytes).hexdigest(), \
+            f"{name} differs between the archive and the repository"
+    assert all(f not in archive_contents["carchive"] + archive_contents["pyz"]
+               for f in ("project.json", "writer_prompt_fixture.json",
+                         "56295265-LLam_ception-1.3.json")), \
+        "private project data must never be packaged"
 
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1138,16 @@ def test_build_json_records_source_platform_interpreter_deps(built, build_json):
     import hashlib
     assert art["sha256"] == hashlib.sha256(built.exe.read_bytes()).hexdigest()
 
+    res = build_json["bundled_resources"]
+    assert "ADR-0010" in res["note"]
+    assert [e["path"] for e in res["files"]] == \
+        ["longform_core/resources/project_defaults.json",
+         "longform_core/resources/writer_preset.json"]
+    for e in res["files"]:
+        repo_bytes = (REPO / e["path"]).read_bytes()
+        assert e["bytes"] == len(repo_bytes)
+        assert e["sha256"] == hashlib.sha256(repo_bytes).hexdigest()
+
     for name, version in (("pyside6-essentials", "6.12.0"), ("shiboken6", "6.12.0")):
         actual = next((v for k, v in deps.items()
                        if k.lower().replace("_", "-") == name), None)
@@ -1098,6 +1210,12 @@ def test_third_party_notices_cover_bundled_licenses(built, build_json):
     assert "Bundled plugin inventory:" in text
     for plugin in gui["inventory"]["wayland_platform_plugins"]:
         assert plugin in text, f"bundled plugin {plugin} not listed in notices"
+    assert "Bundled reviewed resources (application-owned, ADR-0010):" in text
+    for e in build_json["bundled_resources"]["files"]:
+        assert e["path"] in text, f"bundled resource {e['path']} not listed"
+        assert f"sha256={e['sha256']}" in text
+    for fragment in ("fuckpi", "56295265", "LLam_ception"):
+        assert fragment not in text, "private source data leaked into notices"
 
 
 def test_copied_binary_runs_without_sidecars(built, tmp_path):
@@ -1136,3 +1254,39 @@ def test_extracted_certifi_data_loads_into_verifying_ssl_context(built, tmp_path
     import ssl as _ssl
     assert result["verify_mode"] == _ssl.CERT_REQUIRED, "verification must stay enabled"
     assert result["ca_certs"] > 50, "certifi CA bundle did not load any certificates"
+
+
+# ---------------------------------------------------------------------------
+# Bundled defaults: failure and override parity (project-defaults-full-init)
+# ---------------------------------------------------------------------------
+
+def test_parity_init_explicit_preset_failure_and_missing_source(built, tmp_path):
+    """Invalid and unreadable explicit presets fail closed identically: exit
+    status, the diagnostic naming the supplied path and no success transcript
+    agree between the copied executable and the source launcher."""
+    bad = tmp_path / "bad preset.json"
+    bad.write_text("{nope", encoding="utf-8")
+    fr, sr, f_root, _ = parity(built, tmp_path,
+                               ["init", "@ROOT@", "--preset", str(bad)])
+    assert fr.returncode != 0
+    assert "not valid JSON" in fr.stderr
+    assert not (f_root / "writer_preset.json").exists()
+    gone = tmp_path / "definitely gone.json"
+    fr, _, _, _ = parity(built, tmp_path,
+                         ["init", "@ROOT@", "--preset", str(gone)],
+                         cwd="frozen-work-bad")
+    assert fr.returncode != 0
+    assert "gone.json" in fr.stderr + fr.stdout
+
+
+def test_parity_init_preset_restore_after_removal(built, tmp_path):
+    """Removing a default preset and repeating init restores exactly that
+    missing default on both sides (create-missing-only, other bytes intact)."""
+    _, _, f_root, s_root = parity(built, tmp_path, ["init", "@ROOT@"])
+    for root in (f_root, s_root):
+        (root / "writer_preset.json").unlink()
+    parity(built, tmp_path, ["init", "@ROOT@"], cwd="frozen-work-restore")
+    assert (f_root / "writer_preset.json").read_bytes() == \
+        (REPO / "longform_core" / "resources" / "writer_preset.json").read_bytes()
+    assert (f_root / "writer_preset.json").read_bytes() == \
+        (s_root / "writer_preset.json").read_bytes()

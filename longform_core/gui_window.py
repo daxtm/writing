@@ -3462,7 +3462,9 @@ class MainWindow(QMainWindow):
 
     def _resolve_dirty(self):
         """Resolve unsaved input before a destructive transition (project
-        Create/Open); False cancels or defers the transition."""
+        Create/Open). Returns "ok", "cancel" or "deferred": "deferred" means a
+        planning save was dispatched on the worker and the caller's already
+        set `_pending_action` resumes after settlement."""
         if self._scene_sel is not None and self.dirty():
             pick = self._choice(
                 "Unsaved steering",
@@ -3470,9 +3472,9 @@ class MainWindow(QMainWindow):
                 ["Save", "Discard", "Cancel"])
             if pick == "Save":
                 if not self._persist(self.steer_editor.toPlainText()):
-                    return False
+                    return "cancel"
             elif pick != "Discard":
-                return False
+                return "cancel"
         if self._planning_dirty():
             pick = self._choice(
                 "Unsaved planning input",
@@ -3481,13 +3483,13 @@ class MainWindow(QMainWindow):
                 ["Save", "Discard", "Cancel"])
             if pick == "Save":
                 if not self._save_planning_dirty():
-                    return False   # the transition resumes after settlement
-                return False
+                    return "cancel"   # the save refused; nothing dispatched
+                return "deferred"
             if pick == "Discard":
                 self._discard_planning_dirty()
-                return True
-            return False
-        return True
+                return "ok"
+            return "cancel"
+        return "ok"
 
     def _planning_dirty(self):
         return (self.settings_dirty() or self._bible_dirty()
@@ -3533,8 +3535,6 @@ class MainWindow(QMainWindow):
             self._status("An operation is running; Create is disabled until "
                          "it settles.", error=True)
             return
-        if not self._resolve_dirty():
-            return
         picked = self._dir_picker("Create: choose a project directory",
                                   self._plan.get("root") or self._root)
         if not picked:
@@ -3542,9 +3542,13 @@ class MainWindow(QMainWindow):
             return
         target = plan.canonical_root(picked)
         self._pending_action = ("create", target)
-        if not self._resolve_dirty():
+        state = self._resolve_dirty()
+        if state == "cancel":
             self._pending_action = None
+            self._status("Create cancelled; nothing was created.")
             return
+        if state == "deferred":
+            return   # the save settles first; settlement continues the Create
         self._pending_action = None
         self._pending_root = target
 
@@ -3560,8 +3564,6 @@ class MainWindow(QMainWindow):
             self._status("An operation is running; Open is disabled until it "
                          "settles.", error=True)
             return
-        if not self._resolve_dirty():
-            return
         picked = self._dir_picker("Open: choose a project directory",
                                   self._plan.get("root") or self._root)
         if not picked:
@@ -3569,16 +3571,20 @@ class MainWindow(QMainWindow):
                          "unchanged.")
             return
         target = plan.canonical_root(picked)
+        self._pending_action = ("open", target)
+        state = self._resolve_dirty()
+        if state == "cancel":
+            self._pending_action = None
+            self._status("Open cancelled; the current project is unchanged.")
+            return
+        if state == "deferred":
+            return   # the save settles first; settlement continues the Open
+        self._pending_action = None
         if target == plan.canonical_root(self._root):
             self._plan = plan.project_overview(target)
             self.refresh(force=True)
             self._status("Reopened the current project.")
             return
-        self._pending_action = ("open", target)
-        if not self._resolve_dirty():
-            self._pending_action = None
-            return
-        self._pending_action = None
         self._pending_root = target
 
         def fn(sink, token):
@@ -4165,6 +4171,8 @@ class MainWindow(QMainWindow):
         """Cooperative Stop settlement: completed writes stay saved, the
         provisional output is discarded and the messages name exactly what
         happened (never a rollback promise)."""
+        self._pending_action = None   # a stopped save never continues a
+        self._pending_root = None     # deferred transition
         self._update_steering_ui()
         kind = self._op_kind
         if kind == "status_overview":
@@ -4209,6 +4217,12 @@ class MainWindow(QMainWindow):
             self._rev_reset()
             self._status(f"revised {changed} passages — stopped; remaining "
                          "passages were not revised.")
+            return
+        if kind == "init":
+            self._pending_root = None
+            self._status("Stopped; the initialization is incomplete — "
+                         "completed writes stay saved and retrying Create "
+                         "fills only the missing paths.", error=True)
             return
         self._preview_text = ""
         self.preview.setPlainText("")
@@ -4375,7 +4389,10 @@ class MainWindow(QMainWindow):
                     (", ".join(created) if created else
                      "(nothing; all files already exist)")
                 if value.get("preset"):
-                    msg += "; writer_preset.json imported"
+                    if value["preset"].get("default"):
+                        msg += "; bundled writer_preset.json created"
+                    else:
+                        msg += "; writer_preset.json imported"
                 self._status(msg)
             else:
                 self.refresh(force=True)

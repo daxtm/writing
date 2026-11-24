@@ -1411,6 +1411,14 @@ def case_planning_journey(root):
             "fake-writer-model": {
                 "id": "fake-writer-model", "context_length": 8192,
                 "max_completion_tokens": 4096,
+                "available_on_current_plan": True},
+            "huihui-ai/Huihui-Qwen3.8-27B-abliterated": {
+                "id": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+                "context_length": 40960, "max_completion_tokens": 8192,
+                "available_on_current_plan": True},
+            "TheDrummer/Anubis-70B-v1.2": {
+                "id": "TheDrummer/Anubis-70B-v1.2",
+                "context_length": 32768, "max_completion_tokens": 4096,
                 "available_on_current_plan": True}},
         responses=[
             "<outline>OUTLINE ONE BODY</outline>",
@@ -1422,7 +1430,8 @@ def case_planning_journey(root):
             '"beats": ["Mara counts."], "target_words": 1700}]</scenes>',
         ])
 
-    picks = {"dir": [None, str(missing)], "preset": [str(src / "master.json")]}
+    picks = {"dir": [None, str(missing)],
+             "preset": [str(src / "master.json"), str(src / "master.json")]}
     choices = []
 
     win = gw.MainWindow(
@@ -1443,8 +1452,11 @@ def case_planning_journey(root):
     win.create_btn.click()
     assert _pump(a, lambda: not win._busy)
     import longform_core.config as cfgmod
+    import longform_core.defaults as dflmod
+    assert json.loads((missing / "project.json").read_text()) == \
+        dflmod.project_defaults(), \
+        "created project.json uses the reviewed sanitized defaults"
     for name, content in {
-        "project.json": json.dumps(cfgmod.DEFAULT_CONFIG, indent=2) + "\n",
         "bible.md": cfgmod.BIBLE_TEMPLATE,
         "state.md": cfgmod.STATE_TEMPLATE,
         "scenes.json": "[]\n",
@@ -1455,9 +1467,20 @@ def case_planning_journey(root):
     for d in ("trees", "outlines", "critiques", "checks", "state_history",
               "lorebooks", "bible_history"):
         assert (missing / d).is_dir(), f"init directory {d} exists"
+    assert (missing / "writer_preset.json").read_bytes() == \
+        dflmod.writer_preset_bytes(), \
+        "Create ships the bundled reviewed preset without a picker"
     assert fake.calls == [], "Create makes no provider call"
 
-    # -- Preset import through its own picker; original bytes preserved.
+    # -- Preset import: refused while the bundled preset is present...
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not overwritten" in win.status.text().lower()
+    assert (missing / "writer_preset.json").read_bytes() == \
+        dflmod.writer_preset_bytes(), "refusal keeps the bundled bytes"
+
+    # -- ...and succeeds unchanged on an absent destination.
+    (missing / "writer_preset.json").unlink()
     win.preset_import_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert (missing / "writer_preset.json").read_bytes() == \
@@ -1484,8 +1507,9 @@ def case_planning_journey(root):
     assert fake.calls == [("GET", "/plan"),
                           ("GET", "/models/fake-planner-model"),
                           ("GET", "/models/fake-writer-model"),
-                          ("GET", "/models/meta-llama/"
-                                  "Llama-3.3-70B-Instruct")], \
+                          ("GET", "/models/huihui-ai/"
+                                  "Huihui-Qwen3.8-27B-abliterated"),
+                          ("GET", "/models/TheDrummer/Anubis-70B-v1.2")], \
         "explicit fetch makes exactly the plan + per-distinct-model lookups"
     limits = json.loads((missing / "limits.json").read_text())
     assert limits["plan"]["max_context_length"] == 8192
@@ -1626,6 +1650,10 @@ def case_planning_create_open(root):
     assert _pump(a, lambda: not win._busy)
     assert (missing / "project.json").exists() and (missing / "trees").is_dir()
     assert "initialized" in win.status.text().lower()
+    assert "bundled writer_preset.json created" in win.status.text(), \
+        "completion reports the bundled preset as created"
+    assert "writer preset" not in win.generate_note.text().lower(), \
+        "the bundled preset is no longer a missing drafting prerequisite"
     assert win._root == missing
 
     # partial project: existing files are never replaced by a repeated Create
@@ -1638,16 +1666,26 @@ def case_planning_create_open(root):
     assert json.loads((missing / "project.json").read_text())["title"] == "Kept"
     assert (missing / "bible.md").exists(), "only missing files are filled"
 
-    # preset import: cancelled picker, then a valid import
+    # preset import: cancelled picker, then refusal while the bundled
+    # preset is present, then success on an absent destination
+    bundled = (missing / "writer_preset.json").read_bytes()
     preset_picks.append(None)
     win.preset_import_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert "no preset picked" in win.status.text().lower()
-    assert not (missing / "writer_preset.json").exists()
+    assert (missing / "writer_preset.json").read_bytes() == bundled
 
     src = root / "master.json"
     src.write_text(json.dumps({"preset": {}, "instruct": {}, "context": {},
                                "sysprompt": {}}), encoding="utf-8")
+    preset_picks.append(str(src))
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not overwritten" in win.status.text().lower()
+    assert (missing / "writer_preset.json").read_bytes() == bundled, \
+        "import refuses to replace the bundled preset"
+
+    (missing / "writer_preset.json").unlink()
     preset_picks.append(str(src))
     win.preset_import_btn.click()
     assert _pump(a, lambda: not win._busy)
@@ -1670,6 +1708,7 @@ def case_planning_create_open(root):
     assert _pump(a, lambda: not win._busy)
     assert "not valid JSON" in win.status.text()
     assert not (missing / "writer_preset.json").exists()
+    (missing / "writer_preset.json").write_bytes(bundled)
 
     # dirty steering: Save proceeds, Cancel blocks the destructive switch
     _write_json(missing / "scenes.json", [_scene("s001")])
@@ -1702,6 +1741,29 @@ def case_planning_create_open(root):
     assert _pump(a, lambda: not win._busy)
     assert win._root == other, "an invalid Open does not replace the project"
     assert "no valid project.json" in win.status.text()
+
+    # partial-failure Create: a name collision reports the failed path and
+    # completed writes, keeps the current project, and retry fills the rest
+    coll = root / "coll"
+    coll.mkdir()
+    (coll / "writer_preset.json").mkdir()   # collision, not a regular file
+    dir_picks[:] = [str(coll)]
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not a regular file" in win.status.text()
+    assert "created before the error" in win.status.text(), \
+        "completed writes are reported truthfully"
+    assert win._root == other, "a failed Create never rebinds the project"
+    assert (coll / "project.json").is_file() and (coll / "trees").is_dir()
+    (coll / "writer_preset.json").rmdir()
+    dir_picks[:] = [str(coll)]
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._root == coll, "retry after correction binds the new project"
+    assert "writer_preset.json" in win.status.text()
+    assert "bundled writer_preset.json created" in win.status.text()
+    assert json.loads((coll / "project.json").read_text())["title"] == \
+        "Untitled", "defaults do not inherit old-project settings"
 
     # open a valid project
     dir_picks[:] = [str(missing)]
@@ -3550,6 +3612,163 @@ def case_review_dirty_sources(root):
     assert "Export cancelled; nothing was written." in win.status.text()
 
 
+def case_planning_deferred_create(root):
+    """Deferred Create continuation after a dirty-settings Save (1.6).
+
+    The save settles first on the existing worker, then the picked directory
+    receives complete shared initialization identical to immediate Create;
+    cancelled/failed saves and an initialization Stop never create or bind a
+    new project incorrectly and never lose prior work.
+    """
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)   # no credentials in this case
+    choices, dir_picks = [], []
+    import longform_core.defaults as dfl
+    import longform_core.planning_operations as planmod
+    from longform_core.cancel import Cancelled
+
+    old = root / "old"
+    planmod.init_project(old)
+    cfg = json.loads((old / "project.json").read_text())
+    cfg["title"] = "Old Title"
+    (old / "project.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    win = gw.MainWindow(str(old), choice=lambda t, x, o: choices.pop(0),
+                        dir_picker=lambda t, p: dir_picks.pop(0),
+                        preset_picker=lambda t: None)
+    win.show()
+    win.tabs.setCurrentIndex(gw.SETUP)
+    win.set_setting("title", "Dirty Old")
+    assert win.settings_dirty()
+
+    # cancelled resolution: nothing is created, the current project stays
+    dest = root / "newproj"
+    choices.append("Cancel")
+    dir_picks.append(str(dest))
+    win.create_btn.click()
+    assert not dest.exists(), "a cancelled resolution creates nothing"
+    assert win._root == old
+    assert json.loads((old / "project.json").read_text())["title"] == \
+        "Old Title", "no save ran for Cancel"
+
+    # deferred Create: Save settles first, then init runs on the same worker
+    choices.append("Save")
+    dir_picks.append(str(dest))
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert json.loads((old / "project.json").read_text())["title"] == \
+        "Dirty Old", "the save completed before the initialization"
+    assert win._root == dest, "the new project is bound after settlement"
+    assert json.loads((dest / "project.json").read_text())["title"] == \
+        "Untitled", "defaults never inherit old-project settings"
+    for name in ("project.json", "bible.md", "state.md", "scenes.json",
+                 "summaries.json", "writer_preset.json"):
+        assert (dest / name).is_file(), name
+    for d in ("trees", "outlines", "critiques", "checks", "state_history",
+              "lorebooks", "bible_history"):
+        assert (dest / d).is_dir(), d
+    assert (dest / "writer_preset.json").read_bytes() == \
+        dfl.writer_preset_bytes()
+    assert "bundled writer_preset.json created" in win.status.text()
+
+    # both Create paths agree: an immediate Create is byte-identical
+    immediate = root / "immediate"
+    planmod.init_project(immediate)
+    for name in ("project.json", "bible.md", "state.md", "scenes.json",
+                 "summaries.json", "writer_preset.json"):
+        assert (immediate / name).read_bytes() == (dest / name).read_bytes(), \
+            f"deferred and immediate Create agree on {name}"
+
+    # a stale settings save refuses and never continues the deferred Create
+    old2 = root / "old2"
+    planmod.init_project(old2)
+    win2 = gw.MainWindow(str(old2), choice=lambda t, x, o: choices.pop(0),
+                         dir_picker=lambda t, p: dir_picks.pop(0),
+                         preset_picker=lambda t: None)
+    win2.show()
+    win2.tabs.setCurrentIndex(gw.SETUP)
+    win2.set_setting("title", "Stale Edit")
+    cfg2 = json.loads((old2 / "project.json").read_text())
+    cfg2["target_words"] = 1   # changed behind the form: the save goes stale
+    (old2 / "project.json").write_text(json.dumps(cfg2), encoding="utf-8")
+    dest2 = root / "never"
+    choices.append("Save")
+    dir_picks.append(str(dest2))
+    win2.create_btn.click()
+    assert _pump(a, lambda: not win2._busy)
+    assert not dest2.exists(), "a stale save never continues the deferred Create"
+    assert win2._root == old2, "the current project remains selected"
+    assert json.loads((old2 / "project.json").read_text())["target_words"] == 1
+    assert json.loads((old2 / "project.json").read_text())["title"] == \
+        "Untitled", "the stale edit is refused, prior work is intact"
+
+    # cooperative Stop during the deferred initialization: completed writes
+    # stay saved, the old project is never rebound, retry fills the rest
+    old3 = root / "old3"
+    planmod.init_project(old3)
+    win3 = gw.MainWindow(str(old3), choice=lambda t, x, o: choices.pop(0),
+                         dir_picker=lambda t, p: dir_picks.pop(0),
+                         preset_picker=lambda t: None)
+    win3.show()
+    win3.tabs.setCurrentIndex(gw.SETUP)
+    win3.set_setting("title", "Dirty Three")
+    dest3 = root / "stopped"
+    real_init = planmod.init_project
+
+    class _StopSoon:
+        def __init__(self, after):
+            self.n = 0
+            self.after = after
+
+        def check(self):
+            self.n += 1
+            if self.n > self.after:
+                raise Cancelled("stopped")
+
+    def stopping_init(target, *, token=None, events=None, **kw):
+        return real_init(target, token=_StopSoon(2), events=events, **kw)
+
+    planmod.init_project = stopping_init
+    try:
+        choices.append("Save")
+        dir_picks.append(str(dest3))
+        win3.create_btn.click()
+        assert _pump(a, lambda: not win3._busy)
+        assert win3._root == old3, "a stopped init never binds the new project"
+        assert (dest3 / "project.json").is_file(), \
+            "completed writes stay saved"
+        assert not (dest3 / "writer_preset.json").exists(), \
+            "the stopped run created no preset and reports the partial state"
+        assert "incomplete" in win3.status.text().lower()
+        assert json.loads((old3 / "project.json").read_text())["title"] == \
+            "Dirty Three", "prior work is preserved through the Stop"
+        planmod.init_project = real_init
+        dir_picks.append(str(dest3))
+        win3.create_btn.click()
+        assert _pump(a, lambda: not win3._busy)
+        assert win3._root == dest3, "retry after the Stop binds the new project"
+        assert (dest3 / "writer_preset.json").read_bytes() == \
+            dfl.writer_preset_bytes(), "retry fills only the missing paths"
+        assert json.loads((dest3 / "project.json").read_text())["title"] == \
+            "Untitled"
+    finally:
+        planmod.init_project = real_init
+    choices.append("Discard")   # win2's refused edit stays unsaved by design
+    win.close()
+    win2.close()
+    win3.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -3576,6 +3795,7 @@ CASES = {
     "case_invalid_config_and_recovery": case_invalid_config_and_recovery,
     "case_planning_journey": case_planning_journey,
     "case_planning_create_open": case_planning_create_open,
+    "case_planning_deferred_create": case_planning_deferred_create,
     "case_planning_settings_limits": case_planning_settings_limits,
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,

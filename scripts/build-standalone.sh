@@ -35,6 +35,7 @@ uv pip install --python "$PY" -r "$REQ" 1>&2 || err "could not install pinned bu
 echo "== build-standalone: freezing longform.py with PyInstaller"
 "$PY" -m PyInstaller \
 	--onefile --console --name longform --clean --noconfirm --noupx --collect-data certifi \
+	--add-data "$ROOT/longform_core/resources:longform_core/resources" \
 	--distpath "$DIST" --workpath "$WORK" --specpath "$WORK" \
 	longform.py 1>&2
 
@@ -45,7 +46,7 @@ echo "== build-standalone: smoke test"
 "$EXE" --help >/dev/null || err "built executable failed to run --help"
 
 echo "== build-standalone: writing compatibility sidecars"
-ROOT="$ROOT" PYINSTALLER_FLAGS="--onefile --console --name longform --clean --noconfirm --noupx --collect-data certifi" \
+ROOT="$ROOT" PYINSTALLER_FLAGS="--onefile --console --name longform --clean --noconfirm --noupx --collect-data certifi --add-data $ROOT/longform_core/resources:longform_core/resources" \
 "$PY" scripts/standalone_sidecars.py "$EXE" || err "writing dist/longform-build.json or dist/THIRD-PARTY-NOTICES.txt failed"
 
 echo "$EXE"
