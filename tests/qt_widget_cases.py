@@ -2249,8 +2249,11 @@ def case_stream_planning(root):
     assert len(win._outline_candidates) == 2
     texts = [(proj / "outlines" / n).read_text() for n in
              win._outline_candidates]
-    assert "ONE BODY" in texts[0] and "TWO BODY" in texts[1], \
-        "completion binds each candidate to its own saved file"
+    assert any("ONE BODY" in t for t in texts) and \
+        any("TWO BODY" in t for t in texts) and \
+        not any(("ONE BODY" in t and "TWO BODY" in t) for t in texts), \
+        "completion binds each candidate to its own saved file " \
+        "(completion order may differ)"
     win.close()
 
 
@@ -4460,7 +4463,7 @@ CASES = {
 # Cases for openspec/changes/gui-generated-text-streaming whose widgets/seams
 # are not implemented yet. Skipped loudly, never silently: a pending case must
 # not count as coverage. Each task that makes a case pass removes its name.
-PENDING_STREAM_CASES = {"case_stream_planning"}
+PENDING_STREAM_CASES = set()
 
 
 def _teardown():

@@ -167,6 +167,8 @@ class MainWindow(QMainWindow):
         self._bible_preview_is_current = True
         self._outline_overview = None
         self._outline_candidates = []   # candidate names generated this session
+        self._op_previews = {}        # candidate -> {attempt,text,status}
+        self._op_preview_row = None   # selected live-preview candidate
         self._outline_notes_loaded = None
         self._outline_body_loaded = None
         self._scenes_overview = None
@@ -1043,6 +1045,12 @@ class MainWindow(QMainWindow):
             "The generated cards appear here; editing fields below updates "
             "the preview. scenes.json is replaced only on explicit Accept.")
         l.addWidget(self.scenes_preview, 3)
+        self.scenes_stream = QPlainTextEdit()
+        self.scenes_stream.setReadOnly(True)
+        self.scenes_stream.setPlaceholderText(
+            "The live answer appears here while scene cards stream "
+            "(provisional; nothing is saved here)")
+        l.addWidget(self.scenes_stream, 1)
         l.addWidget(QLabel("Selected card fields"))
         grid = QGridLayout()
         grid.setVerticalSpacing(2)
@@ -2550,12 +2558,15 @@ class MainWindow(QMainWindow):
         self._scenes_force_once = False
 
         def fn(sink, token):
+            def sub(ev):
+                sink(dict({"type": "preview", "candidate": 1}, **ev))
             return plan.generate_scene_cards(
                 root, force=force,
                 provider_factory=self._seam(), token=token,
-                events=sink)
+                events=sink, preview_events=sub)
 
-        self._dispatch(fn, kind="scenes_generate")
+        if self._dispatch(fn, kind="scenes_generate"):
+            self._clear_op_previews(("scenes",))
 
     def _on_scenes_selected(self, row):
         cards = self._scene_cards or []
@@ -2793,6 +2804,21 @@ class MainWindow(QMainWindow):
         self.outline_body_edit = QPlainTextEdit()
         self.outline_body_edit.setReadOnly(True)
         l.addWidget(self.outline_body_edit, 4)
+        self.outline_stream_label = QLabel(
+            "Live answer previews (provisional; nothing is saved or "
+            "accepted here)")
+        l.addWidget(self.outline_stream_label)
+        self.outline_stream_list = QListWidget()
+        self.outline_stream_list.setMaximumHeight(72)
+        self.outline_stream_list.currentRowChanged.connect(
+            self._show_outline_stream)
+        l.addWidget(self.outline_stream_list)
+        self.outline_stream = QPlainTextEdit()
+        self.outline_stream.setReadOnly(True)
+        self.outline_stream.setPlaceholderText(
+            "Each candidate's live answer appears here while it streams; "
+            "select a candidate above")
+        l.addWidget(self.outline_stream, 2)
         return box
 
     # ---------------------------------------------------------------- outline
@@ -2855,11 +2881,18 @@ class MainWindow(QMainWindow):
         root = plan.canonical_root(self._root)
 
         def fn(sink, token):
+            def pe(i):
+                def sub(ev):
+                    sink(dict({"type": "preview", "candidate": i + 1},
+                              **ev))
+                return sub
             return plan.generate_outlines(root, notes_form, n,
                                           provider_factory=self._seam(),
-                                          token=token, events=sink)
+                                          token=token, events=sink,
+                                          preview_events=pe)
 
-        self._dispatch(fn, kind="outline_generate")
+        if self._dispatch(fn, kind="outline_generate"):
+            self._clear_op_previews(("outline",))
 
     def _outline_selected(self):
         row = self.outline_list.currentRow()
@@ -4419,6 +4452,14 @@ class MainWindow(QMainWindow):
             self._status("Streaming… (provisional preview; nothing is saved yet)")
         elif kind in ("candidate_done", "candidate_failed"):
             self._status(payload.get("msg", ""))
+            if kind == "candidate_failed" and \
+                    int(payload.get("k", 0)) in self._op_previews:
+                st = self._op_previews[int(payload["k"])]
+                if st["status"] != "complete":
+                    st["status"] = "failed"
+                    self._refresh_preview_pane()
+        elif kind == "preview":
+            self._on_preview_event(payload)
         elif kind == "progress":
             self._status(payload.get("msg", ""))
         elif kind == "note":
@@ -4428,6 +4469,106 @@ class MainWindow(QMainWindow):
                          f"{payload.get('wanted')} responses came back")
         elif kind == "skipped_empty":
             self._status("warning: a response cleaned to empty and was discarded")
+
+    def _on_preview_event(self, payload):
+        """Live answer preview (ADR-0012): events carry operation identity via
+        the queued op_id filter above; here only candidate/attempt matter.
+        Only the latest attempt of a candidate is kept."""
+        try:
+            cand = int(payload.get("candidate", 1))
+        except (TypeError, ValueError):
+            return
+        inner = payload.get("preview_type")
+        st = self._op_previews.setdefault(
+            cand, {"attempt": 0, "text": "", "status": "waiting"})
+        if inner == "preview_start":
+            try:
+                st["attempt"] = int(payload.get("attempt_id", 1))
+            except (TypeError, ValueError):
+                st["attempt"] = 0
+            st["text"] = ""
+            st["status"] = "waiting"
+        elif inner == "preview_delta":
+            st["text"] += payload.get("text", "")
+            if st["text"]:
+                st["status"] = "streaming"
+        elif inner == "preview_reset":
+            st["text"] = ""
+            st["status"] = "waiting"
+        elif inner == "preview_complete":
+            st["status"] = "complete"
+        else:
+            return
+        self._refresh_preview_pane()
+
+    def _preview_target(self):
+        """Which pane shows live previews for the running operation."""
+        if self._op_kind == "outline_generate":
+            return "outline"
+        if self._op_kind == "scenes_generate":
+            return "scenes"
+        return None
+
+    def _refresh_preview_pane(self):
+        target = self._preview_target()
+        if target == "outline":
+            cands = sorted(self._op_previews)
+            lst = self.outline_stream_list
+            lst.blockSignals(True)
+            lst.clear()
+            for c in cands:
+                lst.addItem(QListWidgetItem(
+                    f"candidate {c} — {self._op_previews[c]['status']}"))
+            if cands:
+                row = self._op_preview_row if self._op_preview_row in cands \
+                    else cands[0]
+                self._op_preview_row = row
+                lst.setCurrentRow(cands.index(row))
+            lst.blockSignals(False)
+            if self._op_preview_row in cands:
+                st = self._op_previews[self._op_preview_row]
+                text = st["text"]
+                if not text:
+                    text = ("(Waiting for answer…)"
+                            if st["status"] in ("waiting", "streaming")
+                            else f"({st['status']}; no answer text)")
+                self.outline_stream.setPlainText(text)
+                bar = self.outline_stream.verticalScrollBar()
+                bar.setValue(bar.maximum())
+        elif target == "scenes":
+            st = self._op_previews.get(1)
+            if st is not None:
+                self.scenes_stream.setPlainText(st["text"])
+                bar = self.scenes_stream.verticalScrollBar()
+                bar.setValue(bar.maximum())
+
+    def _show_outline_stream(self, row):
+        cands = sorted(self._op_previews)
+        if 0 <= row < len(cands):
+            self._op_preview_row = cands[row]
+            self._refresh_preview_pane()
+
+    def _clear_op_previews(self, targets):
+        """Reset live preview state and pane widgets for a fresh operation."""
+        self._op_previews = {}
+        self._op_preview_row = None
+        if "outline" in targets:
+            self.outline_stream_list.blockSignals(True)
+            self.outline_stream_list.clear()
+            self.outline_stream_list.blockSignals(False)
+            self.outline_stream.setPlainText("")
+        if "scenes" in targets:
+            self.scenes_stream.setPlainText("")
+
+    def _fail_running_previews(self):
+        """A settled (cancelled/failed) operation cannot keep streaming."""
+        changed = False
+        for st in self._op_previews.values():
+            if st["status"] in ("waiting", "streaming"):
+                st["status"] = "failed"
+                changed = True
+        if changed:
+            self._refresh_preview_pane()
 
     def _on_worker_done(self, op_id, outcome, value):
         """One terminal outcome per operation. Settlement runs here, but the
@@ -4472,6 +4613,7 @@ class MainWindow(QMainWindow):
         happened (never a rollback promise)."""
         self._pending_action = None   # a stopped save never continues a
         self._pending_root = None     # deferred transition
+        self._fail_running_previews()
         self._update_steering_ui()
         kind = self._op_kind
         if kind == "status_overview":
@@ -4532,6 +4674,7 @@ class MainWindow(QMainWindow):
         self._update_steering_ui()
         self._pending_action = None   # a failed save never continues a
         self._pending_root = None     # deferred transition
+        self._fail_running_previews()
         if getattr(value, "collision", False) and \
                 self._op_kind in ("import", "scenes_generate",
                                   "compress_generate"):

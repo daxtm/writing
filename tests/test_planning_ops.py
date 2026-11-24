@@ -1244,7 +1244,7 @@ class FakeOutlineProvider:
         self.calls = []
 
     def chat_many(self, role, messages, n, max_tokens=None, token=None,
-                  on_event=None):
+                  on_event=None, preview_events=None):
         self.calls.append({"role": role, "messages": messages, "n": n})
         out = []
         for k in range(n):
@@ -1253,11 +1253,22 @@ class FakeOutlineProvider:
             i = len(self.calls) - 1
             item = FakeOutlineProvider.script[k] if \
                 len(FakeOutlineProvider.script) > k else "<outline>X</outline>"
+            sub = preview_events(k) if preview_events is not None else None
             if isinstance(item, Exception):
+                if sub:
+                    sub({"type": "preview_start", "attempt_id": 1})
+                    sub({"type": "preview_reset", "attempt_id": 1})
                 if on_event:
                     on_event({"type": "candidate_failed", "k": k + 1, "n": n,
                               "msg": "failed"})
                 continue
+            if sub:
+                sub({"type": "preview_start", "attempt_id": 1})
+                half = len(item) // 2
+                for part in (item[:half], item[half:]):
+                    sub({"type": "preview_delta", "attempt_id": 1,
+                         "text": part})
+                sub({"type": "preview_complete", "attempt_id": 1})
             out.append((item, "stop", {}))
             if on_event:
                 on_event({"type": "candidate_done", "k": k + 1, "n": n,
@@ -1427,6 +1438,139 @@ def test_outline_choose_strips_comment_and_backs_up(tmp_path):
     assert "<!-- notes:" in cand, "the original candidate file is retained"
 
 
+def test_outline_previews_raw_provisional_and_final_identical(tmp_path):
+    """Preview events carry raw fragments per candidate (task 1.4); completed
+    parsing/files are byte-identical with and without a subscriber."""
+    a, b = outline_project(tmp_path / "a"), outline_project(tmp_path / "b")
+    FakeOutlineProvider.script = list(OUTLINES)
+    evs = []
+    plan.generate_outlines(a, "notes", 1,
+                           provider_factory=lambda p: FakeOutlineProvider(p),
+                           events=evs.append,
+                           preview_events=lambda i: (lambda ev: None))
+    pv = [e for e in evs if e.get("type") == "preview"]
+    assert [e["preview_type"] for e in pv] == [
+        "preview_start", "preview_delta", "preview_delta", "preview_complete"]
+    assert all(e["candidate"] == 1 for e in pv)
+    deltas = "".join(e["text"] for e in pv
+                     if e["preview_type"] == "preview_delta")
+    assert "OUTLINE ONE BODY" in deltas, "raw answer visible before completion"
+    assert not (a / "outline.md").exists(), \
+        "no provisional choose/accept from previews"
+
+    plan.generate_outlines(b, "notes", 1,
+                           provider_factory=lambda p: FakeOutlineProvider(p))
+    na = sorted(x.name for x in (a / "outlines").glob("candidate_*.md"))
+    nb = sorted(x.name for x in (b / "outlines").glob("candidate_*.md"))
+    assert na == nb
+    for n in na:
+        assert (a / "outlines" / n).read_bytes() == \
+            (b / "outlines" / n).read_bytes(), n
+
+    evs2 = []
+    plan.generate_outlines(outline_project(tmp_path / "c"), "notes", 1,
+                           provider_factory=lambda p: FakeOutlineProvider(p),
+                           events=evs2.append)
+    assert not [e for e in evs2 if e.get("type") == "preview"], \
+        "no preview events without a subscriber"
+
+
+def test_outline_previews_incomplete_tag_visible_and_reroll_retagged(tmp_path):
+    """An answer with no closing tag still shows its raw fragments; a reroll
+    is a fresh operation whose candidate ids restart at 1."""
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = ["<outline>OUTLINE ONE BO"]
+    evs = []
+    out = plan.generate_outlines(root, "notes", 1,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p),
+                                 events=evs.append,
+                                 preview_events=lambda i: (lambda ev: None))
+    deltas = "".join(e["text"] for e in evs
+                     if e.get("type") == "preview" and
+                     e["preview_type"] == "preview_delta")
+    assert "<outline>OUTLINE ONE BO" in deltas, \
+        "incomplete tagged answer is visible as provisional raw text"
+    assert any("no <outline> tags" in w for w in out["warnings"]), \
+        "completed parsing stays authoritative"
+    assert len(out["candidates"]) == 1
+
+    FakeOutlineProvider.script = list(OUTLINES)
+    evs2 = []
+    plan.generate_outlines(root, "more notes", 1,
+                           provider_factory=lambda p: FakeOutlineProvider(p),
+                           events=evs2.append,
+                           preview_events=lambda i: (lambda ev: None))
+    cands = {e["candidate"] for e in evs2 if e.get("type") == "preview"}
+    assert cands == {1}, "reroll previews restart their own candidate ids"
+
+
+def test_outline_previews_two_candidates_each_tagged(tmp_path):
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = list(OUTLINES)
+    evs = []
+    plan.generate_outlines(root, "notes", 2,
+                           provider_factory=lambda p: FakeOutlineProvider(p),
+                           events=evs.append,
+                           preview_events=lambda i: (lambda ev: None))
+    per = {}
+    for e in evs:
+        if e.get("type") == "preview":
+            per.setdefault(e["candidate"], []).append(e["preview_type"])
+    assert set(per) == {1, 2}
+    for c, kinds in per.items():
+        assert kinds == ["preview_start", "preview_delta", "preview_delta",
+                         "preview_complete"], c
+
+
+def test_scene_previews_raw_provisional_and_parse_unchanged(tmp_path):
+    """Scene-card previews stream the raw answer; parsing/scenes.json are
+    unchanged with and without a subscriber."""
+    a, b = scenes_project(tmp_path / "a"), scenes_project(tmp_path / "b")
+    FakeSceneProvider.text = SCENES_JSON
+    evs = []
+    out = plan.generate_scene_cards(
+        a, provider_factory=lambda p: FakeSceneProvider(p),
+        events=evs.append, preview_events=lambda ev: None)
+    pv = [e for e in evs if e.get("type") == "preview"]
+    assert [e["preview_type"] for e in pv] == [
+        "preview_start", "preview_delta", "preview_delta", "preview_complete"]
+    assert all(e["candidate"] == 1 for e in pv)
+    deltas = "".join(e["text"] for e in pv
+                     if e["preview_type"] == "preview_delta")
+    assert SCENES_JSON in deltas, "raw scene JSON visible before completion"
+    before = (a / "scenes.json").read_bytes()
+    assert (a / "scenes.json").read_bytes() == before, \
+        "generation never writes scenes.json (preview only)"
+
+    out_b = plan.generate_scene_cards(
+        b, provider_factory=lambda p: FakeSceneProvider(p))
+    assert out["cards"] == out_b["cards"], \
+        "parsed cards are identical with and without previews"
+    assert (b / "scenes.json").read_bytes() == before
+
+
+def test_scene_previews_invalid_json_recovery_unchanged(tmp_path):
+    """Invalid arrays keep the existing raw-saved recovery path; the preview
+    shows the same raw text and adds no acceptance."""
+    root = scenes_project(tmp_path / "p")
+    FakeSceneProvider.text = "<scenes>[not json"
+    evs = []
+    out = plan.generate_scene_cards(
+        root, provider_factory=lambda p: FakeSceneProvider(p),
+        events=evs.append, preview_events=lambda ev: None)
+    deltas = "".join(e["text"] for e in evs
+                     if e.get("type") == "preview" and
+                     e["preview_type"] == "preview_delta")
+    assert "<scenes>[not json" in deltas
+    assert out["cards"] is None and out["raw_path"], \
+        "invalid raw output keeps the existing recovery path"
+    saved = (root / "outlines" / out["raw_path"]).read_text()
+    assert saved == "<scenes>[not json"
+    assert (root / "scenes.json").read_bytes() == \
+        (root / "scenes.json").read_bytes(), "scenes.json untouched"
+
+
 def test_outline_choose_stale_refusal(tmp_path):
     root = outline_project(tmp_path / "p")
     base = plan.outline_baseline(root)
@@ -1515,10 +1659,19 @@ class FakeSceneProvider:
         self.calls = []
 
     def chat(self, role, messages, max_tokens=None, stream_cb=None,
-             progress=True, token=None, on_retry_event=None):
+             progress=True, token=None, on_retry_event=None,
+             preview_events=None):
         self.calls.append({"role": role, "messages": messages})
         if token:
             token.check()
+        if preview_events is not None:
+            text = FakeSceneProvider.text
+            preview_events({"type": "preview_start", "attempt_id": 1})
+            half = len(text) // 2
+            for part in (text[:half], text[half:]):
+                preview_events({"type": "preview_delta", "attempt_id": 1,
+                                "text": part})
+            preview_events({"type": "preview_complete", "attempt_id": 1})
         return FakeSceneProvider.text, "stop", {}
 
 

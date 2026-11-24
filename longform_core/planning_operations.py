@@ -624,10 +624,14 @@ def outline_baseline(root, candidates=()):
 
 
 def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
-                      events=None):
+                      events=None, preview_events=None):
     """N competing planner candidates via the shared chat_many: exact CLI
     messages, tag extraction, candidate naming and the optional leading notes
-    comment. Rerolls append; nothing replaces outline.md."""
+    comment. Rerolls append; nothing replaces outline.md.
+
+    `preview_events`, when given, is called with the slot index i and must
+    return that candidate's preview_events subscriber (or None); each event is
+    forwarded on the same events channel tagged with candidate=i+1 (ADR-0012)."""
     p = _project_of(root)
     bible = read_text(p.f("bible.md")).strip()
     if not bible:
@@ -652,8 +656,24 @@ def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
     _emit(events, "progress", msg=f"generating {n} outline candidate(s) "
           f"(max_parallel {p.cfg['max_parallel']})")
     from .utils import extract_tagged
+    def _factory(j):
+        sub = preview_events(j)
+        if sub is None:
+            return None
+        if events is None:
+            return sub
+        c = j + 1
+
+        def fwd(ev, c=c):
+            d = {k: v for k, v in ev.items() if k != "type"}
+            _emit(events, "preview", candidate=c,
+                  preview_type=ev.get("type"), **d)
+        return fwd
+
+    pe = None if preview_events is None else _factory
     try:
         res = provider.chat_many("planner", msgs, n, token=token,
+                                 preview_events=pe,
                                  on_event=None if events is None else (
                                      lambda ev: _emit(events, ev.get("type"),
                                                       **{k: v for k, v in
@@ -1023,14 +1043,15 @@ def scene_messages(bible, outline, tw):
 
 
 def generate_scene_cards(root, *, force=False, provider_factory=None,
-                         token=None, events=None):
+                         token=None, events=None, preview_events=None):
     """Scene-card generation from a saved outline (CLI `scenes`).
 
     Force protection mirrors `scenes --force`: any non-planned card or any
     tree file requires an explicit confirmation before the provider call
     (declining runs no request and changes nothing). Invalid arrays are saved
     at the existing raw path for inspection; scenes.json is never replaced by
-    a preview."""
+    a preview. `preview_events` (single candidate) is forwarded tagged with
+    candidate=1 on the events channel."""
     p = _project_of(root)
     outline = read_text(p.f("outline.md")).strip() \
         if p.f("outline.md").is_file() else ""
@@ -1059,7 +1080,13 @@ def generate_scene_cards(root, *, force=False, provider_factory=None,
             "planner", msgs, token=token,
             on_retry_event=None if events is None else (
                 lambda why, delay: _emit(events, "retry", why=why,
-                                         delay=delay)))
+                                         delay=delay)),
+            preview_events=None if preview_events is None else (
+                (lambda ev: _emit(events, "preview", candidate=1,
+                                  preview_type=ev.get("type"),
+                                  **{k: v for k, v in ev.items()
+                                     if k != "type"}))
+                if events is not None else preview_events))
     except Cancelled:
         raise
     except Exception as e:  # noqa: BLE001 — sanitized outcome
