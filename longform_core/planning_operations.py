@@ -21,7 +21,8 @@ from .config import BIBLE_TEMPLATE, DEFAULT_CONFIG, STATE_TEMPLATE
 from .draft_operations import (_advance, _capture, _emit, _project_of,
                                _provider, _read_bytes, _scenes_or_error,
                                _stale_check, OpError, credential_state,
-                               redaction_secrets, scrub_credentials)
+                               preview_factory, redaction_secrets,
+                               scrub_credentials)
 from .reader_model import _no_symlink_below
 from .project import Project
 from .utils import (FatalError, deep_merge, now, read_text, save_input, stamp,
@@ -656,21 +657,8 @@ def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
     _emit(events, "progress", msg=f"generating {n} outline candidate(s) "
           f"(max_parallel {p.cfg['max_parallel']})")
     from .utils import extract_tagged
-    def _factory(j):
-        sub = preview_events(j)
-        if sub is None:
-            return None
-        if events is None:
-            return sub
-        c = j + 1
-
-        def fwd(ev, c=c):
-            d = {k: v for k, v in ev.items() if k != "type"}
-            _emit(events, "preview", candidate=c,
-                  preview_type=ev.get("type"), **d)
-        return fwd
-
-    pe = None if preview_events is None else _factory
+    pe = None if preview_events is None else \
+        preview_factory(events, preview_events)
     try:
         res = provider.chat_many("planner", msgs, n, token=token,
                                  preview_events=pe,
@@ -1081,12 +1069,8 @@ def generate_scene_cards(root, *, force=False, provider_factory=None,
             on_retry_event=None if events is None else (
                 lambda why, delay: _emit(events, "retry", why=why,
                                          delay=delay)),
-            preview_events=None if preview_events is None else (
-                (lambda ev: _emit(events, "preview", candidate=1,
-                                  preview_type=ev.get("type"),
-                                  **{k: v for k, v in ev.items()
-                                     if k != "type"}))
-                if events is not None else preview_events))
+            preview_events=None if preview_events is None else
+            preview_factory(events, lambda i: preview_events)(0))
     except Cancelled:
         raise
     except Exception as e:  # noqa: BLE001 — sanitized outcome

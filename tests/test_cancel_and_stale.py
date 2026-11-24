@@ -267,7 +267,7 @@ def test_repeated_stop_is_safe_and_shortfall_reported(tmp_path):
         def complete(self, *a, **k):
             return "ONLY ONE. ", "stop", {}
 
-        def many(self, fn, n, token=None, on_event=None):
+        def many(self, fn, n, token=None, on_event=None, indexed=None):
             return [("ONLY ONE. ", "stop", {})]
 
     events = []

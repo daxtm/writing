@@ -167,7 +167,8 @@ class MainWindow(QMainWindow):
         self._bible_preview_is_current = True
         self._outline_overview = None
         self._outline_candidates = []   # candidate names generated this session
-        self._op_previews = {}        # candidate -> {attempt,text,status}
+        self._op_previews = {}   # (candidate_id, attempt_id) -> {text,status}
+        self._op_preview_latest = {}   # candidate_id -> latest attempt seen
         self._op_preview_row = None   # selected live-preview candidate
         self._outline_notes_loaded = None
         self._outline_body_loaded = None
@@ -511,6 +512,12 @@ class MainWindow(QMainWindow):
         l.setContentsMargins(0, 0, 0, 0)
         self.preview_label = QLabel("Preview — provisional streaming text (not saved)")
         l.addWidget(self.preview_label)
+        self.draft_stream_list = QListWidget()
+        self.draft_stream_list.setMaximumHeight(72)
+        self.draft_stream_list.setToolTip(
+            "Live answer previews per candidate while they stream (provisional)")
+        self.draft_stream_list.currentRowChanged.connect(self._show_draft_stream)
+        l.addWidget(self.draft_stream_list)
         self.preview = QPlainTextEdit()
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText(
@@ -2558,12 +2565,10 @@ class MainWindow(QMainWindow):
         self._scenes_force_once = False
 
         def fn(sink, token):
-            def sub(ev):
-                sink(dict({"type": "preview", "candidate": 1}, **ev))
             return plan.generate_scene_cards(
                 root, force=force,
                 provider_factory=self._seam(), token=token,
-                events=sink, preview_events=sub)
+                events=sink, preview_events=lambda ev: None)
 
         if self._dispatch(fn, kind="scenes_generate"):
             self._clear_op_previews(("scenes",))
@@ -2881,15 +2886,13 @@ class MainWindow(QMainWindow):
         root = plan.canonical_root(self._root)
 
         def fn(sink, token):
-            def pe(i):
-                def sub(ev):
-                    sink(dict({"type": "preview", "candidate": i + 1},
-                              **ev))
-                return sub
+            # no-op subscriber: planning_operations forwards each provider
+            # preview event on the events channel tagged with candidate_id.
             return plan.generate_outlines(root, notes_form, n,
                                           provider_factory=self._seam(),
                                           token=token, events=sink,
-                                          preview_events=pe)
+                                          preview_events=lambda i:
+                                          (lambda ev: None))
 
         if self._dispatch(fn, kind="outline_generate"):
             self._clear_op_previews(("outline",))
@@ -4452,13 +4455,16 @@ class MainWindow(QMainWindow):
             self._status("Streaming… (provisional preview; nothing is saved yet)")
         elif kind in ("candidate_done", "candidate_failed"):
             self._status(payload.get("msg", ""))
-            if kind == "candidate_failed" and \
-                    int(payload.get("k", 0)) in self._op_previews:
-                st = self._op_previews[int(payload["k"])]
-                if st["status"] != "complete":
+            if kind == "candidate_failed":
+                try:
+                    k = int(payload.get("k", 0))
+                except (TypeError, ValueError):
+                    k = 0
+                st = self._op_previews.get((k, self._op_preview_latest.get(k)))
+                if st is not None and st["status"] != "complete":
                     st["status"] = "failed"
                     self._refresh_preview_pane()
-        elif kind == "preview":
+        elif kind in dop.PREVIEW_TYPES:
             self._on_preview_event(payload)
         elif kind == "progress":
             self._status(payload.get("msg", ""))
@@ -4471,31 +4477,32 @@ class MainWindow(QMainWindow):
             self._status("warning: a response cleaned to empty and was discarded")
 
     def _on_preview_event(self, payload):
-        """Live answer preview (ADR-0012): events carry operation identity via
-        the queued op_id filter above; here only candidate/attempt matter.
-        Only the latest attempt of a candidate is kept."""
+        """Live answer preview (ADR-0012) keyed by candidate/attempt; the
+        queued channel already paired the payload with the operation id, and
+        the op_id filter above ignores superseded operations. Only the latest
+        attempt of a candidate is kept."""
         try:
-            cand = int(payload.get("candidate", 1))
+            cand = int(payload.get("candidate_id", 1))
+            attempt = int(payload.get("attempt_id", 1))
         except (TypeError, ValueError):
             return
-        inner = payload.get("preview_type")
+        kind = payload.get("type")
+        if self._op_preview_latest.get(cand, 0) > attempt:
+            return   # a retired attempt cannot revive its preview
         st = self._op_previews.setdefault(
-            cand, {"attempt": 0, "text": "", "status": "waiting"})
-        if inner == "preview_start":
-            try:
-                st["attempt"] = int(payload.get("attempt_id", 1))
-            except (TypeError, ValueError):
-                st["attempt"] = 0
+            (cand, attempt), {"text": "", "status": "waiting"})
+        if kind == "preview_start":
+            self._op_preview_latest[cand] = attempt
             st["text"] = ""
             st["status"] = "waiting"
-        elif inner == "preview_delta":
+        elif kind == "preview_delta":
             st["text"] += payload.get("text", "")
             if st["text"]:
                 st["status"] = "streaming"
-        elif inner == "preview_reset":
+        elif kind == "preview_reset":
             st["text"] = ""
             st["status"] = "waiting"
-        elif inner == "preview_complete":
+        elif kind == "preview_complete":
             st["status"] = "complete"
         else:
             return
@@ -4503,22 +4510,33 @@ class MainWindow(QMainWindow):
 
     def _preview_target(self):
         """Which pane shows live previews for the running operation."""
-        if self._op_kind == "outline_generate":
+        if self._op_kind in ("outline_generate",):
             return "outline"
-        if self._op_kind == "scenes_generate":
+        if self._op_kind in ("scenes_generate",):
             return "scenes"
+        if self._op_kind in ("generate", "reroll", "add"):
+            return "draft"
         return None
+
+    def _candidate_states(self):
+        """Latest attempt per candidate: {cand: {text,status}}."""
+        out = {}
+        for (cand, _attempt), st in self._op_previews.items():
+            if self._op_preview_latest.get(cand) == _attempt:
+                out[cand] = st
+        return out
 
     def _refresh_preview_pane(self):
         target = self._preview_target()
         if target == "outline":
-            cands = sorted(self._op_previews)
+            states = self._candidate_states()
+            cands = sorted(states)
             lst = self.outline_stream_list
             lst.blockSignals(True)
             lst.clear()
             for c in cands:
                 lst.addItem(QListWidgetItem(
-                    f"candidate {c} — {self._op_previews[c]['status']}"))
+                    f"candidate {c} — {states[c]['status']}"))
             if cands:
                 row = self._op_preview_row if self._op_preview_row in cands \
                     else cands[0]
@@ -4526,7 +4544,7 @@ class MainWindow(QMainWindow):
                 lst.setCurrentRow(cands.index(row))
             lst.blockSignals(False)
             if self._op_preview_row in cands:
-                st = self._op_previews[self._op_preview_row]
+                st = states[self._op_preview_row]
                 text = st["text"]
                 if not text:
                     text = ("(Waiting for answer…)"
@@ -4536,21 +4554,50 @@ class MainWindow(QMainWindow):
                 bar = self.outline_stream.verticalScrollBar()
                 bar.setValue(bar.maximum())
         elif target == "scenes":
-            st = self._op_previews.get(1)
+            st = self._candidate_states().get(1)
             if st is not None:
                 self.scenes_stream.setPlainText(st["text"])
                 bar = self.scenes_stream.verticalScrollBar()
                 bar.setValue(bar.maximum())
+        elif target == "draft":
+            states = self._candidate_states()
+            cands = sorted(states)
+            lst = self.draft_stream_list
+            lst.blockSignals(True)
+            lst.clear()
+            for c in cands:
+                lst.addItem(QListWidgetItem(
+                    f"candidate {c} — {states[c]['status']}"))
+            if cands:
+                row = self._op_preview_row if self._op_preview_row in cands \
+                    else cands[0]
+                self._op_preview_row = row
+                lst.setCurrentRow(cands.index(row))
+            lst.blockSignals(False)
+            if self._op_preview_row in cands:
+                st = states[self._op_preview_row]
+                text = st["text"]
+                if not text:
+                    text = ("(Waiting for answer…)"
+                            if st["status"] in ("waiting", "streaming")
+                            else f"({st['status']}; no answer text)")
+                self.preview.setPlainText(text)
+                bar = self.preview.verticalScrollBar()
+                bar.setValue(bar.maximum())
 
     def _show_outline_stream(self, row):
-        cands = sorted(self._op_previews)
+        cands = sorted(self._candidate_states())
         if 0 <= row < len(cands):
             self._op_preview_row = cands[row]
             self._refresh_preview_pane()
 
+    def _show_draft_stream(self, row):
+        self._show_outline_stream(row)
+
     def _clear_op_previews(self, targets):
         """Reset live preview state and pane widgets for a fresh operation."""
         self._op_previews = {}
+        self._op_preview_latest = {}
         self._op_preview_row = None
         if "outline" in targets:
             self.outline_stream_list.blockSignals(True)
@@ -4559,6 +4606,12 @@ class MainWindow(QMainWindow):
             self.outline_stream.setPlainText("")
         if "scenes" in targets:
             self.scenes_stream.setPlainText("")
+        if "draft" in targets:
+            self.draft_stream_list.blockSignals(True)
+            self.draft_stream_list.clear()
+            self.draft_stream_list.blockSignals(False)
+            self._preview_text = ""
+            self.preview.setPlainText("")
 
     def _fail_running_previews(self):
         """A settled (cancelled/failed) operation cannot keep streaming."""
@@ -5214,9 +5267,10 @@ class MainWindow(QMainWindow):
                 self._root, self._batch["scene"], count=count,
                 parent=self._batch["parent"],
                 provider_factory=self._seam(), token=token,
-                events=sink)
+                events=sink, preview_events=lambda i: (lambda ev: None))
 
-        self._dispatch(fn, kind=kind, rows=rows)
+        if self._dispatch(fn, kind=kind, rows=rows):
+            self._clear_op_previews(("draft",))
 
     def reroll_selected(self):
         rows = [self._tray_selected()] if self._tray_selected() is not None else []
@@ -5426,13 +5480,17 @@ class MainWindow(QMainWindow):
         self._op_scene = scene
 
         def fn(sink, token):
+            # ADR-0012: the no-op subscriber enables the preview stream;
+            # generate_candidates forwards provider events tagged with the
+            # submission-slot candidate_id on the events channel.
             return dop.generate_candidates(
                 self._root, scene, count=self.count_spin.value(),
                 passage_words=self.length_spin.value(),
                 provider_factory=self._seam(), token=token,
-                events=sink)
+                events=sink, preview_events=lambda i: (lambda ev: None))
 
-        self._dispatch(fn)
+        if self._dispatch(fn):
+            self._clear_op_previews(("draft",))
 
     def accept_candidate(self):
         """Accept the tray-selected candidate; never implicit."""

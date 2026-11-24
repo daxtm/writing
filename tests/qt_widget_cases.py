@@ -610,9 +610,11 @@ PRESET = {
 class FakeProvider:
     """Provider seam for widget cases: same complete/many surface as Api."""
 
-    def __init__(self, chunks=("First chunk. ", "Second chunk."), responses=None):
+    def __init__(self, chunks=("First chunk. ", "Second chunk."), responses=None,
+                 fragments=None):
         self.chunks = list(chunks)
         self.responses = list(responses) if responses is not None else None
+        self.fragments = list(fragments) if fragments is not None else None
         self.calls = []
         self.started = 0
         self.gate = None          # threading.Event: block between chunks when set
@@ -628,6 +630,8 @@ class FakeProvider:
         self.started += 1
         if token is not None:
             token.check()
+        if _stream is None and self.fragments is not None:
+            _stream = self.fragments[self.started - 1]
         if _stream is not None:
             # paused-stream mode (gui-generated-text-streaming): deliver the
             # first fragment, block on the shared gate, then finish.
@@ -654,6 +658,13 @@ class FakeProvider:
                 raise RuntimeError(f"fake provider failed call {i}")
             return self.responses[i], "stop", {}
         out = []
+        red = None
+        if preview_events is not None:
+            from longform_core.utils import StreamRedactor
+            # mirror the ops-level redaction feed so preview deltas hold back
+            # split secrets exactly like the legacy delta channel
+            red = StreamRedactor(list(getattr(self, "preview_secrets", []) or []))
+            preview_events({"type": "preview_start", "attempt_id": 1})
         for i, ch in enumerate(self.chunks):
             if self.gate is not None and i > 0 and not self.gate.wait(10):
                 raise AssertionError("fake provider gate never opened")
@@ -662,8 +673,19 @@ class FakeProvider:
             out.append(ch)
             if stream_cb:
                 stream_cb(ch)
+            if red is not None:
+                text = red.feed(ch)
+                if text:
+                    preview_events({"type": "preview_delta",
+                                    "attempt_id": 1, "text": text})
             if self.fail_after is not None and i >= self.fail_after:
                 raise RuntimeError("fake provider failed midstream")
+        if red is not None:
+            rest = red.flush()
+            if rest:
+                preview_events({"type": "preview_delta",
+                                "attempt_id": 1, "text": rest})
+            preview_events({"type": "preview_complete", "attempt_id": 1})
         return "".join(out), "stop", {}
 
     def many(self, fn, n, token=None, on_event=None, indexed=None):
@@ -695,7 +717,8 @@ class FakeProvider:
             if token is not None:
                 token.check()
             try:
-                results.append(fn())
+                results.append(indexed(k - 1)() if indexed is not None
+                               else fn())
                 if on_event:
                     on_event({"type": "candidate_done", "k": k, "n": n})
             except longform_core.cancel.Cancelled:
@@ -775,7 +798,7 @@ class PlanningFake(FakeProvider):
     def chat_many(self, role, messages, n, max_tokens=None, token=None,
                   on_event=None, preview_events=None):
         self.calls.append(("chat_many", role))
-        if self.fragments is None and preview_events is None:
+        if self.fragments is None:
             return self.many(lambda: self.chat(role, messages, max_tokens,
                                                token=token), n, token=token,
                              on_event=on_event)
@@ -2202,8 +2225,66 @@ def case_planning_outline(root):
     win2.close()
 
 
+def case_stream_draft_candidates(root):
+    """Paused two-candidate draft generation (gui-generated-text-streaming).
+
+    Both labelled live answer previews show their first fragment while the
+    completion gates are closed and the worker is busy; the gates are always
+    released in finally, and completion binds each candidate to its own
+    saved branch with the head unchanged."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(root)
+    fake = FakeProvider(fragments=[("BATCH ONE text.", " tail one."),
+                                   ("BATCH TWO text.", " tail two.")])
+    fake.parallel = True
+    win = gw.MainWindow(str(project), choice=_no_dialogs("stream draft"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.count_spin.setValue(2)
+    fake.gate = threading.Event()   # closed: block after the first fragment
+    win.generate_btn.click()
+    try:
+        assert _pump(a, lambda: fake.started >= 2), "both candidates started"
+        assert _pump(a, lambda: win.draft_stream_list.count() == 2), \
+            "two labelled live candidate rows"
+        assert "streaming" in win.draft_stream_list.item(0).text().lower()
+        win.draft_stream_list.setCurrentRow(0)
+        assert _pump(a, lambda: "BATCH ONE text." in win.preview.toPlainText()), \
+            "candidate 1's fragment is visible while the gate is closed"
+        win.draft_stream_list.setCurrentRow(1)
+        assert _pump(a, lambda: "BATCH TWO text." in win.preview.toPlainText()), \
+            "candidate 2's fragment is visible while the gate is closed"
+        assert win._busy, "the worker is still busy while the gates are closed"
+        t = json.loads((project / "trees" / "s001.json").read_text())
+        assert set(t["nodes"]) == {"n1"}, \
+            "no candidate node exists before completion"
+        assert t["head"] == "n1", "head unchanged while streaming"
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "the worker settles on release"
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["head"] == "n1", "no implicit acceptance after completion"
+    assert win._batch and len(win._batch["saved"]) == 2, \
+        "both completed candidates are offered in the tray"
+    texts = [t["nodes"][nid]["text"] for nid in win._batch["saved"]]
+    assert any("BATCH ONE text." in x for x in texts) and \
+        any("BATCH TWO text." in x for x in texts) and \
+        not any(("BATCH ONE text." in x and "BATCH TWO text." in x)
+                for x in texts), \
+        "completion binds each candidate to its own saved branch " \
+        "(completion order may differ)"
+    for nid in win._batch["saved"]:
+        assert t["nodes"][nid]["parent"] == "n1", \
+            "each candidate is a sibling of the captured parent"
+        assert t["nodes"][nid]["source"] == "model"
+    win.close()
+
+
 def case_stream_planning(root):
     """Paused two-candidate outline generation (gui-generated-text-streaming).
+
 
     Both labelled live answer previews show their first fragment while the
     completion gates are closed and the worker is busy; the gates are always
@@ -4353,6 +4434,9 @@ def case_credentials_redaction(root):
         chunks = (f"The key is {SESSION_SENTINEL[:12]}",
                   f"{SESSION_SENTINEL[12:]} end. {ENV_SENTINEL} echo.")
         fake = FakeProvider(chunks=chunks)
+        # the fake mirrors the ops-level redaction feed for preview deltas
+        fake.preview_secrets = [SESSION_SENTINEL, PROJECT_SENTINEL,
+                                ENV_SENTINEL]
         win = gw.MainWindow(str(project),
                             choice=_no_dialogs("redaction"),
                             provider_factory=lambda _p: fake)
@@ -4447,6 +4531,7 @@ CASES = {
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
     "case_stream_planning": case_stream_planning,
+    "case_stream_draft_candidates": case_stream_draft_candidates,
     "case_planning_scenes": case_planning_scenes,
     "case_planning_card_edit": case_planning_card_edit,
     "case_review_update_state": case_review_update_state,

@@ -238,14 +238,22 @@ class GenerateResult:
 
 def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
                         passage_words=None, provider_factory=None, token=None,
-                        events=None):
+                        events=None, preview_events=None):
     """Generate `count` candidate passages as siblings of `parent` (default head).
 
     Cleaning, cutoff handling and node metadata match the CLI byte-for-byte.
     A failed, cancelled or empty cleaned response creates no node; complete
     candidates saved earlier stay saved. Raises OpError (stale/soft) or
-    Cancelled; never moves the head."""
+    Cancelled; never moves the head.
+
+    `preview_events` (ADR-0012), when given, is called with the submission
+    slot index i and must return that candidate's live answer subscriber;
+    slot ids are assigned before submission, so preview candidate_id stays
+    stable regardless of completion order. Without it the legacy single-
+    stream/CLI delta events are unchanged and no preview events are emitted."""
     count = max(1, int(count))
+    pf = None if preview_events is None else preview_factory(events,
+                                                             preview_events)
     p, scenes, idx, sc = _session(root, scene_id)
     tree = _tree(p, scene_id)
     head0 = tree.head if parent is None else parent
@@ -274,28 +282,41 @@ def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
     meta = {"scene": sc["id"], "head": head0, "lorebooks": lore.active(),
             "present": sc.get("characters") or [], "char": rep["char"], "steer": steer}
 
-    def one():
-        return provider.complete("writer", prompt, params, extra, meta=meta, token=token)
+    def one(i=None):
+        return provider.complete("writer", prompt, params, extra, meta=meta,
+                                 token=token,
+                                 preview_events=None if pf is None else pf(i))
 
     try:
         if count == 1:
             _emit(events, "stream_start")
-            red = StreamRedactor(redaction_secrets(p, provider))
-            results = [provider.complete("writer", prompt, params, extra,
-                                         stream_cb=(lambda t: _emit(events, "delta",
-                                                                    text=red.feed(t))) if events else None,
-                                         meta=meta, token=token,
-                                         on_retry_event=(lambda kind: _emit(events, kind)) if events else None)]
-            rest = red.flush()
-            if rest and events:
-                _emit(events, "delta", text=rest)
+            sub = None if pf is None else pf(0)
+            if sub is not None:
+                # ADR-0012: the subscriber receives the answer preview; the
+                # legacy CLI delta channel is not duplicated on top of it.
+                results = [provider.complete(
+                    "writer", prompt, params, extra, meta=meta, token=token,
+                    preview_events=sub)]
+                rest = ""
+            else:
+                red = StreamRedactor(redaction_secrets(p, provider))
+                results = [provider.complete("writer", prompt, params, extra,
+                                             stream_cb=(lambda t: _emit(events, "delta",
+                                                                        text=red.feed(t))) if events else None,
+                                             meta=meta, token=token,
+                                             on_retry_event=(lambda kind: _emit(events, kind)) if events else None)]
+                rest = red.flush()
+                if rest and events:
+                    _emit(events, "delta", text=rest)
             _emit(events, "stream_end")
             streamed = True
         else:
             _emit(events, "progress",
                   msg=f"generating {count} candidates (max_parallel {p.cfg['max_parallel']})...")
             results = provider.many(one, count, token=token,
-                                    on_event=(lambda ev: _emit_raw(events, ev)) if events else None)
+                                    on_event=(lambda ev: _emit_raw(events, ev)) if events else None,
+                                    indexed=(lambda i: (lambda: one(i)))
+                                    if pf is not None else None)
             streamed = False
     except Cancelled:
         raise
@@ -331,6 +352,31 @@ def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
 def _emit_raw(events, payload):
     if events:
         events(dict(payload))
+
+
+def preview_factory(events, preview_events):
+    """Common ADR-0012 forwarding: bind each slot's subscriber to its candidate
+    slot before submission. With an events channel, each provider preview
+    event is re-emitted on it tagged with candidate_id=i+1 (the queued worker
+    channel pairs it with the operation id); otherwise the subscriber receives
+    the provider event directly."""
+    def factory(i):
+        sub = preview_events(i) if preview_events is not None else None
+        if sub is None:
+            return None
+        if events is None:
+            return sub
+        c = i + 1
+
+        def fwd(ev, c=c):
+            d = {k: v for k, v in ev.items() if k != "type"}
+            _emit(events, ev.get("type"), candidate_id=c, **d)
+        return fwd
+    return factory
+
+
+PREVIEW_TYPES = ("preview_start", "preview_delta", "preview_reset",
+                 "preview_complete")
 
 
 def accept_candidate(root, scene_id, nid, *, token=None, events=None):
