@@ -485,8 +485,14 @@ class Api:
             pe({"type": "preview_complete", "attempt_id": pstate["attempt"]})
         return text, finish, usage
 
-    def many(self, fn, n, token=None, on_event=None):
+    def many(self, fn, n, token=None, on_event=None, indexed=None):
         """n parallel calls of fn(); completed results in completion order.
+
+        With `indexed`, called once per slot before submission, each slot runs
+        indexed(i) instead of fn() — stable per-slot state (e.g. preview
+        subscribers) independent of completion order. Zero-argument callers
+        keep the previous behavior, bounded concurrency and completion-order
+        results.
 
         `on_event` replaces the terminal progress prints with dicts ({"type":
         "candidate_done"/"candidate_failed", "k", "n", ...}); a cancelled token
@@ -497,10 +503,10 @@ class Api:
             token.check()
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = []
-            for _ in range(n):
+            for i in range(n):
                 if token:
                     token.check()
-                futs.append(ex.submit(fn))
+                futs.append(ex.submit(indexed(i) if indexed is not None else fn))
             was_cancelled = False
             for k, fut in enumerate(as_completed(futs), 1):
                 try:
@@ -526,11 +532,24 @@ class Api:
         else:
             print(col(msg, color), flush=True)
 
-    def chat_many(self, role, messages, n, max_tokens=None, token=None, on_event=None):
+    def chat_many(self, role, messages, n, max_tokens=None, token=None, on_event=None,
+                  preview_events=None):
         """n planner-style calls; optional token/on_event pass through to many()
-        and each chat (defaults keep the unchanged CLI output)."""
+        and each chat (defaults keep the unchanged CLI output).
+
+        `preview_events`, when given, is called with the slot index i and must
+        return that candidate's preview_events subscriber (or None); slots are
+        assigned before submission so identities are stable regardless of
+        completion order."""
         one_at_a_time = max(1, min(n, int(self.p.cfg["max_parallel"]))) == 1
+
+        def indexed(i):
+            sub = preview_events(i) if preview_events is not None else None
+            return lambda: self.chat(role, messages, max_tokens,
+                                     progress=one_at_a_time, token=token,
+                                     preview_events=sub)
+
         return self.many(
             lambda: self.chat(role, messages, max_tokens, progress=one_at_a_time, token=token),
-            n, token=token, on_event=on_event)
+            n, token=token, on_event=on_event, indexed=indexed if preview_events is not None else None)
 

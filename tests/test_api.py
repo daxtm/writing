@@ -6,6 +6,7 @@ autouse guard fails any request that escapes the mocks.
 """
 
 import json
+import threading
 from pathlib import Path
 
 import httpx
@@ -639,6 +640,129 @@ def test_preview_transport_retry_resets_attempt(mock_http, api_env):
     assert _kinds(evs) == [("preview_start", 1), ("preview_reset", 1),
                            ("preview_start", 2), ("preview_delta", 2),
                            ("preview_complete", 2)]
+
+
+def sse_stream(chunks):
+    """A lazily-streamed SSE response: chunks is an iterable of SSE payloads
+    (dicts or bytes); bytes pass through, dicts are encoded per chunk so a
+    paused generator can block between them."""
+    def gen():
+        for c in chunks:
+            if isinstance(c, bytes):
+                yield c
+            else:
+                yield ("data: " + json.dumps(c) + "\n\n").encode()
+        yield b"data: [DONE]\n\n"
+    return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                          content=gen())
+
+
+def test_many_indexed_previews_paused_reverse_completion(mock_http):
+    """Two paused candidates with per-slot preview subscribers (task 1.3)."""
+    gates = {"A": threading.Event(), "B": threading.Event()}
+    first = {"A": threading.Event(), "B": threading.Event()}
+    done = {"B": threading.Event()}
+
+    def handler(request):
+        body = json.loads(request.content)
+        tag = "A" if "slot-A" in body["prompt"] else "B"
+
+        def gen():
+            yield text_chunk(tag + "-one ")
+            first[tag].set()
+            assert gates[tag].wait(30), f"gate {tag} never opened"
+            yield text_chunk(tag + "-two", finish="stop",
+                             usage={"prompt_tokens": 2})
+            if tag == "B":
+                done["B"].set()
+        return sse_stream(gen())
+
+    api = make_api(mock_http, handler)
+    subs = {0: [], 1: []}
+    tags = {0: "A", 1: "B"}
+
+    def indexed(i):
+        return lambda: api.complete("writer", f"prompt slot-{tags[i]}",
+                                    {"max_tokens": 5},
+                                    preview_events=subs[i].append)
+
+    out = []
+    t = threading.Thread(
+        target=lambda: out.append(api.many(lambda: None, 2, indexed=indexed)))
+    t.start()
+    try:
+        assert first["A"].wait(30) and first["B"].wait(30)
+        assert _deltas(subs[0]) == "A-one " and _deltas(subs[1]) == "B-one ", \
+            "both slot previews show their fragment while paused"
+        gates["B"].set()   # release out of slot order: reverse completion
+        assert done["B"].wait(30), "B never finished"
+        gates["A"].set()
+        t.join(30)
+    finally:
+        gates["A"].set()
+        gates["B"].set()
+    assert not t.is_alive()
+    assert [r[0] for r in out[0]] == ["B-one B-two", "A-one A-two"], \
+        "results stay in completion order"
+    for i in (0, 1):
+        assert _deltas(subs[i]) == f"{tags[i]}-one {tags[i]}-two", \
+            "each subscriber kept its own candidate's answer"
+        assert _kinds(subs[i]) == [("preview_start", 1), ("preview_delta", 1),
+                                   ("preview_delta", 1), ("preview_complete", 1)], \
+            "one attempt per slot, stable identities"
+    assert len(mock_http.calls) == 2, "no extra requests"
+
+
+def test_many_indexed_retry_isolated_per_candidate(mock_http, api_env):
+    n = {"A": 0, "B": 0}
+
+    def handler(request):
+        body = json.loads(request.content)
+        tag = "A" if "slot-A" in body["prompt"] else "B"
+        n[tag] += 1
+        if tag == "A" and n["A"] == 1:
+            return json_response({"error": "busy"}, status=503)
+        return sse(text_chunk(tag + "-done", finish="stop",
+                              usage={"prompt_tokens": 1}))
+
+    api = make_api(mock_http, handler)
+    subs = {0: [], 1: []}
+    retries = {0: [], 1: []}
+
+    def indexed(i):
+        tag = "A" if i == 0 else "B"
+        return lambda: api.complete(
+            "writer", f"prompt slot-{tag}", {"max_tokens": 5},
+            on_retry_event=lambda why: retries[i].append(why),
+            preview_events=subs[i].append)
+
+    results = api.many(lambda: None, 2, indexed=indexed)
+    assert sorted(r[0] for r in results) == ["A-done", "B-done"]
+    assert retries[0] == ["reset"] and retries[1] == [], \
+        "only the failed candidate retried"
+    assert _kinds(subs[0]) == [("preview_start", 1), ("preview_reset", 1),
+                               ("preview_start", 2), ("preview_delta", 2),
+                               ("preview_complete", 2)]
+    assert _kinds(subs[1]) == [("preview_start", 1), ("preview_delta", 1),
+                               ("preview_complete", 1)], \
+        "the healthy candidate's preview is untouched by the retry"
+    assert n == {"A": 2, "B": 1}, "no extra requests beyond the retry"
+
+
+def test_chat_many_preview_events_per_slot(mock_http):
+    def handler(request):
+        return sse(delta_chunk({"content": "ok"}, finish="stop",
+                               usage={"prompt_tokens": 1}))
+
+    api = make_api(mock_http, handler)
+    subs = {i: [] for i in range(3)}
+    results = api.chat_many("quietrole", [{"role": "user", "content": "q"}], 3,
+                            preview_events=lambda i: subs[i].append)
+    assert [r[0] for r in results] == ["ok"] * 3
+    for i in range(3):
+        assert _kinds(subs[i]) == [("preview_start", 1), ("preview_delta", 1),
+                                   ("preview_complete", 1)], \
+            f"slot {i} got its own single-attempt preview"
 
 
 def test_preview_extra_parameter_fallback_resets_attempt(mock_http):
