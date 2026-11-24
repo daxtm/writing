@@ -16,39 +16,25 @@ from .tree import Tree
 from .utils import (ask, col, die, edit_saved, extract_tagged, keep_lead, line_diff, now, page, parse_sections, read_json, read_text, save_input, slug, stamp, tag_instr, text_hash, warn, word_diff, words, write_json, write_text)
 
 def cmd_init(args):
-    root = Path(args.dir).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    made = []
-    files = {
-        "project.json": json.dumps(DEFAULT_CONFIG, indent=2) + "\n",
-        "bible.md": BIBLE_TEMPLATE,
-        "state.md": STATE_TEMPLATE,
-        "scenes.json": "[]\n",
-        "summaries.json": json.dumps({"scenes": {}, "arcs": []}, indent=2) + "\n",
-    }
-    for name, content in files.items():
-        path = root / name
-        if not path.exists():
-            write_text(path, content)
-            made.append(name)
-    for d in ("trees", "outlines", "critiques", "checks", "state_history", "lorebooks", "bible_history"):
-        (root / d).mkdir(exist_ok=True)
-    if args.preset:
-        src = Path(args.preset).expanduser().resolve()
-        dst = root / "writer_preset.json"
-        if not src.exists():
-            die(f"preset file not found: {src}")
-        if dst.exists():
-            warn(f"{dst} already exists; not overwritten")
-        else:
-            d = read_json(src)
-            for k in ("instruct", "context", "sysprompt", "preset"):
-                if k not in d:
-                    die(f"{src} is not a SillyTavern master export (missing '{k}')")
-            shutil.copy2(src, dst)
-            made.append("writer_preset.json")
-    print(f"project: {root}")
-    print("created: " + (", ".join(made) if made else "(nothing; all files already exist)"))
+    """Thin CLI adapter over the shared initializer (planning_operations).
+
+    Same arguments/output structure as before; create-missing-only with the
+    reviewed complete defaults (ADR-0010). Failures die nonzero with truthful
+    partial-work diagnostics; an existing destination preset is preserved with
+    a not-overwritten warning.
+    """
+    from .planning_operations import OpError, init_project
+    try:
+        result = init_project(Path(args.dir).expanduser().resolve(),
+                              preset_src=args.preset)
+    except OpError as e:
+        die(str(e))
+    for w in result["warnings"]:
+        warn(w)
+    made = result["created"]
+    print(f"project: {result['root']}")
+    print("created: " + (", ".join(made) if made
+                         else "(nothing; all files already exist)"))
     print("next: set models in project.json, fill in bible.md, put lorebooks in lorebooks/, then run limits")
 
 

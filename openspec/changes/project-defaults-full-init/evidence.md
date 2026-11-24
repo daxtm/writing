@@ -16,3 +16,9 @@ preset-usability assertions fail. The xfail is strict, so it becomes an error
 the moment the behavior exists without the marker being removed.
 
 After task 1.4 the marker is removed and the same test must pass unmarked.
+
+Task 1.4 follow-up: the marker was removed and the suite reports
+`431 passed` (source stage, standalone excluded); the CLI transcript is frozen
+as `created: project.json, bible.md, state.md, scenes.json, summaries.json,
+writer_preset.json`, failures exit nonzero via `die()`/`FatalError` with
+truthful partial-work diagnostics, and explicit `--preset` copies exact bytes.

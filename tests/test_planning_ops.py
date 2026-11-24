@@ -67,13 +67,13 @@ def test_init_matches_cli_files_and_transcript(tmp_path, monkeypatch, capsys):
     out = cli_init(a, monkeypatch=monkeypatch, capsys=capsys).out
     result = plan.init_project(b)
     for name in plan.INIT_FILES:
-        if name in ("project.json", "writer_preset.json"):
-            continue   # interim: the CLI adapter swaps to this op with 1.4
         assert (a / name).read_bytes() == (b / name).read_bytes(), name
-    assert result["created"][-1] == "writer_preset.json", \
-        "the shared operation already creates the bundled default preset"
+    for d in plan.INIT_DIRS:
+        assert (a / d).is_dir() and (b / d).is_dir()
+    assert result["created"][-1] == "writer_preset.json"
     assert out == (f"project: {a}\n"
-                   "created: project.json, bible.md, state.md, scenes.json, summaries.json\n"
+                   "created: project.json, bible.md, state.md, scenes.json, "
+                   "summaries.json, writer_preset.json\n"
                    "next: set models in project.json, fill in bible.md, put lorebooks in "
                    "lorebooks/, then run limits\n")
 
@@ -396,7 +396,8 @@ def test_import_preset_missing_source_is_an_error(tmp_path):
     root.mkdir()
     with pytest.raises(OpError) as e:
         plan.import_preset(root, tmp_path / "absent.json")
-    assert "could not be read" in str(e.value)
+    assert ("could not be read" in str(e.value)
+            or "not found" in str(e.value))
 
 
 def test_import_preset_never_overwrites_destination(tmp_path, master_file):

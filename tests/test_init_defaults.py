@@ -6,6 +6,7 @@ preset in its `created:` line, and make no provider call. Runs against the real
 CLI entry point; no network, no owner source files, no fixtures.
 """
 
+import json
 import sys
 
 import pytest
@@ -18,10 +19,6 @@ INIT_DIRS = ("trees", "outlines", "critiques", "checks", "state_history",
              "lorebooks", "bible_history")
 
 
-@pytest.mark.xfail(reason="baseline: CLI init without --preset creates no "
-                          "writer_preset.json (project-defaults-full-init 1.1); "
-                          "strict marker removed when initialization is extended",
-                   strict=True)
 def test_cli_init_without_preset_creates_complete_defaults(tmp_path, monkeypatch,
                                                            capsys):
     proj = tmp_path / "demo"
@@ -58,3 +55,94 @@ def test_cli_init_without_preset_creates_complete_defaults(tmp_path, monkeypatch
         assert isinstance(preset[k], dict), k
     params, _extra, _ignored = writer_sampling(preset, lambda s: s)
     assert params, "the bundled preset must yield usable sampling parameters"
+
+
+def test_cli_init_repeat_reports_nothing_created(tmp_path, monkeypatch, capsys):
+    proj = tmp_path / "demo"
+    monkeypatch.setattr(sys, "argv", ["longform.py", "init", str(proj)])
+    cli.main()
+    first = capsys.readouterr()
+    assert "writer_preset.json" in first.out
+    monkeypatch.setattr(sys, "argv", ["longform.py", "init", str(proj)])
+    cli.main()
+    out = capsys.readouterr().out
+    assert out == (f"project: {proj}\n"
+                   "created: (nothing; all files already exist)\n"
+                   "next: set models in project.json, fill in bible.md, "
+                   "put lorebooks in lorebooks/, then run limits\n")
+
+
+MASTER = {"preset": {"temp": 0.9, "genamt": 400},
+          "instruct": {"macro": True, "input_sequence": "\n",
+                       "input_suffix": "\n", "output_sequence": "\n",
+                       "stop_sequence": ""},
+          "context": {"story_string": "", "chat_start": "## Chat\n",
+                      "example_separator": "\n"},
+          "sysprompt": {"content": "write well", "name": "sp"}}
+
+
+def test_cli_init_explicit_preset_copies_exact_bytes(tmp_path, monkeypatch,
+                                                     capsys):
+    proj = tmp_path / "demo"
+    src = tmp_path / "mine.json"
+    src.write_text(json.dumps(MASTER), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["longform.py", "init", str(proj),
+                                      "--preset", str(src)])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "warning" not in out
+    assert "writer_preset.json" in out.splitlines()[1]
+    assert (proj / "writer_preset.json").read_bytes() == src.read_bytes(), \
+        "the explicit override is copied byte-identically"
+
+
+def test_cli_init_existing_preset_survives_with_warning(tmp_path, monkeypatch,
+                                                        capsys):
+    proj = tmp_path / "demo"
+    src = tmp_path / "mine.json"
+    src.write_text(json.dumps(MASTER), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["longform.py", "init", str(proj)])
+    cli.main()
+    capsys.readouterr()
+    kept = (proj / "writer_preset.json").read_bytes()
+    monkeypatch.setattr(sys, "argv", ["longform.py", "init", str(proj),
+                                      "--preset", str(src)])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "warning: writer_preset.json already exists; not overwritten" in out
+    assert (proj / "writer_preset.json").read_bytes() == kept, \
+        "an existing preset is never replaced"
+
+
+def test_cli_init_failure_exits_nonzero_without_transcript(tmp_path,
+                                                           monkeypatch,
+                                                           capsys):
+    proj = tmp_path / "demo"
+    src = tmp_path / "bad.json"
+    src.write_text("{nope", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["longform.py", "init", str(proj),
+                                      "--preset", str(src)])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code not in (0, None), "failures exit nonzero"
+    captured = capsys.readouterr()
+    assert captured.out == "", "no success transcript on failure"
+    assert "error: " in captured.err
+    assert "not valid JSON" in captured.err
+    assert "created before the error" in captured.err, \
+        "partial work is reported truthfully"
+    assert not (proj / "writer_preset.json").exists(), \
+        "invalid explicit input never falls back to the bundle"
+
+
+def test_cli_init_missing_preset_source_exits_nonzero(tmp_path, monkeypatch,
+                                                      capsys):
+    proj = tmp_path / "demo"
+    monkeypatch.setattr(sys, "argv", ["longform.py", "init", str(proj),
+                                      "--preset", str(tmp_path / "gone.json")])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code not in (0, None)
+    err = capsys.readouterr().err
+    assert "could not be read" in err or "not found" in err
+    assert "gone.json" in err

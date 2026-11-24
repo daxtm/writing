@@ -184,7 +184,7 @@ def _init_preset(root, preset_src, made, dirs_made, problems, *, token):
         return None   # existing preset/config preserved untouched
     if preset_src:
         try:
-            return import_preset(root, preset_src, token=token)
+            preset = import_preset(root, preset_src, token=token)
         except OpError as e:
             note = _partial_note_made(made, dirs_made)
             if note and note not in str(e):
@@ -192,6 +192,9 @@ def _init_preset(root, preset_src, made, dirs_made, problems, *, token):
                               collision=getattr(e, "collision", False)
                               ) from None
             raise
+        if "writer_preset.json" not in made:
+            made.append("writer_preset.json")
+        return preset
     try:
         data = dfl.writer_preset_bytes()
     except dfl.DefaultsError as e:
@@ -244,7 +247,7 @@ def import_preset(root, src, *, token=None, events=None):
     try:
         data = src.read_bytes()
     except OSError as e:
-        raise OpError("the selected preset could not be read "
+        raise OpError(f"preset file not found or unreadable: {src} "
                       f"({type(e).__name__})") from None
     try:
         d = json.loads(data.decode("utf-8"))
