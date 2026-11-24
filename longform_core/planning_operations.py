@@ -14,6 +14,7 @@ import os
 import re
 from pathlib import Path
 
+from . import defaults as dfl
 from .api import Api, HttpErr
 from .cancel import Cancelled
 from .config import BIBLE_TEMPLATE, DEFAULT_CONFIG, STATE_TEMPLATE
@@ -28,12 +29,23 @@ from .utils import (FatalError, deep_merge, now, read_text, save_input, stamp,
 # ------------------------------------------------------- initialization
 
 
+def _project_json_bytes(title=None):
+    """Reviewed new-project defaults (ADR-0010) as the exact project.json
+    payload; a fresh validated copy per call, with an optional explicit title.
+    """
+    cfg = dfl.project_defaults()
+    if title is not None:
+        cfg["title"] = str(title)
+    return (json.dumps(cfg, indent=2) + "\n").encode("utf-8")
+
+
 INIT_FILES = {
-    "project.json": json.dumps(DEFAULT_CONFIG, indent=2) + "\n",
+    "project.json": None,      # payload from the reviewed defaults
     "bible.md": BIBLE_TEMPLATE,
     "state.md": STATE_TEMPLATE,
     "scenes.json": "[]\n",
     "summaries.json": json.dumps({"scenes": {}, "arcs": []}, indent=2) + "\n",
+    "writer_preset.json": None,  # explicit source wins; else the bundled preset
 }
 INIT_DIRS = ("trees", "outlines", "critiques", "checks", "state_history",
              "lorebooks", "bible_history")
@@ -56,67 +68,158 @@ def _write_bytes_safe(path, data):
     os.replace(tmp, path)
 
 
-def init_project(root, *, preset_src=None, token=None, events=None):
-    """Create-missing-only initialization with cmd_init's exact payloads.
-
-    Existing files are never replaced, even malformed; a name collision with a
-    directory or symlink is an error (with what was already created reported),
-    not permission to reset. A preset source imports through the existing
-    master-export validation without overwriting an existing destination.
-    """
-    root = canonical_root(root)
+def _init_file(root, name, data, made, token):
+    """Create one missing initial file (bytes) with the safe-path checks;
+    existing files are never replaced, unsafe collisions are refused."""
+    path = root / name
     if token:
         token.check()
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise OpError(f"{name} is a symlink; not overwritten")
+        if path.exists() and not path.is_file():
+            raise OpError(f"{name} exists and is not a regular file; "
+                          "not overwritten")
     except OSError as e:
-        raise OpError(f"the project directory could not be created "
-                      f"({type(e).__name__})") from None
+        raise OpError(f"{name} could not be inspected "
+                      f"({type(e).__name__})" + _partial_note_made(made)
+                      ) from None
+    if path.exists():
+        return
+    try:
+        _write_bytes_safe(path, data)
+    except OSError as e:
+        raise OpError(f"{name} could not be written ({type(e).__name__})"
+                      + _partial_note_made(made)) from None
+    made.append(name)
+
+
+def init_project(root, *, preset_src=None, title=None, token=None, events=None):
+    """Create-missing-only initialization with complete new-project defaults.
+
+    Existing files are never replaced, even malformed; a name collision with a
+    directory or symlink is an error (with what was already created reported),
+    not permission to reset. New files come from the reviewed bundled defaults
+    (ADR-0010): supported settings with the forced empty key, credential
+    environment name and project-relative preset path, plus a usable bundled
+    `writer_preset.json`. An explicit `preset_src` wins over the bundle for a
+    missing destination and is validated before any write — invalid explicit
+    input never falls back to the bundle; an existing regular destination is
+    preserved with a not-overwritten warning. `title` (optional) overrides the
+    `Untitled` default for a newly created configuration only.
+    """
+    root = canonical_root(root)
     made, dirs_made, problems = [], [], []
-    for name, content in INIT_FILES.items():
-        path = root / name
+    try:
+        if token:
+            token.check()
         try:
-            if path.is_symlink():
-                raise OpError(f"{name} is a symlink; not overwritten")
-            if path.exists() and not path.is_file():
-                raise OpError(f"{name} exists and is not a regular file; "
-                              "not overwritten")
+            root.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            raise OpError(f"{name} could not be inspected "
+            raise OpError(f"the project directory could not be created "
                           f"({type(e).__name__})") from None
-        if not path.exists():
-            write_text(path, content)
-            made.append(name)
-    for d in INIT_DIRS:
-        dp = root / d
-        if dp.is_symlink():
-            raise OpError(f"{d}/ is a symlink; not replaced"
-                          + _partial_note(made, dirs_made))
-        if dp.exists():
-            if not dp.is_dir():
-                raise OpError(f"{d} exists and is not a directory; not replaced"
-                              + _partial_note(made, dirs_made))
-            continue
-        try:
-            dp.mkdir()
-        except OSError as e:
-            raise OpError(f"{d}/ could not be created ({type(e).__name__})"
-                          + _partial_note(made, dirs_made)) from None
-        dirs_made.append(d)
-    preset = None
-    if preset_src:
-        preset = import_preset(root, preset_src, token=token)
+        for name, content in INIT_FILES.items():
+            if name == "writer_preset.json":
+                continue   # after the directories, once its source is selected
+            if name == "project.json":
+                _init_file(root, name, _project_json_bytes(title), made, token)
+            else:
+                _init_file(root, name, content.encode("utf-8"), made, token)
+        for d in INIT_DIRS:
+            if token:
+                token.check()
+            dp = root / d
+            if dp.is_symlink():
+                raise OpError(f"{d}/ is a symlink; not replaced"
+                              + _partial_note_made(made, dirs_made))
+            if dp.exists():
+                if not dp.is_dir():
+                    raise OpError(
+                        f"{d} exists and is not a directory; not replaced"
+                        + _partial_note_made(made, dirs_made))
+                continue
+            try:
+                dp.mkdir()
+            except OSError as e:
+                raise OpError(f"{d}/ could not be created "
+                              f"({type(e).__name__})"
+                              + _partial_note_made(made, dirs_made)) from None
+            dirs_made.append(d)
+        preset = _init_preset(root, preset_src, made, dirs_made, problems,
+                              token=token)
+    except Cancelled:
+        # Stop at a controlled boundary: report what already exists, keep it.
+        _emit(events, "init_partial", created=list(made), dirs=list(dirs_made))
+        raise
     _emit(events, "initialized", created=len(made))
     return {"root": str(root), "created": made, "dirs": dirs_made,
             "preset": preset, "warnings": problems}
 
 
-def _partial_note(made, dirs_made):
+def _init_preset(root, preset_src, made, dirs_made, problems, *, token):
+    """Select the preset source before creating a missing destination:
+    explicit `preset_src` (validated, never replaced by the bundle), else the
+    reviewed bundled preset. An existing regular destination is preserved."""
+    dst = root / "writer_preset.json"
+    if token:
+        token.check()
+    try:
+        if dst.is_symlink():
+            raise OpError("writer_preset.json is a symlink; not overwritten"
+                          + _partial_note_made(made, dirs_made),
+                          collision=True)
+        if dst.exists() and not dst.is_file():
+            raise OpError("writer_preset.json exists and is not a regular "
+                          "file; not overwritten"
+                          + _partial_note_made(made, dirs_made), collision=True)
+    except OSError as e:
+        raise OpError("writer_preset.json could not be inspected "
+                      f"({type(e).__name__})"
+                      + _partial_note_made(made, dirs_made)) from None
+    if dst.exists():
+        if preset_src:
+            problems.append("writer_preset.json already exists; not "
+                            "overwritten (configure an existing preset path "
+                            "in Settings if appropriate)")
+        return None   # existing preset/config preserved untouched
+    if preset_src:
+        try:
+            return import_preset(root, preset_src, token=token)
+        except OpError as e:
+            note = _partial_note_made(made, dirs_made)
+            if note and note not in str(e):
+                raise OpError(str(e) + note,
+                              collision=getattr(e, "collision", False)
+                              ) from None
+            raise
+    try:
+        data = dfl.writer_preset_bytes()
+    except dfl.DefaultsError as e:
+        raise OpError(str(e) + _partial_note_made(made, dirs_made)) from None
+    if token:
+        token.check()
+    try:
+        _write_bytes_safe(dst, data)
+    except OSError as e:
+        raise OpError(f"writer_preset.json could not be written "
+                      f"({type(e).__name__})"
+                      + _partial_note_made(made, dirs_made)) from None
+    made.append("writer_preset.json")
+    _emit(None, "preset_imported", name="writer_preset.json")
+    return {"imported": "writer_preset.json", "bytes": len(data),
+            "replaced": False, "default": True}
+
+
+def _partial_note_made(made, dirs_made=()):
     if made or dirs_made:
         return (f" (created before the error: "
-                f"{', '.join(made + dirs_made)}; initialization is not a "
-                "transaction)")
+                f"{', '.join(list(made) + list(dirs_made))}; initialization "
+                "is not a transaction)")
     return ""
+
+
+def _partial_note(made, dirs_made):
+    return _partial_note_made(made, dirs_made)
 
 
 REQUIRED_PRESET_KEYS = ("instruct", "context", "sysprompt", "preset")

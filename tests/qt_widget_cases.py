@@ -1411,6 +1411,14 @@ def case_planning_journey(root):
             "fake-writer-model": {
                 "id": "fake-writer-model", "context_length": 8192,
                 "max_completion_tokens": 4096,
+                "available_on_current_plan": True},
+            "huihui-ai/Huihui-Qwen3.8-27B-abliterated": {
+                "id": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+                "context_length": 40960, "max_completion_tokens": 8192,
+                "available_on_current_plan": True},
+            "TheDrummer/Anubis-70B-v1.2": {
+                "id": "TheDrummer/Anubis-70B-v1.2",
+                "context_length": 32768, "max_completion_tokens": 4096,
                 "available_on_current_plan": True}},
         responses=[
             "<outline>OUTLINE ONE BODY</outline>",
@@ -1422,7 +1430,8 @@ def case_planning_journey(root):
             '"beats": ["Mara counts."], "target_words": 1700}]</scenes>',
         ])
 
-    picks = {"dir": [None, str(missing)], "preset": [str(src / "master.json")]}
+    picks = {"dir": [None, str(missing)],
+             "preset": [str(src / "master.json"), str(src / "master.json")]}
     choices = []
 
     win = gw.MainWindow(
@@ -1443,8 +1452,11 @@ def case_planning_journey(root):
     win.create_btn.click()
     assert _pump(a, lambda: not win._busy)
     import longform_core.config as cfgmod
+    import longform_core.defaults as dflmod
+    assert json.loads((missing / "project.json").read_text()) == \
+        dflmod.project_defaults(), \
+        "created project.json uses the reviewed sanitized defaults"
     for name, content in {
-        "project.json": json.dumps(cfgmod.DEFAULT_CONFIG, indent=2) + "\n",
         "bible.md": cfgmod.BIBLE_TEMPLATE,
         "state.md": cfgmod.STATE_TEMPLATE,
         "scenes.json": "[]\n",
@@ -1455,9 +1467,20 @@ def case_planning_journey(root):
     for d in ("trees", "outlines", "critiques", "checks", "state_history",
               "lorebooks", "bible_history"):
         assert (missing / d).is_dir(), f"init directory {d} exists"
+    assert (missing / "writer_preset.json").read_bytes() == \
+        dflmod.writer_preset_bytes(), \
+        "Create ships the bundled reviewed preset without a picker"
     assert fake.calls == [], "Create makes no provider call"
 
-    # -- Preset import through its own picker; original bytes preserved.
+    # -- Preset import: refused while the bundled preset is present...
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not overwritten" in win.status.text().lower()
+    assert (missing / "writer_preset.json").read_bytes() == \
+        dflmod.writer_preset_bytes(), "refusal keeps the bundled bytes"
+
+    # -- ...and succeeds unchanged on an absent destination.
+    (missing / "writer_preset.json").unlink()
     win.preset_import_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert (missing / "writer_preset.json").read_bytes() == \
@@ -1484,8 +1507,9 @@ def case_planning_journey(root):
     assert fake.calls == [("GET", "/plan"),
                           ("GET", "/models/fake-planner-model"),
                           ("GET", "/models/fake-writer-model"),
-                          ("GET", "/models/meta-llama/"
-                                  "Llama-3.3-70B-Instruct")], \
+                          ("GET", "/models/huihui-ai/"
+                                  "Huihui-Qwen3.8-27B-abliterated"),
+                          ("GET", "/models/TheDrummer/Anubis-70B-v1.2")], \
         "explicit fetch makes exactly the plan + per-distinct-model lookups"
     limits = json.loads((missing / "limits.json").read_text())
     assert limits["plan"]["max_context_length"] == 8192
@@ -1638,16 +1662,26 @@ def case_planning_create_open(root):
     assert json.loads((missing / "project.json").read_text())["title"] == "Kept"
     assert (missing / "bible.md").exists(), "only missing files are filled"
 
-    # preset import: cancelled picker, then a valid import
+    # preset import: cancelled picker, then refusal while the bundled
+    # preset is present, then success on an absent destination
+    bundled = (missing / "writer_preset.json").read_bytes()
     preset_picks.append(None)
     win.preset_import_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert "no preset picked" in win.status.text().lower()
-    assert not (missing / "writer_preset.json").exists()
+    assert (missing / "writer_preset.json").read_bytes() == bundled
 
     src = root / "master.json"
     src.write_text(json.dumps({"preset": {}, "instruct": {}, "context": {},
                                "sysprompt": {}}), encoding="utf-8")
+    preset_picks.append(str(src))
+    win.preset_import_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not overwritten" in win.status.text().lower()
+    assert (missing / "writer_preset.json").read_bytes() == bundled, \
+        "import refuses to replace the bundled preset"
+
+    (missing / "writer_preset.json").unlink()
     preset_picks.append(str(src))
     win.preset_import_btn.click()
     assert _pump(a, lambda: not win._busy)

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from longform_core.cancel import Cancelled
+
 import reader_support as rs
 
 import longform_core.commands as commands
@@ -63,11 +65,13 @@ def cli_init(root, preset=None, monkeypatch=None, capsys=None):
 def test_init_matches_cli_files_and_transcript(tmp_path, monkeypatch, capsys):
     a, b = tmp_path / "cli", tmp_path / "op"
     out = cli_init(a, monkeypatch=monkeypatch, capsys=capsys).out
-    plan.init_project(b)
+    result = plan.init_project(b)
     for name in plan.INIT_FILES:
+        if name in ("project.json", "writer_preset.json"):
+            continue   # interim: the CLI adapter swaps to this op with 1.4
         assert (a / name).read_bytes() == (b / name).read_bytes(), name
-    for d in plan.INIT_DIRS:
-        assert (a / d).is_dir() and (b / d).is_dir()
+    assert result["created"][-1] == "writer_preset.json", \
+        "the shared operation already creates the bundled default preset"
     assert out == (f"project: {a}\n"
                    "created: project.json, bible.md, state.md, scenes.json, summaries.json\n"
                    "next: set models in project.json, fill in bible.md, put lorebooks in "
@@ -119,6 +123,245 @@ def test_init_refuses_symlinked_target(tmp_path):
         plan.init_project(root)
     assert "symlink" in str(e.value)
     assert (real / "bible.md").read_text() == "keep me"
+
+
+# ------------------------------------------------- bundled defaults (1.3)
+
+def test_init_bundled_defaults_exact_contents(tmp_path):
+    import longform_core.defaults as dfl
+    out = plan.init_project(tmp_path / "p")
+    assert out["created"] == ["project.json", "bible.md", "state.md",
+                              "scenes.json", "summaries.json",
+                              "writer_preset.json"]
+    assert out["dirs"] == ["trees", "outlines", "critiques", "checks",
+                           "state_history", "lorebooks", "bible_history"]
+    assert out["warnings"] == []
+    assert out["preset"] == {"imported": "writer_preset.json",
+                             "bytes": len(dfl.writer_preset_bytes()),
+                             "replaced": False, "default": True}
+    root = tmp_path / "p"
+    expected_cfg = dfl.project_defaults()
+    assert json.loads((root / "project.json").read_text()) == expected_cfg
+    assert (root / "project.json").read_bytes() == \
+        (json.dumps(expected_cfg, indent=2) + "\n").encode("utf-8")
+    assert (root / "writer_preset.json").read_bytes() == \
+        dfl.writer_preset_bytes()
+    for name, content in (("bible.md", None), ("state.md", None),
+                          ("scenes.json", "[]\n")):
+        assert (root / name).is_file()
+    assert json.loads((root / "summaries.json").read_text()) == \
+        {"scenes": {}, "arcs": []}
+    from longform_core.config import BIBLE_TEMPLATE, STATE_TEMPLATE
+    assert (root / "bible.md").read_text() == BIBLE_TEMPLATE
+    assert (root / "state.md").read_text() == STATE_TEMPLATE
+
+
+def test_init_optional_title_isolation(tmp_path):
+    root = tmp_path / "p"
+    plan.init_project(root, title="Named")
+    cfg = json.loads((root / "project.json").read_text())
+    assert cfg["title"] == "Named"
+    assert cfg["target_words"] == 17000, "only the title is overridden"
+    again = plan.init_project(root)
+    assert again["created"] == [], "an existing config is never re-titled"
+    assert json.loads((root / "project.json").read_text())["title"] == "Named"
+
+
+def test_init_repeated_reports_nothing_created(tmp_path):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    again = plan.init_project(root)
+    assert again["created"] == [] and again["dirs"] == []
+    assert again["preset"] is None and again["warnings"] == []
+
+
+def test_init_restores_only_a_missing_default_preset(tmp_path):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    external = tmp_path / "elsewhere" / "mine.json"
+    external.parent.mkdir()
+    external.write_text(json.dumps(MASTER), encoding="utf-8")
+    cfg = json.loads((root / "project.json").read_text())
+    cfg["roles"]["writer"]["preset"] = str(external)
+    (root / "project.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (root / "writer_preset.json").unlink()
+    again = plan.init_project(root)
+    assert again["created"] == ["writer_preset.json"]
+    import longform_core.defaults as dfl
+    assert (root / "writer_preset.json").read_bytes() == dfl.writer_preset_bytes(), \
+        "only the missing local default preset is restored"
+    assert json.loads((root / "project.json").read_text()) \
+        ["roles"]["writer"]["preset"] == str(external), \
+        "the configured external preset path is never retargeted"
+    assert external.read_bytes() == json.dumps(MASTER).encode("utf-8")
+
+
+def test_repeated_init_keeps_every_existing_byte(tmp_path):
+    root = plan.init_project(tmp_path / "p")["root"]
+    root = Path(root)
+    edits = {"project.json": '{"title": "Edited", "target_words": 99}',
+             "bible.md": "## Title\nmine\n", "state.md": "# mine",
+             "scenes.json": '[{"id": "s001"}]', "summaries.json": '{"scenes": {}}',
+             "writer_preset.json": '{"instruct": {}, "context": {}, "sysprompt": {}, "preset": {}}'}
+    for name, text in edits.items():
+        (root / name).write_text(text, encoding="utf-8")
+    (root / "state_history" / "kept.md").write_text("drafted", encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in sorted(root.rglob("*"))
+              if p.is_file()}
+    out = plan.init_project(root)
+    assert out["created"] == [] and out["dirs"] == []
+    after = {p.name: p.read_bytes() for p in sorted(root.rglob("*"))
+             if p.is_file()}
+    assert after == before, "existing bytes never change on repeat"
+
+
+def test_legacy_sparse_config_keeps_old_fallbacks_and_bytes(tmp_path):
+    root = plan.init_project(tmp_path / "p")["root"]
+    (Path(root) / "project.json").write_text('{"title": "Old"}\n',
+                                             encoding="utf-8")
+    from longform_core.project import Project
+    p = Project(root)
+    assert p.cfg["roles"]["writer"]["passage_words"] == 220, \
+        "old sparse projects keep the previous application fallback"
+    assert p.cfg["roles"]["writer"]["preset_overrides"] == {"temp": 1.06}
+    raw = (Path(root) / "project.json").read_bytes()
+    plan.init_project(root)
+    assert (Path(root) / "project.json").read_bytes() == raw, \
+        "repeated init never rewrites an existing configuration"
+
+
+def test_init_invalid_explicit_preset_never_falls_back(tmp_path):
+    root = tmp_path / "p"
+    src = tmp_path / "bad.json"
+    src.write_text("{nope", encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.init_project(root, preset_src=str(src))
+    assert "not valid JSON" in str(e.value)
+    assert "created before the error" in str(e.value), \
+        "earlier writes are reported for a non-destructive retry"
+    assert not (root / "writer_preset.json").exists(), \
+        "no bundled substitution for invalid explicit input"
+    retry = plan.init_project(root)
+    assert retry["created"] == ["writer_preset.json"], \
+        "retry after correction fills only missing paths"
+
+
+def test_init_invalid_explicit_preset_missing_required_key(tmp_path):
+    src = tmp_path / "partial.json"
+    src.write_text(json.dumps({"instruct": {}, "context": {}}),
+                   encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.init_project(tmp_path / "p", preset_src=str(src))
+    assert "missing 'sysprompt'" in str(e.value)
+
+
+def test_init_explicit_override_existing_destination_warns(tmp_path, master_file):
+    import longform_core.defaults as dfl
+    root = tmp_path / "p"
+    plan.init_project(root)
+    bundled = (root / "writer_preset.json").read_bytes()
+    (root / "bible.md").unlink()
+    out = plan.init_project(root, preset_src=str(master_file))
+    assert out["warnings"] == ["writer_preset.json already exists; not "
+                               "overwritten (configure an existing preset "
+                               "path in Settings if appropriate)"]
+    assert out["preset"] is None
+    assert (root / "writer_preset.json").read_bytes() == bundled, \
+        "an existing regular destination stays byte-identical"
+    assert "bible.md" in out["created"], \
+        "other missing initialization paths are still filled"
+    assert master_file.read_bytes() != bundled
+
+
+def test_init_refuses_symlinked_preset_destination(tmp_path):
+    real = tmp_path / "real.json"
+    real.write_text("{}", encoding="utf-8")
+    root = plan.init_project(tmp_path / "p")
+    root = Path(root["root"])
+    (root / "writer_preset.json").unlink()
+    (root / "writer_preset.json").symlink_to(real)
+    with pytest.raises(OpError) as e:
+        plan.init_project(root)
+    assert "symlink" in str(e.value)
+    assert real.read_text() == "{}", "the linked target is untouched"
+
+
+def test_init_refuses_preset_directory_collision(tmp_path):
+    root = plan.init_project(tmp_path / "p")
+    root = Path(root["root"])
+    (root / "writer_preset.json").unlink()
+    (root / "writer_preset.json").mkdir()
+    with pytest.raises(OpError) as e:
+        plan.init_project(root)
+    assert "not a regular file" in str(e.value)
+
+
+def test_init_write_failure_reports_partial_work_and_retries(tmp_path,
+                                                             monkeypatch):
+    root = tmp_path / "p"
+    real = plan._write_bytes_safe
+    calls = []
+
+    def flaky(path, data):
+        calls.append(path.name)
+        if path.name == "scenes.json":
+            raise OSError(13, "Permission denied")
+        return real(path, data)
+
+    monkeypatch.setattr(plan, "_write_bytes_safe", flaky)
+    with pytest.raises(OpError) as e:
+        plan.init_project(root)
+    msg = str(e.value)
+    assert "scenes.json could not be written" in msg
+    assert "project.json" in msg and "bible.md" in msg, \
+        "completed writes are reported"
+    assert "(os error 13)" not in msg.lower() or "Permission denied" in msg
+    monkeypatch.setattr(plan, "_write_bytes_safe", real)
+    retry = plan.init_project(root)
+    assert "scenes.json" in retry["created"], "retry fills missing paths only"
+    assert (root / "scenes.json").read_text() == "[]\n"
+
+
+class _StopAfter:
+    """Cancellation token that trips after N checks (controlled boundary)."""
+
+    def __init__(self, after):
+        self.n = 0
+        self.after = after
+
+    def check(self):
+        self.n += 1
+        if self.n > self.after:
+            raise Cancelled("stopped")
+
+
+def test_init_stop_keeps_complete_writes_and_reports_partial(tmp_path):
+    root = tmp_path / "p"
+    events = []
+    token = _StopAfter(3)   # project.json + bible.md complete, then Stop
+    with pytest.raises(Cancelled):
+        plan.init_project(root, token=token, events=events.append)
+    partial = [ev for ev in events if ev.get("type") == "init_partial"]
+    assert partial, "the partial state is emitted for reporting"
+    assert partial[0]["created"] == ["project.json", "bible.md"]
+    assert (root / "project.json").exists() and (root / "bible.md").exists()
+    assert not (root / "writer_preset.json").exists(), \
+        "no incomplete preset is written or reported as created"
+    out = plan.init_project(root)
+    assert set(out["created"]) == {"state.md", "scenes.json", "summaries.json",
+                                   "writer_preset.json"}, \
+        "retry after Stop fills only the missing paths"
+
+
+def test_init_stop_before_anything_creates_nothing(tmp_path):
+    root = tmp_path / "p"
+    events = []
+    token = _StopAfter(0)
+    with pytest.raises(Cancelled):
+        plan.init_project(root, token=token, events=events.append)
+    assert not root.exists() or not any(root.iterdir())
+    partial = [ev for ev in events if ev.get("type") == "init_partial"]
+    assert partial and partial[0]["created"] == [] and partial[0]["dirs"] == []
 
 
 # --------------------------------------------------------------- presets
