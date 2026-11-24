@@ -22,7 +22,12 @@ PySide6 (~hundreds of MB of wheel downloads plus installed size, and the matchin
 use even for CLI-only users, as accepted in ADR-0006; GUI imports stay lazy, so `--help` needs no display.
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
-GUI demo: `QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR` opens one native Wayland window
+A bare `uv run --script longform.py` (or a copied standalone executable with no
+arguments, such as a file-manager double-click) opens the GUI for the current
+directory; `gui` accepts an optional DIR.
+GUI demo: `QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR` (or no
+argument / `gui` with no DIR from the project directory) opens one native Wayland
+window
 (the complete draft loop: reading all saved branches/notes, per-scene steering Save/Clear, Generate with
 count/swipes and streaming preview, candidate tray Accept/Reroll selected/all/Add N/View/Delete leaf/
 Keep branches/Discard, built-in New passage/Edit head editors with diff/history, Rewind/Use as head/

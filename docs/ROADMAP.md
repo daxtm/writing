@@ -193,6 +193,10 @@ not completion. PySide6 6.12.0 and offscreen widget tests are already in the
 launcher/check environment. Its real Wayland smoke is recorded in the shell
 design (KWin/Plasma 6.8.3, `wayland`, 1920×1080 DPR 1.0, persisted steering,
 clean close); interactive scaling, themes and mouse/keyboard acceptance remain.
+The source launcher and the copied executable also open this workspace when
+invoked with no command (for example a file-manager double-click), defaulting
+the project directory to the current directory; explicit commands still require
+their existing arguments.
 
 Drafting starts from an existing synthetic project with preset and planned
 scenes. Generate saves current multiline steering before building the shared
@@ -301,7 +305,7 @@ shipping is authorized; no more speculative changes.
 
 | Existing CLI surface | Required GUI control(s) | Implementing change |
 |---|---|---|
-| `gui DIR` | Native Wayland project window, reading/notes, refresh/navigation, font size | Existing shell; retained throughout |
+| `gui [DIR]` | Native Wayland project window, reading/notes, refresh/navigation, font size; no-argument launch opens it in the current directory | Existing shell; retained throughout |
 | `draft [--scene ID]`, resume/default next unfinished | Select scene / Next unfinished / reopen done scene, resume head, status/prerequisite warnings | `gui-drafting-workspace` |
 | `g [N]` / `gN`, default writer.swipes | Generate, count, streaming/completion progress, Stop | `gui-drafting-workspace` |
 | Candidate `K`, `r K…` / `r all`, `+ N`, `v K`, `d K`, Enter | Accept, Reroll selected/all, Add N, View, Delete leaf, Keep branches/Discard preview | `gui-drafting-workspace` |

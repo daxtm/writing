@@ -128,3 +128,29 @@ def test_check_script_missing_uv_without_tests_skips(tmp_repo, tmp_path):
     assert r.returncode == 0
     assert "no tests/ yet" in r.stderr or "no tests/ yet" in r.stdout
     assert log_lines(tmp_repo) == ["python3 -m py_compile longform.py"]
+
+
+FROZEN_GUI_TESTS = (
+    "test_copied_binary_runs_help_without_python_uv_or_checkout",
+    "test_copied_binary_headless_cli_without_display_variables",
+    "test_copied_binary_with_no_arguments_launches_gui",
+    "test_archive_contains_gui_application_modules",
+    "test_archive_contains_qt_runtime_and_wayland_plugins",
+    "test_frozen_gui_refuses_platforms_before_qt",
+    "test_frozen_gui_missing_wayland_socket_gives_standalone_advice",
+)
+
+
+def test_real_check_script_runs_mandatory_frozen_gui_coverage():
+    """The real check entry point builds once and runs the frozen GUI tests;
+    those tests contain no skip path, so missing build/Qt/compiler
+    dependencies fail the checks instead of passing silently."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "bash scripts/build-standalone.sh" in script
+    assert "pytest -q tests/test_standalone.py" in script
+    frozen = (REPO / "tests" / "test_standalone.py").read_text(encoding="utf-8")
+    for name in FROZEN_GUI_TESTS:
+        assert f"def {name}" in frozen, f"{name} disappeared from frozen coverage"
+    assert "pytest.mark.skip" not in frozen
+    assert "pytest.skip(" not in frozen
+    assert "pytest.importorskip" not in frozen

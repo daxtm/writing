@@ -11,6 +11,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 
 from longform_core import cli  # noqa: E402
@@ -96,6 +98,31 @@ def test_gui_dispatch_blocks_until_close(monkeypatch, tmp_path):
         "window must be shown before the blocking app.exec()"
 
 
+def test_no_arguments_dispatches_gui_in_current_directory(monkeypatch, tmp_path):
+    """Double-clicking the executable (no arguments) opens the GUI in cwd
+    instead of printing an argparse error."""
+    import longform_core.gui as gui
+
+    calls = []
+    monkeypatch.setattr(gui, "run_cli", lambda d: calls.append(d) or 0)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["longform"])
+    assert cli.main() == 0
+    assert calls == [str(tmp_path)]
+
+
+def test_gui_without_directory_dispatches_in_current_directory(monkeypatch, tmp_path):
+    """`gui` without DIR also defaults to cwd."""
+    import longform_core.gui as gui
+
+    calls = []
+    monkeypatch.setattr(gui, "run_cli", lambda d: calls.append(d) or 3)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["longform.py", "gui"])
+    assert cli.main() == 3
+    assert calls == [str(tmp_path)]
+
+
 def test_gui_unsets_platform_env_selects_wayland(monkeypatch):
     """Unset QT_QPA_PLATFORM means Wayland: the env is set before Qt loads."""
     import longform_core.gui as gui
@@ -147,8 +174,37 @@ def test_gui_wayland_unavailable_fails_with_guidance(tmp_path):
                        cwd=str(REPO))
     assert r.returncode != 0, r.stdout
     assert "native Wayland is required" in r.stdout + r.stderr
+    assert "QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR" in r.stdout + r.stderr
     # the guidance is emitted before QApplication construction in gw.run
-    assert "PRE_START_GUIDANCE" in Path(gw.__file__).read_text(encoding="utf-8")
+    assert "pre_start_guidance" in Path(gw.__file__).read_text(encoding="utf-8")
+
+
+def test_gui_launch_advice_source_uses_uv(monkeypatch):
+    """Source mode keeps the documented uv invocation."""
+    import longform_core.gui as gui
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert gui.launch_advice() == \
+        "QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR"
+    assert "uv run --script longform.py" in gui.missing_runtime_message()
+
+
+def test_gui_launch_advice_frozen_uses_quoted_executable(monkeypatch):
+    """Frozen mode points at the copied executable (absolute, shell-quoted)
+    and never tells the user to run uv or the source launcher."""
+    import longform_core.gui as gui
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", "/tmp/copied dir with spaces/longform")
+    advice = gui.launch_advice()
+    assert advice == ("QT_QPA_PLATFORM=wayland '/tmp/copied dir with spaces/longform' "
+                      "gui DIR")
+    assert "uv" not in advice
+    missing = gui.missing_runtime_message()
+    assert "uv" not in missing
+    assert "'/tmp/copied dir with spaces/longform'" in missing
+    with pytest.raises(gui.GuiLaunchError) as excinfo:
+        gui.resolve_platform(env="xcb")
+    assert "uv" not in str(excinfo.value)
+    assert "'/tmp/copied dir with spaces/longform'" in str(excinfo.value)
 
 
 def test_gui_mismatched_platform_after_init(monkeypatch, tmp_path, capsys):

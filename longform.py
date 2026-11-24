@@ -25,6 +25,8 @@ Every command is its own step. No command runs another one for you.
   revise DIR --scene ID        passage-by-passage line edit using critiques/ID.md and/or checks/ID.md
   status DIR                   project overview
   export DIR [--out FILE]      write manuscript.md
+  gui [DIR]                    native Wayland window: saved branches, notes, per-scene steering
+                               (DIR defaults to the current directory; running with no command opens it)
 
 API key: "api_key" in project.json, or else the environment variable named by "api_key_env"
 (default: export FEATHERLESS_API_KEY=...).
