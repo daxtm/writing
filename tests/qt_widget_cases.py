@@ -3883,7 +3883,48 @@ def case_credentials_session(root):
     assert "missing" in win2.credential_status.text().lower(), \
         "a new window never inherits the session credential"
     assert win2.credential_entry.text() == ""
+
+    # empty input is refused: no effective credential change, no request
+    fake.calls.clear(); fake.started = 0
+    before2 = (fresh / "project.json").read_bytes()
+    win2.credential_use_btn.click()
+    assert fake.calls == [] and fake.started == 0
+    assert "enter a credential" in win2.status.text().lower()
+    assert (fresh / "project.json").read_bytes() == before2
     win2.close()
+
+    # cancelled/failed Open keeps the current project's session; a
+    # successful switch to another project clears it
+    proj_b = _credential_project(root, "projb", cfg={"api_key":
+                                                     PROJECT_SENTINEL})
+    picks = []
+    fake.calls.clear(); fake.started = 0
+    win3 = gw.MainWindow(str(fresh),
+                         choice=lambda t, x, o: picks.pop(0),
+                         dir_picker=lambda t, p: picks.pop(0),
+                         provider_factory=lambda _p: fake)
+    win3.show()
+    win3.tabs.setCurrentIndex(gw.SETUP)
+    win3.credential_entry.setText(SESSION_SENTINEL)
+    win3.credential_use_btn.click()
+    assert _pump(a, lambda: not win3._busy)
+    picks.append(None)          # cancelled Open: no directory picked
+    win3.open_btn.click()
+    assert _pump(a, lambda: not win3._busy)
+    assert win3._session_key == SESSION_SENTINEL, \
+        "a cancelled Open never clears the current session"
+    assert fake.calls == [] and fake.started == 0
+    picks.append(str(proj_b))   # successful switch
+    win3.open_btn.click()
+    assert _pump(a, lambda: not win3._busy)
+    assert win3._session_key is None, \
+        "a successful switch clears the session"
+    assert "project" in win3.credential_status.text().lower(), \
+        "the saved project key is the fallback source"
+    assert win3.credential_entry.text() == ""
+    assert fake.calls == [] and fake.started == 0, \
+        "no implicit request on any credential lifecycle step"
+    win3.close()
 
 
 def case_credentials_storage(root):
@@ -3972,7 +4013,108 @@ def case_credentials_storage(root):
     assert "missing" in win.credential_status.text().lower()
     assert not (proj / "limits.json").exists(), "no request was made"
     assert fake.calls == [] and fake.started == 0
+
+    # reopen: the cleared state falls back to missing; a fresh window over
+    # a project with a saved key reports the project source, not a value
     win.close()
+    win2 = gw.MainWindow(str(proj), choice=_no_dialogs("storage"),
+                         provider_factory=lambda _p: fake)
+    win2.show()
+    win2.tabs.setCurrentIndex(gw.SETUP)
+    assert "missing" in win2.credential_status.text().lower()
+    assert win2.credential_entry.text() == ""
+    win2.close()
+    proj_c = _credential_project(root, "storedc",
+                                 cfg={"api_key": PROJECT_SENTINEL,
+                                      "title": "StoreC"})
+    picks = []
+    win3 = gw.MainWindow(str(proj_c), choice=lambda t, x, o: picks.pop(0),
+                         dir_picker=lambda t, p: None,
+                         provider_factory=lambda _p: fake)
+    win3.show()
+    win3.tabs.setCurrentIndex(gw.SETUP)
+    assert "project" in win3.credential_status.text().lower(), \
+        "a reopened window reports the saved key's availability, not a value"
+    assert PROJECT_SENTINEL not in win3.credential_status.text()
+
+    # credential actions pause while an operation runs
+    orig_get = fake.get
+
+    def gated_get(path, token=None, on_retry_event=None):
+        if fake.gate is not None and not fake.gate.wait(10):
+            raise AssertionError("gate never opened")
+        return orig_get(path, token=token, on_retry_event=on_retry_event)
+
+    fake.get = gated_get
+    fake.gate = threading.Event()
+    win3.fetch_limits_btn.click()
+    assert _pump(a, lambda: win3._busy)
+    for b in (win3.credential_use_btn, win3.credential_clear_session_btn,
+              win3.credential_save_btn, win3.credential_clear_saved_btn,
+              win3.credential_test_btn):
+        assert not b.isEnabled(), "credential actions are disabled while busy"
+    fake.gate.set()
+    assert _pump(a, lambda: not win3._busy)
+    assert win3.credential_use_btn.isEnabled()
+    fake.gate = None
+    fake.get = orig_get
+    _assert_no_sentinel(win3)
+
+    # dirty settings: Cancel keeps the edits and writes nothing
+    win3.credential_entry.setText(SESSION_SENTINEL)
+    win3.set_setting("title", "Changed externally")   # marks settings dirty
+    assert win3.settings_dirty()
+    before_c = (proj_c / "project.json").read_bytes()
+    picks.append("Cancel")
+    win3.credential_save_btn.click()
+    assert (proj_c / "project.json").read_bytes() == before_c
+    assert win3.settings_dirty(), "a cancelled save keeps the settings edits"
+
+    # Discard continues: the settings edits are dropped, only api_key changes
+    picks.append("Save")                    # confirmation first
+    picks.append("Discard settings changes")  # then the dirty-settings dialog
+    win3.credential_save_btn.click()
+    assert _pump(a, lambda: not win3._busy)
+    cfgc = json.loads((proj_c / "project.json").read_text())
+    assert cfgc["api_key"] == SESSION_SENTINEL
+    assert cfgc["title"] == "StoreC", \
+        "the discarded settings edit never persisted and fields survive"
+    assert not win3.settings_dirty()
+    _assert_no_sentinel(win3)
+
+    # a stale save is refused: the configuration changed externally
+    (proj_c / "project.json").write_text(
+        json.dumps({**cfgc, "title": "External edit"}), encoding="utf-8")
+    win3.credential_entry.setText("sk-replacement")
+    picks.append("Save")
+    picks.append("Discard settings changes")  # confirmation, then dirty dialog
+    win3.credential_save_btn.click()
+    assert _pump(a, lambda: not win3._busy)
+    msg = win3.status.text()
+    assert "reload" in msg.lower() or "stale" in msg.lower(), msg
+    assert json.loads((proj_c / "project.json").read_text())["title"] == \
+        "External edit", "an externally changed configuration survives"
+    assert json.loads((proj_c / "project.json").read_text())["api_key"] == \
+        SESSION_SENTINEL, "a stale save writes nothing"
+    _assert_no_sentinel(win3)
+    fake.gate = None
+    win3.close()
+
+
+class _GatedPlan:
+    """Provider whose /plan lookup blocks on a gate (Stop coverage)."""
+
+    def __init__(self, gate):
+        self.gate = gate
+        self.calls = []
+
+    def get(self, path, token=None, on_retry_event=None):
+        self.calls.append(("GET", path))
+        if self.gate is not None and not self.gate.wait(10):
+            raise AssertionError("gate never opened")
+        if token is not None:
+            token.check()
+        return {"max_context_length": 8192, "concurrency": 2}
 
 
 def case_credentials_connection(root):
@@ -4028,6 +4170,37 @@ def case_credentials_connection(root):
     _assert_no_sentinel(win)
     assert not (proj / "limits.json").exists()
     win.close()
+
+    # cooperative Stop: close while a lookup is blocked, Stop and wait
+    # settles the worker, then the window closes and nothing was written
+    gate = threading.Event()
+    gated = _GatedPlan(gate)
+    win2 = gw.MainWindow(str(proj), choice=lambda t, x, o: picks.pop(0),
+                         provider_factory=lambda _p: gated)
+    win2.show()
+    win2.tabs.setCurrentIndex(gw.SETUP)
+    win2.credential_entry.setText(SESSION_SENTINEL)
+    win2.credential_use_btn.click()
+    assert _pump(a, lambda: not win2._busy)
+    win2.credential_test_btn.click()
+    assert _pump(a, lambda: win2._busy)
+    assert _pump(a, lambda: gated.calls == [("GET", "/plan")]), \
+        "the lookup started and is blocked in flight"
+    assert not win2.credential_test_btn.isEnabled(), \
+        "credential actions are disabled while the lookup runs"
+    picks = ["Stop and wait"]
+    win2.close()
+    gate.set()
+    assert _pump(a, lambda: not win2._busy), \
+        "Stop and wait settles the worker cooperatively"
+    assert "stopping" in win2.status.text().lower() or \
+        "stopped" in win2.status.text().lower()
+    win2.close()   # the abandoned close is completed after settlement
+    assert _pump(a, lambda: not win2.isVisible()), \
+        "the window closes only after settlement"
+    assert gated.calls == [("GET", "/plan")], "exactly one lookup ran"
+    assert not (proj / "limits.json").exists()
+    _assert_no_sentinel(win2)
 
 
 def case_credentials_redaction(root):
