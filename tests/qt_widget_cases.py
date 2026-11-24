@@ -4030,6 +4030,81 @@ def case_credentials_connection(root):
     win.close()
 
 
+def case_credentials_redaction(root):
+    """gui-api-key-setup: no credential value from session, saved project or
+    environment ever reaches previews, saved nodes, status/errors or files —
+    including values split across streamed chunks."""
+    import longform_core.gui_window as gw
+    a = app()
+    os.environ["FEATHERLESS_API_KEY"] = ENV_SENTINEL
+    try:
+        project = _draft_project(root)
+        cfgp = project / "project.json"
+        cfgp.write_text(json.dumps(
+            {**json.loads(cfgp.read_text()), "api_key": PROJECT_SENTINEL}),
+            encoding="utf-8")
+        chunks = (f"The key is {SESSION_SENTINEL[:12]}",
+                  f"{SESSION_SENTINEL[12:]} end. {ENV_SENTINEL} echo.")
+        fake = FakeProvider(chunks=chunks)
+        win = gw.MainWindow(str(project),
+                            choice=_no_dialogs("redaction"),
+                            provider_factory=lambda _p: fake)
+        win.show()
+        win._session_key = SESSION_SENTINEL   # a session override is active
+        win.select_item("manuscript", "s001", None)
+        win.count_spin.setValue(1)
+        win.generate_btn.click()
+        assert _pump(a, lambda: not win._busy)
+
+        # the streamed preview never shows any source's value, split or whole
+        preview = win.preview.toPlainText()
+        for s in (SESSION_SENTINEL, PROJECT_SENTINEL, ENV_SENTINEL):
+            assert s not in preview, "a credential value leaked to the preview"
+        assert "The key is [redacted]" in preview, \
+            "split fragments are withheld, then emitted redacted"
+
+        # the accepted-text node file never stores a value
+        t = json.loads((project / "trees" / "s001.json").read_text())
+        node = t["nodes"]["n2"]
+        blob = json.dumps(t)
+        for s in (SESSION_SENTINEL, PROJECT_SENTINEL, ENV_SENTINEL):
+            assert s not in blob, "a credential value leaked into a tree file"
+        assert node["text"].strip().startswith("The key is [redacted]")
+
+        # a midstream failure echoing the saved key is redacted in status
+        fake2 = FakeProvider(chunks=("First. ",))
+        fake2.fail_after = 0
+        win2 = gw.MainWindow(str(project), choice=_no_dialogs("redaction"),
+                             provider_factory=lambda _p: fake2)
+        win2.show()
+        win2.select_item("manuscript", "s001", None)
+        win2.count_spin.setValue(1)
+        win2._provider_factory = lambda _p: _EchoFail(PROJECT_SENTINEL)
+        win2.generate_btn.click()
+        assert _pump(a, lambda: not win2._busy)
+        msg = win2.status.text()
+        assert PROJECT_SENTINEL not in msg and "[redacted]" in msg, \
+            f"a credential echo reached status: {msg!r}"
+        win2.close()
+        win.close()
+    finally:
+        os.environ.pop("FEATHERLESS_API_KEY", None)
+
+
+class _EchoFail:
+    """Provider whose failure message echoes the given secret."""
+
+    def __init__(self, secret):
+        self.secret = secret
+
+    def complete(self, role, prompt, params, extra=None, stream_cb=None,
+                 **kw):
+        raise RuntimeError(f"provider refused {self.secret}")
+
+    def many(self, fn, n, token=None, on_event=None):
+        return []
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -4061,6 +4136,7 @@ CASES = {
     "case_credentials_session": case_credentials_session,
     "case_credentials_storage": case_credentials_storage,
     "case_credentials_connection": case_credentials_connection,
+    "case_credentials_redaction": case_credentials_redaction,
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
     "case_planning_scenes": case_planning_scenes,

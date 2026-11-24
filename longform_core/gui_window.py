@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from .prompt import tail_trim_chars
-from .utils import word_diff
+from .utils import redact_text, word_diff
 from .gui import launch_advice
 from . import draft_operations as dop
 from . import planning_operations as plan
@@ -214,6 +214,11 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001 — invalid config still redacts the session value
             pass
         return tuple(vals)
+
+    def _scrub_display(self, text):
+        """Redact every credential value this window knows from one
+        display/diagnostic string (ADR-0011)."""
+        return redact_text(text, self._credential_secrets())
 
     def _seam(self):
         """Provider factory for this window's provider calls (ADR-0007 and
@@ -4383,7 +4388,7 @@ class MainWindow(QMainWindow):
         self._token = CancellationToken()
         token = self._token
         thread = OpThread(op_id, lambda sink, tok=token: fn(sink, tok),
-                          parent=self)
+                          parent=self, redact=self._scrub_display)
         thread.event_sig.connect(self._on_worker_event)
         thread.done_sig.connect(self._on_worker_done)
         thread.finished.connect(lambda t=thread: self._on_thread_finished(t))

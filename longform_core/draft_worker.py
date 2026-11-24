@@ -25,14 +25,16 @@ class OpThread(QThread):
     event_sig = Signal(int, dict)
     done_sig = Signal(int, str, object)
 
-    def __init__(self, op_id, fn, parent=None):
+    def __init__(self, op_id, fn, parent=None, redact=None):
         super().__init__(parent)
         self._op_id = op_id
         self._fn = fn
+        self._redact = redact   # scrub credential echoes in failure text
 
     def run(self):
         op_id = self._op_id
         sink = lambda payload: self.event_sig.emit(op_id, dict(payload))
+        red = self._redact or (lambda t: t)
         try:
             value = self._fn(sink)
             self.done_sig.emit(op_id, "ok", value)
@@ -41,6 +43,7 @@ class OpThread(QThread):
         except OpError as e:
             self.done_sig.emit(op_id, "error", e)
         except FatalError as e:
-            self.done_sig.emit(op_id, "error", OpError(str(e.msg)))
+            self.done_sig.emit(op_id, "error", OpError(red(str(e.msg))))
         except Exception as e:  # noqa: BLE001 — the GUI needs a readable failure, never a dead thread
-            self.done_sig.emit(op_id, "error", OpError(f"{type(e).__name__}: {e}"))
+            self.done_sig.emit(op_id, "error",
+                               OpError(red(f"{type(e).__name__}: {e}")))
