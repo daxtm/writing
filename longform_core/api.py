@@ -37,6 +37,76 @@ def split_thinking(content, reasoning=""):
     return c.strip(), (reasoning or "").strip(), True
 
 
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+class AnswerStream:
+    """Incremental answer-only splitter mirroring split_thinking (ADR-0012).
+
+    Feed raw streamed content; returns the text newly decidable as answer.
+    With thinking enabled and no distinguishable boundary yet (no reasoning
+    field, no opener/closer pair) bytes stay withheld - waiting/thinking
+    status - instead of guessing that hidden content is answer text. The
+    completed parser stays authoritative for the final answer; this adapter
+    only decides what a live preview may already show."""
+
+    def __init__(self, thinking_on=False):
+        self.on = bool(thinking_on)
+        self.acc = ""
+        self.reasoning = False
+        self.open = False
+        self.closed = not self.on
+        self.emitted = 0
+
+    def note_reasoning(self):
+        self.reasoning = True
+
+    def feed(self, chunk):
+        if not self.on:
+            return chunk
+        if not chunk:
+            return ""
+        self.acc += chunk
+        if self.closed:
+            out = self.acc[self.emitted:]
+            self.emitted = len(self.acc)
+            return out
+        s = self.acc.lstrip()
+        close = None
+        for close in re.finditer(_THINK_CLOSE, self.acc, flags=re.I):
+            pass
+        if self.open or s[:len(_THINK_OPEN)].lower() == _THINK_OPEN:
+            # inside (or entering) an inline thinking block: hold until its
+            # closing tag; everything after the last close is answer
+            self.open = True
+            if close is None:
+                return ""
+            self.closed = True
+            self.emitted = close.end()
+            out = self.acc[self.emitted:]
+            self.emitted = len(self.acc)
+            return out
+        if not s:
+            return ""
+        if close is not None:
+            # a closing tag arrived without an opener at the start: content
+            # before it was thinking, the remainder is answer
+            self.closed = True
+            self.emitted = close.end()
+            out = self.acc[self.emitted:]
+            self.emitted = len(self.acc)
+            return out
+        if self.reasoning:
+            # the server separated thinking into its own field, so content
+            # is the answer (same rule the completed parser applies)
+            self.closed = True
+            out = self.acc[self.emitted:]
+            self.emitted = len(self.acc)
+            return out
+        return ""   # still ambiguous: hold as waiting/thinking status
+
+
 class Progress:
     """One live status line on stderr while a chat call streams: thinking vs answer, approx tokens, seconds."""
 
@@ -144,10 +214,16 @@ class Api:
                 time.sleep(delay)
             delay = min(delay * 2, 30.0)
 
-    def _post(self, url, body, stream_cb, kind, progress=None, thinking=False, token=None):
+    def _post(self, url, body, stream_cb, kind, progress=None, thinking=False, token=None,
+              preview=None, rflag=None):
         """Always streams, so long generations never sit silent past the read timeout and one bad chunk
         can't sink a whole reply. kind 'chat' reads delta content (+ reasoning fields), 'text' reads choice text.
-        Returns (content, finish_reason, usage, reasoning, bad_chunks)."""
+        Returns (content, finish_reason, usage, reasoning, bad_chunks).
+
+        `preview(raw_chunk)` receives each raw content chunk for the optional
+        answer-preview channel (ADR-0012); `rflag()` is called when reasoning
+        field content arrives, so the preview adapter can separate them."""
+
         parts, rparts, bad, finish, usage = [], [], [], None, {}
         closed = False
         red = StreamRedactor(self.secrets)
@@ -178,11 +254,15 @@ class Api:
                     rr = delta.get("reasoning_content") or delta.get("reasoning")
                     if rr:
                         rparts.append(rr)
+                        if rflag:
+                            rflag()
                         if progress:
                             progress("thinking", len(rr))
                 t = delta.get("content") if kind == "chat" else chs[0].get("text")
                 if t:
                     parts.append(t)
+                    if preview:
+                        preview(t)
                     if stream_cb:
                         out = red.feed(t)
                         if out:
@@ -215,13 +295,16 @@ class Api:
         print(col(f"\n  [{why}; retrying in {delay:.0f}s]", "33"), flush=True)
 
     def chat(self, role, messages, max_tokens=None, stream_cb=None, progress=True,
-             token=None, on_retry_event=None):
+             token=None, on_retry_event=None, preview_events=None):
         """Returns (answer, finish_reason, usage). Thinking never reaches the answer: it is split off
         by the reasoning field or </think>, and an unfinished thought raises NoAnswerErr.
 
         `token` adds cooperative cancellation checks around the request;
-        `on_retry_event(why, delay)` replaces the terminal retry line. Both
-        default to the unchanged CLI behavior."""
+        `on_retry_event(why, delay)` replaces the terminal retry line; the
+        optional `preview_events` subscriber receives answer-only
+        preview_start/delta/reset/complete events (attempt ids assigned here;
+        hidden reasoning and secrets are never forwarded). All default to the
+        unchanged CLI behavior."""
         rc = self.p.cfg["roles"][role]
         body = {"model": rc["model"], "messages": messages}
         for k in SAMPLING_KEYS:
@@ -241,13 +324,49 @@ class Api:
         t0 = time.time()
         prog = Progress(f"{role} ({rc['model']})") if progress and stream_cb is None else None
         if on_retry_event is not None:
-            retry_cb = lambda why, delay: on_retry_event(why, delay)
+            base_retry = lambda why, delay: on_retry_event(why, delay)
         else:
-            retry_cb = self._on_retry
+            base_retry = self._on_retry
+        # Optional answer-preview channel (ADR-0012): the caller-bound closure
+        # carries operation/candidate identity; this method adds attempt ids
+        # and answer-only, credential-redacted text. Never raw content.
+        pe = preview_events
+        pstate = {"attempt": 0}
+
+        def retry_cb(why, delay):
+            if pe:
+                pe({"type": "preview_reset", "attempt_id": pstate["attempt"]})
+            base_retry(why, delay)
+
+        def attempt():
+            if pe:
+                pstate["attempt"] += 1
+                pe({"type": "preview_start", "attempt_id": pstate["attempt"]})
+            stream = AnswerStream(thinking_on) if pe else None
+            red = StreamRedactor(self.secrets) if pe else None
+
+            def on_raw(t):
+                out = stream.feed(t)
+                if out and red:
+                    out = red.feed(out)
+                    if out:
+                        pe({"type": "preview_delta",
+                            "attempt_id": pstate["attempt"], "text": out})
+
+            res = self._post(self.base + "/chat/completions", body, stream_cb,
+                             "chat", prog, thinking_on, token=token,
+                             preview=on_raw if pe else None,
+                             rflag=(stream.note_reasoning if pe else None))
+            if pe and red:
+                rest = red.flush()
+                if rest:
+                    pe({"type": "preview_delta",
+                        "attempt_id": pstate["attempt"], "text": rest})
+            return res
+
         try:
             content, finish, usage, reasoning, bad = self._retry(
-                lambda: self._post(self.base + "/chat/completions", body, stream_cb, "chat", prog, thinking_on, token=token),
-                retry_cb, token=token)
+                attempt, retry_cb, token=token)
         finally:
             if prog:
                 prog.done()
@@ -273,17 +392,23 @@ class Api:
             raise NoAnswerErr(f"{role} ({rc['model']}) returned an empty answer (finish_reason={finish}).")
         if finish == "length":
             warn(f"{role} answer hit max_tokens {body.get('max_tokens', '?')}; it may be cut off")
+        if pe:
+            pe({"type": "preview_complete", "attempt_id": pstate["attempt"]})
         return answer, finish, usage
 
     def complete(self, role, prompt, params, extra=None, stream_cb=None, meta=None,
-                 token=None, on_retry_event=None):
+                 token=None, on_retry_event=None, preview_events=None):
         """Text completion. `extra` holds params Featherless doesn't document (DRY); if the
         server rejects them they are dropped for the rest of the session, with a warning.
 
         `token` adds cooperative cancellation checks before each attempt and at
         stream chunks; `on_retry_event` (used by the GUI) is called before a
         retry so a streamed preview can reset instead of concatenating failed
-        attempt fragments. Both default to the unchanged CLI behavior."""
+        attempt fragments; the optional `preview_events` subscriber receives
+        answer-only preview_start/delta/reset/complete events (attempt ids
+        assigned here, redaction applied before emission — the completion
+        endpoint has no hidden reasoning). All default to the unchanged CLI
+        behavior."""
         rc = self.p.cfg["roles"][role]
         body = {"model": rc["model"], "prompt": prompt, **params}
         sent_extra = bool(extra) and self.extra_ok
@@ -292,14 +417,43 @@ class Api:
         url = self.base + "/completions"
         t0 = time.time()
 
+        pe = preview_events
+        pstate = {"attempt": 0}
+
         def attempt(tok=None):
-            return self._post(url, body, stream_cb, "text", token=tok)
+            if pe:
+                pstate["attempt"] += 1
+                pe({"type": "preview_start", "attempt_id": pstate["attempt"]})
+            red = StreamRedactor(self.secrets) if pe else None
+
+            def on_raw(t):
+                out = red.feed(t)
+                if out:
+                    pe({"type": "preview_delta",
+                        "attempt_id": pstate["attempt"], "text": out})
+
+            res = self._post(url, body, stream_cb, "text", token=tok,
+                             preview=on_raw if pe else None)
+            if pe and red:
+                rest = red.flush()
+                if rest:
+                    pe({"type": "preview_delta",
+                        "attempt_id": pstate["attempt"], "text": rest})
+            return res
 
         def retriable(fn):
-            if on_retry_event is not None:
+            if on_retry_event is not None or pe:
                 # GUI: a retried stream attempt resets the preview instead of
                 # concatenating failed-attempt fragments with the response.
-                return self._retry(fn, lambda why, delay: on_retry_event("reset"), token=token)
+                def cb(why, delay):
+                    if pe:
+                        pe({"type": "preview_reset",
+                            "attempt_id": pstate["attempt"]})
+                    if on_retry_event is not None:
+                        on_retry_event("reset")
+                    else:
+                        self._on_retry(why, delay)
+                return self._retry(fn, cb, token=token)
             return self._retry(fn, self._on_retry, token=token)
 
         try:
@@ -312,6 +466,8 @@ class Api:
                         warn("server rejected " + ", ".join(extra) + f" ({e}); sending without them for this session")
                 body = {k: v for k, v in body.items() if k not in extra}
                 sent_extra = False
+                if pe:
+                    pe({"type": "preview_reset", "attempt_id": pstate["attempt"]})
                 text, finish, usage, _, bad = retriable(attempt)
             else:
                 raise
@@ -325,6 +481,8 @@ class Api:
             "prompt": prompt, "output": text, "finish_reason": finish, "usage": usage,
             "stream_problems": stream_notes, "bad_chunks": bad,
         }, self.secrets))
+        if pe:
+            pe({"type": "preview_complete", "attempt_id": pstate["attempt"]})
         return text, finish, usage
 
     def many(self, fn, n, token=None, on_event=None):

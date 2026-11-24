@@ -511,3 +511,156 @@ def test_candidate_failure_echo_is_redacted(mock_http):
     why = events[0]["why"]
     assert "test-key-123" not in why and "[redacted]" in why
     assert api.p.logs[0]["candidate_failed"] == why
+
+
+# ------------------------------------------------------- preview events (ADR-0012)
+
+
+def _deltas(evs):
+    return "".join(e.get("text", "") for e in evs if e["type"] == "preview_delta")
+
+
+def _kinds(evs):
+    return [(e.get("type"), e.get("attempt_id")) for e in evs]
+
+
+def test_preview_split_think_delimiter_shows_only_answer(mock_http):
+    def handler(request):
+        return sse(delta_chunk({"content": "<think> MAXIMALLY"}),
+                   delta_chunk({"content": "THINKING</think>"}),
+                   delta_chunk({"content": " Final answer"}, finish="stop",
+                               usage={"prompt_tokens": 5}))
+
+    api = make_api(mock_http, handler)
+    evs = []
+    answer, _, _ = api.chat("chatrole", [{"role": "user", "content": "q"}],
+                            progress=False, preview_events=evs.append)
+    assert answer == "Final answer", "completed parsing is unchanged"
+    assert _kinds(evs)[0] == ("preview_start", 1)
+    assert _kinds(evs)[-1] == ("preview_complete", 1)
+    assert _deltas(evs) == " Final answer", \
+        "only answer bytes are shown, after the split delimiter completes"
+    for e in evs:
+        assert set(e) <= {"type", "attempt_id", "text"}, \
+            "no credential/config/header objects in preview events"
+
+
+def test_preview_reasoning_field_then_answer(mock_http):
+    def handler(request):
+        return sse(delta_chunk({"reasoning_content": "hidden thoughts"}),
+                   delta_chunk({"content": "The"}),
+                   delta_chunk({"content": " answer"}, finish="stop",
+                               usage={"prompt_tokens": 3}))
+
+    api = make_api(mock_http, handler)
+    evs = []
+    answer, _, _ = api.chat("chatrole", [{"role": "user", "content": "q"}],
+                            progress=False, preview_events=evs.append)
+    assert answer == "The answer"
+    assert _deltas(evs) == "The answer"
+    assert "hidden thoughts" not in _deltas(evs)
+
+
+def test_preview_waits_through_ambiguous_implicit_prefix(mock_http):
+    def handler(request):
+        return sse(delta_chunk({"content": "hel"}),
+                   delta_chunk({"content": "lo world"}, finish="stop",
+                               usage={"prompt_tokens": 2}))
+
+    api = make_api(mock_http, handler)
+    evs = []
+    answer, _, _ = api.chat("chatrole", [{"role": "user", "content": "q"}],
+                            progress=False, preview_events=evs.append)
+    assert answer == "hello world"
+    assert _deltas(evs) == "", \
+        "an undecidable prefix is withheld rather than guessed"
+
+
+def test_preview_nonthinking_answer_streams_immediately(mock_http):
+    def handler(request):
+        return sse(delta_chunk({"content": "quick"}),
+                   delta_chunk({"content": " reply"}, finish="stop",
+                               usage={"prompt_tokens": 2}))
+
+    api = make_api(mock_http, handler)
+    evs = []
+    answer, _, _ = api.chat("quietrole", [{"role": "user", "content": "q"}],
+                            progress=False, preview_events=evs.append)
+    assert answer == "quick reply"
+    assert _deltas(evs) == "quick reply"
+
+
+def test_preview_no_answer_never_completes(mock_http):
+    def handler(request):
+        return sse(delta_chunk({"content": "																					"}),
+                   delta_chunk({}, finish="length"))
+
+    api = make_api(mock_http, handler)
+    evs = []
+    with pytest.raises(longform.NoAnswerErr):
+        api.chat("chatrole", [{"role": "user", "content": "q"}],
+                 progress=False, preview_events=evs.append)
+    assert _kinds(evs) == [("preview_start", 1)], \
+        "waiting only: no successful complete is invented"
+
+
+def test_preview_split_secret_is_redacted_in_chat(mock_http):
+    def handler(request):
+        return sse(delta_chunk({"content": "echo test-key-"}),
+                   delta_chunk({"content": "123 tail"}, finish="stop",
+                               usage={"prompt_tokens": 2}))
+
+    api = make_api(mock_http, handler)
+    evs = []
+    answer, _, _ = api.chat("quietrole", [{"role": "user", "content": "q"}],
+                            progress=False, preview_events=evs.append)
+    assert _deltas(evs) == "echo [redacted] tail", \
+        "a credential spanning chunks never reaches the preview"
+    assert "test-key-123" not in _deltas(evs)
+
+
+def test_preview_transport_retry_resets_attempt(mock_http, api_env):
+    sleeps, _ = api_env
+    n = 0
+
+    def handler(request):
+        nonlocal n
+        n += 1
+        if n == 1:
+            return json_response({"error": "busy"}, status=503)
+        return sse(delta_chunk({"content": "ok"}, finish="stop",
+                               usage={"prompt_tokens": 1}))
+
+    api = make_api(mock_http, handler)
+    evs = []
+    answer, _, _ = api.chat("quietrole", [{"role": "user", "content": "q"}],
+                            progress=False, preview_events=evs.append)
+    assert answer == "ok" and len(mock_http.calls) == 2
+    assert _kinds(evs) == [("preview_start", 1), ("preview_reset", 1),
+                           ("preview_start", 2), ("preview_delta", 2),
+                           ("preview_complete", 2)]
+
+
+def test_preview_extra_parameter_fallback_resets_attempt(mock_http):
+    bodies_seen = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies_seen.append(body)
+        if "dry_multiplier" in body:
+            return json_response(
+                {"error": {"message": "unknown parameter dry_multiplier"}},
+                status=400)
+        return sse(text_chunk("clean", finish="stop",
+                              usage={"prompt_tokens": 1}))
+
+    api = make_api(mock_http, handler)
+    evs = []
+    text, _, _ = api.complete("writer", "PROMPT", {"max_tokens": 5},
+                              extra={"dry_multiplier": 0.8},
+                              preview_events=evs.append)
+    assert text == "clean" and len(bodies_seen) == 2
+    assert _kinds(evs) == [("preview_start", 1), ("preview_reset", 1),
+                           ("preview_start", 2), ("preview_delta", 2),
+                           ("preview_complete", 2)]
+    assert _deltas(evs) == "clean"
