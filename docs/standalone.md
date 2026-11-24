@@ -57,6 +57,15 @@ Only the executable file is needed; the informational sidecars described below
 are not required to run it. Relative paths (project directories, `--out`,
 presets) resolve against the caller's working directory exactly as in source.
 
+The executable bundles the reviewed application-owned new-project defaults
+(`longform_core/resources/project_defaults.json` and `writer_preset.json`,
+per ADR-0010) inside the archive, so `init` and GUI Create produce the same
+complete six-file setup as source with no adjacent defaults directory, manual
+preset copy or network access. Missing or invalid bundled assets fail init
+with an actionable diagnostic instead of a complete-setup report; an explicit
+`--preset` still takes precedence for a missing destination and existing
+preset files are never overwritten on repeat init.
+
 The GUI is the default entry point: running the executable with **no
 arguments** — for example by double-clicking it in a file manager — opens the
 GUI in the current directory. `gui` without `DIR` does the same. If that
@@ -83,11 +92,14 @@ Two files are generated beside the executable for distribution purposes:
   the bundled distributions (including certifi's CA data), the PyInstaller
   bootloader exception, and the LGPLv3/GPLv2/GPLv3 texts governing PySide6,
   Shiboken and Qt (vendored canonical SPDX texts, because those wheels ship no
-  license files), plus the bundled plugin inventory.
+  license files), plus the bundled plugin inventory. It also records the
+  bundled reviewed defaults resources by name, size and SHA-256 (per ADR-0010,
+  hashes only — never their contents).
 
 ## What is bundled vs. what stays on the host
 
-- **Bundled**: the Python runtime, `longform.py` + `longform_core`, the httpx
+- **Bundled**: the Python runtime, `longform.py` + `longform_core`, the reviewed
+  defaults resources (`longform_core/resources/*.json`, ADR-0010), the httpx
   dependency closure, certifi's CA data, PySide6/Shiboken and the Qt libraries
   and plugins needed by the GUI (the Qt Wayland platform plugin, shell
   integrations, decoration and graphics-integration clients), and their

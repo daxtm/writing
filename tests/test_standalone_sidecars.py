@@ -98,3 +98,33 @@ def test_vendored_license_texts_are_required(tmp_path):
         (tmp_path / name).write_text(f"text for {name}\n", encoding="utf-8")
     texts = sidecars.load_vendored_licenses(tmp_path)
     assert set(texts) == set(sidecars.LICENSE_TEXT_NAMES)
+
+
+def test_bundled_resource_entries_match_repository():
+    """The sidecar's resource provenance is computed from the reviewed
+    repository assets and the archive TOC."""
+    import hashlib
+    root = REPO
+    names = {f"longform_core/resources/{p.name}"
+             for p in (root / "longform_core" / "resources").glob("*.json")}
+    entries = sidecars.bundled_resource_entries(root, names)
+    assert [e["path"] for e in entries] == \
+        ["longform_core/resources/project_defaults.json",
+         "longform_core/resources/writer_preset.json"]
+    for e in entries:
+        data = (root / e["path"]).read_bytes()
+        assert e["bytes"] == len(data)
+        assert e["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_bundled_resource_entries_fail_closed(tmp_path):
+    (tmp_path / "longform_core" / "resources").mkdir(parents=True)
+    (tmp_path / "longform_core" / "resources" / "project_defaults.json") \
+        .write_text("{}", encoding="utf-8")
+    with pytest.raises(sidecars.SidecarError, match="missing from the archive"):
+        sidecars.bundled_resource_entries(tmp_path, set())
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(sidecars.SidecarError, match="no reviewed resources found"):
+        sidecars.bundled_resource_entries(empty,
+                                          {"longform_core/resources/x.json"})

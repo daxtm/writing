@@ -252,6 +252,27 @@ def load_vendored_licenses(license_dir):
     return texts
 
 
+def bundled_resource_entries(root, archive_names):
+    """Reviewed application-owned resources (ADR-0010) bundled into the
+    archive: names and hashes only, never their contents. Missing resources
+    fail the build; they are never silently omitted."""
+    entries = []
+    for res in sorted((Path(root) / "longform_core" / "resources").glob("*.json")):
+        key = f"longform_core/resources/{res.name}"
+        if key not in archive_names:
+            raise SidecarError(
+                f"bundled reviewed resource missing from the archive: {key} "
+                "(add-data covers longform_core/resources)")
+        entries.append({
+            "path": key,
+            "bytes": res.stat().st_size,
+            "sha256": hashlib.sha256(res.read_bytes()).hexdigest(),
+        })
+    if not entries:
+        raise SidecarError("no reviewed resources found under longform_core/resources")
+    return entries
+
+
 def build_documents(exe, root, license_dir):
     from PySide6 import __version__ as pyside_version
     from PySide6.QtCore import qVersion
@@ -264,6 +285,10 @@ def build_documents(exe, root, license_dir):
     from PyInstaller.archive.readers import CArchiveReader
     names = list(CArchiveReader(str(exe)).toc)
     inventory = gui_inventory(names)
+
+    # Bundled reviewed application-owned resources (ADR-0010): names and
+    # hashes only, never their contents, in the informational sidecars.
+    bundled_resources = bundled_resource_entries(root, names)
 
     vendored = load_vendored_licenses(license_dir)
 
@@ -313,6 +338,12 @@ def build_documents(exe, root, license_dir):
             "inventory": inventory,
             "native_dependency_inspection": native,
         },
+        "bundled_resources": {
+            "note": ("Application-owned reviewed sanitized defaults derived "
+                     "read-only from a private local setup per ADR-0010; "
+                     "bundled verbatim with init, never user data."),
+            "files": bundled_resources,
+        },
         "host_libraries": {"ldd_artifact": ldd_out, "ldd_version": glibc_line},
         "notices": "dist/THIRD-PARTY-NOTICES.txt",
         "note": ("Compatibility boundary observed on the build host; no older-distribution, "
@@ -339,6 +370,13 @@ def build_documents(exe, root, license_dir):
     out.append("Qt GUI runtime (PySide6, Shiboken and Qt libraries/plugins) and certifi's")
     out.append("CA certificate data. The PyInstaller bootloader is distributed under")
     out.append("the GPL with the bootloader exception reproduced below.")
+    out.append("")
+    out.append("Bundled reviewed resources (application-owned, ADR-0010): init writes")
+    out.append("these sanitized defaults verbatim; names and hashes only below, never")
+    out.append("their contents.")
+    out.append("")
+    for res in bundled_resources:
+        out.append(f"  {res['path']}  {res['bytes']} bytes  sha256={res['sha256']}")
     out.append("")
 
     def add_license(title, name, text):
