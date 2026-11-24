@@ -3329,6 +3329,22 @@ class MainWindow(QMainWindow):
         self.credential_clear_session_btn.clicked.connect(
             self.credential_clear_session)
         cbtns.addWidget(self.credential_clear_session_btn)
+        self.credential_save_btn = QPushButton("Save to this project")
+        self.credential_save_btn.setToolTip(
+            "Store the pasted key in project.json api_key after explicit "
+            "confirmation: the file is plaintext and sharing/backups "
+            "include the key. The saved key applies only when no session "
+            "key is active; an active session is never replaced.")
+        self.credential_save_btn.clicked.connect(self.credential_save)
+        cbtns.addWidget(self.credential_save_btn)
+        self.credential_clear_saved_btn = QPushButton("Clear saved key")
+        self.credential_clear_saved_btn.setToolTip(
+            "Clear only the saved project.json api_key (explicit "
+            "confirmation): the session key, if any, stays in force and "
+            "otherwise the environment fallback is exposed.")
+        self.credential_clear_saved_btn.clicked.connect(
+            self.credential_clear_saved)
+        cbtns.addWidget(self.credential_clear_saved_btn)
         cbtns.addStretch(1)
         l.addLayout(cbtns)
 
@@ -3785,6 +3801,9 @@ class MainWindow(QMainWindow):
             lines.append("warning: " + w)
         self.setup_status.setText("\n".join(lines))
         self.credential_status.setText(self._credential_status_text())
+        self.credential_save_btn.setText(
+            "Replace saved key" if p.get("inline_key")
+            else "Save to this project")
 
     def _credential_status_text(self):
         """Availability, winning source and environment name only (ADR-0011)."""
@@ -3839,6 +3858,98 @@ class MainWindow(QMainWindow):
         self._status("Session credential cleared; the saved project key, "
                      "then the environment, applies again. project.json is "
                      "unchanged.")
+
+    def _resolve_credential_settings_dirty(self, action):
+        """Unsaved settings edits survive unless explicitly discarded
+        before a credential write replaces their loaded baseline."""
+        if not self.settings_dirty():
+            return True
+        pick = self._choice(
+            "Unsaved settings",
+            "Settings have unsaved changes. A credential write replaces "
+            "the loaded settings baseline. Discard the settings changes "
+            "and continue, or cancel?",
+            ["Discard settings changes", "Cancel"])
+        if pick == "Discard settings changes":
+            self._settings_touched = {}
+            return True
+        self._status(f"Cancelled; the {action} wrote nothing and the "
+                     "settings edits are kept.", error=True)
+        return False
+
+    def credential_save(self):
+        """Confirm, then store the pasted key in project.json api_key."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        val = self.credential_entry.text().strip()
+        if not val:
+            self._status("Enter a credential first; an empty entry changes "
+                         "nothing.", error=True)
+            return
+        replace = bool(self._plan.get("inline_key"))
+        head = ("Replace the saved project.json api_key with this key?\n\n"
+                if replace else
+                "Save this key into project.json?\n\n")
+        pick = self._choice(
+            "Replace saved credential" if replace else "Save credential",
+            head + "project.json is plaintext: anyone with access to the "
+            "project, and any shared copy or backup, can read the key.\n\n"
+            "The saved key applies only when no session key is active; an "
+            "active session key is never replaced. Only the api_key field "
+            "changes.",
+            ["Save", "Cancel"])
+        if pick != "Save":
+            self._status("Cancelled; nothing was written and no credential "
+                         "was saved.")
+            return
+        if not self._resolve_credential_settings_dirty("save"):
+            return
+        root = plan.canonical_root(self._root)
+        base = self._settings_state.get("baseline")
+
+        def fn(sink, token):
+            return plan.save_credential(
+                root, "replace" if replace else "save", val,
+                baseline=dict(base) if base else None, token=token,
+                events=sink)
+
+        self._dispatch(fn, kind="credential_save")
+
+    def credential_clear_saved(self):
+        """Confirm, then write an empty project.json api_key."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        if not self._plan.get("inline_key"):
+            self._status("No saved project credential to clear.")
+            return
+        fallback = ("an active session key stays in force"
+                    if self._availability() else
+                    f"the environment fallback ({self._plan.get('api_key_env') or 'the configured variable'}) "
+                    "is exposed")
+        pick = self._choice(
+            "Clear saved credential",
+            "Clear the saved project.json api_key?\n\nAfterwards "
+            + fallback + ". Only the api_key field changes; the file is "
+            "never rewritten with a value.",
+            ["Clear", "Cancel"])
+        if pick != "Clear":
+            self._status("Cancelled; nothing was written.")
+            return
+        if not self._resolve_credential_settings_dirty("clear"):
+            return
+        root = plan.canonical_root(self._root)
+        base = self._settings_state.get("baseline")
+
+        def fn(sink, token):
+            return plan.save_credential(
+                root, "clear", baseline=dict(base) if base else None,
+                token=token, events=sink)
+
+        self._dispatch(fn, kind="credential_save")
 
     # ------------------------------------------------------------ preset import
 
@@ -4199,6 +4310,7 @@ class MainWindow(QMainWindow):
         for b in (self.create_btn, self.open_btn, self.preset_import_btn,
                   self.settings_save_btn, self.settings_cancel_btn,
                   self.credential_use_btn, self.credential_clear_session_btn,
+                  self.credential_save_btn, self.credential_clear_saved_btn,
                   self.fetch_limits_btn, self.bible_begin_btn,
                   self.bible_save_btn, self.bible_accept_btn,
                   self.bible_edit_btn, self.bible_skip_btn,
@@ -4590,6 +4702,20 @@ class MainWindow(QMainWindow):
             self._status(msg)
             if self._pending_action is not None:
                 self._run_pending_action()
+        elif kind == "credential_save" and isinstance(value, dict):
+            self._load_settings_form()
+            self._settings_state["loaded"] = True
+            self.refresh(force=True)
+            self.credential_entry.clear()
+            verb = ("replaced" if value["action"] == "replace"
+                    else "saved" if value["action"] == "save" else "cleared")
+            self._status(
+                f"{verb.capitalize()} the saved project credential; "
+                "availability refreshed. project.json is plaintext — "
+                "sharing and backups include the key."
+                if value["action"] != "clear" else
+                "Cleared the saved project credential; availability "
+                "refreshed.")
         elif kind == "limits" and isinstance(value, dict):
             self.limits_view.setPlainText(self._limits_text(value["view"]))
             msg = ("limits fetched and saved to limits.json"

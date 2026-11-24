@@ -3886,6 +3886,95 @@ def case_credentials_session(root):
     win2.close()
 
 
+def case_credentials_storage(root):
+    """gui-api-key-setup: Save/Replace/Clear saved key — explicit informed
+    actions through the shared credential op; only api_key changes, no
+    session override is replaced, values never appear on screen."""
+    import longform_core.gui_window as gw
+    a = app()
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+    fake = PlanningFake(plan={"max_context_length": 8192, "concurrency": 2},
+                        models=_credential_models())
+    cfg = {"api_key": PROJECT_SENTINEL, "title": "Store", "target_words": 8000}
+    proj = _credential_project(root, "stored", cfg=cfg)
+    choices = []
+    win = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.tabs.setCurrentIndex(gw.SETUP)
+    assert "Available" in win.credential_status.text()
+    assert "project" in win.credential_status.text().lower(), \
+        "the saved key is the winning source"
+    assert win.credential_save_btn.text() == "Replace saved key"
+    before = (proj / "project.json").read_bytes()
+
+    # Save with a saved key present is a Replace confirmation; declining
+    # writes nothing
+    win.credential_entry.setText(SESSION_SENTINEL)
+    choices.append("Cancel")
+    win.credential_save_btn.click()
+    assert (proj / "project.json").read_bytes() == before, \
+        "a declined confirmation writes nothing"
+    assert json.loads((proj / "project.json").read_text())["api_key"] == \
+        PROJECT_SENTINEL
+
+    # accepting stores the trimmed value; only api_key changes
+    choices.append("Save")
+    win.credential_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    cfg2 = json.loads((proj / "project.json").read_text())
+    assert cfg2["api_key"] == SESSION_SENTINEL, "the value is trimmed"
+    assert cfg2["title"] == "Store" and cfg2["target_words"] == 8000, \
+        "unrelated fields survive"
+    assert win.credential_entry.text() == ""
+    assert win.credential_save_btn.text() == "Replace saved key"
+    assert "Available" in win.credential_status.text()
+    _assert_no_sentinel(win)
+    after_save = (proj / "project.json").read_bytes()
+
+    # a session key is never replaced by saving
+    win.credential_entry.setText("sk-temp-session")
+    win.credential_use_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._session_key == "sk-temp-session"
+    assert "session" in win.credential_status.text().lower()
+    win.credential_entry.setText(SESSION_SENTINEL)
+    choices.append("Save")
+    win.credential_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert json.loads((proj / "project.json").read_text())["api_key"] == \
+        SESSION_SENTINEL, "saving stored the value"
+    assert win._session_key == "sk-temp-session", \
+        "saving never replaces an active session override"
+    saved_bytes = (proj / "project.json").read_bytes()
+
+    # Clear saved key: confirmation explains the fallback; the session stays
+    choices.append("Cancel")
+    win.credential_clear_saved_btn.click()
+    assert (proj / "project.json").read_bytes() == saved_bytes
+    choices.append("Clear")
+    win.credential_clear_saved_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    cfg3 = json.loads((proj / "project.json").read_text())
+    assert cfg3["api_key"] == "" and cfg3["title"] == "Store", \
+        "clear writes an empty api_key and keeps unrelated fields"
+    assert win._session_key == "sk-temp-session", \
+        "clearing the saved key never clears the session"
+    assert "session" in win.credential_status.text().lower(), \
+        "the session override is still the winning source"
+    assert win.credential_save_btn.text() == "Save to this project"
+    _assert_no_sentinel(win)
+    assert "sk-temp-session" not in (proj / "project.json").read_text()
+
+    # clear with no session: the environment fallback is named in the dialog
+    win.credential_clear_session_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "missing" in win.credential_status.text().lower()
+    assert not (proj / "limits.json").exists(), "no request was made"
+    assert fake.calls == [] and fake.started == 0
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -3915,6 +4004,7 @@ CASES = {
     "case_planning_deferred_create": case_planning_deferred_create,
     "case_planning_settings_limits": case_planning_settings_limits,
     "case_credentials_session": case_credentials_session,
+    "case_credentials_storage": case_credentials_storage,
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
     "case_planning_scenes": case_planning_scenes,
