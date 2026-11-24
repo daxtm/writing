@@ -4,8 +4,8 @@ Host: Linux x86_64, glibc 2.44 (`ldd (GNU libc) 2.44`), uv-managed CPython
 3.11.15, build PyInstaller 6.22.3 with pyinstaller-hooks-contrib 2026.10,
 PySide6 6.12.0 (`pyside6-essentials`), Shiboken6 6.12.0, Qt 6.12.0.
 No Wayland session is available on this host (`XDG_SESSION_TYPE=tty`, no
-`WAYLAND_DISPLAY`), so task 1.6 remains PENDING; automated checks use offscreen
-widget cases and synthetic missing-socket startup failures only.
+`WAYLAND_DISPLAY`), so the desktop acceptance remains PENDING; automated checks
+use offscreen widget cases and synthetic missing-socket startup failures only.
 
 ## Commands and results
 

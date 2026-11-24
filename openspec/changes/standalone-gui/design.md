@@ -129,7 +129,7 @@ relaxing the production command's platform policy. Neither archive inspection,
 Qt startup failure, nor offscreen widgets proves a functioning frozen window.
 
 Require a separate real native-Wayland acceptance of the copied production
-binary before marking this change complete. Use a synthetic project without
+binary before claiming the workspace complete. Use a synthetic project without
 credentials, no source/runtime packages in its execution environment, and
 the native network guard. Open/reopen, read active/inactive branches, save
 multiline steering, edit a scene card, save a new manual passage, export
@@ -141,8 +141,9 @@ record unavailable cases explicitly.
 
 Record commands, checksum/revision, OS/glibc, compositor, runtime versions,
 scaling/theme, and outcomes in this change's `evidence.md`. If a real desktop
-is unavailable, record PENDING and leave desktop acceptance unchecked; do
-not substitute offscreen success or claim workspace completion.
+is unavailable, record PENDING and keep desktop acceptance as an explicit
+owner follow-up; do not substitute offscreen success or claim workspace
+completion.
 
 ### 5. Default the bare invocation to the GUI
 
