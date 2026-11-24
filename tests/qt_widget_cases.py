@@ -3769,6 +3769,122 @@ def case_planning_deferred_create(root):
     win3.close()
 
 
+# ------------------------------------------------- gui-api-key-setup cases
+
+SESSION_SENTINEL = "sk-session-sentinel-credentials"
+PROJECT_SENTINEL = "sk-project-sentinel-credentials"
+ENV_SENTINEL = "sk-env-sentinel-credentials"
+CRED_PLANNER_MODEL = "huihui-ai/Huihui-Qwen3.8-27B-abliterated"
+
+
+def _credential_models():
+    return {CRED_PLANNER_MODEL: {"id": CRED_PLANNER_MODEL,
+                                 "context_length": 131072,
+                                 "max_completion_tokens": 8192,
+                                 "available_on_current_plan": True,
+                                 "api_key": "sk-server-side"}}
+
+
+def _credential_project(root, name="p", cfg=None):
+    proj = root / name
+    (proj / "trees").mkdir(parents=True)
+    _write_json(proj / "project.json", cfg if cfg is not None else {})
+    _write_json(proj / "scenes.json", [])
+    _write_json(proj / "summaries.json", {"scenes": {}, "arcs": []})
+    return proj
+
+
+def _assert_no_sentinel(win, *extra_texts):
+    """The credential values never reach any visible pane text."""
+    surfaces = [win.credential_status.text(), win.setup_status.text(),
+                win.settings_note.text(), win.status.text(),
+                win.limits_view.toPlainText()]
+    for text in list(extra_texts) + surfaces:
+        for sentinel in (SESSION_SENTINEL, PROJECT_SENTINEL, ENV_SENTINEL):
+            assert sentinel not in (text or ""), "a credential value leaked"
+
+
+def case_credentials_session(root):
+    """gui-api-key-setup: from complete Create, a masked entry plus Use for
+    this session satisfies every provider prerequisite (limits, outline)
+    without changing project.json; a new window never inherits it."""
+    import longform_core.gui_window as gw
+    from PySide6.QtWidgets import QLineEdit
+    a = app()
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+    fake = PlanningFake(plan={"max_context_length": 8192, "concurrency": 2},
+                        models=_credential_models())
+
+    fresh = root / "fresh"
+    dir_picks = [str(fresh)]
+    win = gw.MainWindow(str(fresh), choice=_no_dialogs("credentials"),
+                        dir_picker=lambda t, p: dir_picks.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (fresh / "project.json").is_file()
+    assert json.loads((fresh / "project.json").read_text())["api_key"] == ""
+    before = (fresh / "project.json").read_bytes()
+
+    win.tabs.setCurrentIndex(gw.SETUP)
+    entry = win.credential_entry
+    assert entry.echoMode() == QLineEdit.EchoMode.Password, "entry is masked"
+    assert entry.text() == "", "the entry is empty on load (never prefilled)"
+
+    # typing alone is inert: no effective credential change, no request
+    entry.setText(SESSION_SENTINEL + " ")
+    assert json.loads((fresh / "project.json").read_bytes()) == before
+    assert fake.calls == [] and fake.started == 0, "typing makes no request"
+    assert "missing" in win.credential_status.text().lower()
+
+    # Use for this session: trims, activates, clears the entry, writes nothing
+    win.credential_use_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win.credential_entry.text() == "", "entry cleared after Use"
+    assert fake.calls == [] and fake.started == 0, "Use makes no request"
+    status = win.credential_status.text()
+    assert "Available" in status and "session" in status, status
+    _assert_no_sentinel(win)
+    assert json.loads((fresh / "project.json").read_bytes()) == before, \
+        "session use never writes project.json"
+
+    # prerequisites: the session credential satisfies readiness
+    assert win._session.get("creds_ok")
+    assert "credentials" not in win.generate_note.text().lower()
+    assert win.outline_generate_btn.isEnabled()
+
+    # explicit Fetch limits runs with only the session credential
+    win.fetch_limits_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert ("GET", "/plan") in fake.calls, \
+        "the session credential reaches the provider without a disk key"
+    assert (fresh / "limits.json").is_file()
+    _assert_no_sentinel(win)
+
+    # outline generation runs through the window's provider wrapper
+    win.tabs.setCurrentIndex(gw.OUTLINE)
+    win.outline_notes_edit.setPlainText("Keep chapters short.")
+    win.outline_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert any(c[0] == "chat_many" for c in fake.calls), \
+        "outline generation ran with the session credential active"
+    assert win._outline_overview.get("candidates"), "candidates were generated"
+    _assert_no_sentinel(win)
+    assert json.loads((fresh / "project.json").read_bytes()) == before
+
+    # lifecycle: closing clears the session; a new window never inherits it
+    win.close()
+    win2 = gw.MainWindow(str(fresh), choice=_no_dialogs("credentials"),
+                         provider_factory=lambda _p: fake)
+    win2.show()
+    win2.tabs.setCurrentIndex(gw.SETUP)
+    assert "missing" in win2.credential_status.text().lower(), \
+        "a new window never inherits the session credential"
+    assert win2.credential_entry.text() == ""
+    win2.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -3797,6 +3913,7 @@ CASES = {
     "case_planning_create_open": case_planning_create_open,
     "case_planning_deferred_create": case_planning_deferred_create,
     "case_planning_settings_limits": case_planning_settings_limits,
+    "case_credentials_session": case_credentials_session,
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
     "case_planning_scenes": case_planning_scenes,
