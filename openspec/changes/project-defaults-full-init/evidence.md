@@ -56,6 +56,30 @@ missing preset source and preset-restore-after-removal
 `test_parity_init_explicit_preset_failure_and_missing_source`,
 `test_parity_init_preset_restore_after_removal`).
 
+## Task 1.8 final verification
+
+Command (2026-11-24):
+
+```
+./scripts/check.sh
+```
+
+Result: exit 0.
+
+- `python3 -m py_compile longform.py`: passed.
+- CLI smoke `uv run --script longform.py --help`: passed.
+- Standalone build: succeeded; frozen suite `45 passed in 27.03s`.
+- Source suite: `433 passed in 5.59s` (includes the new init/defaults, planning,
+  deferred-Create and registered offscreen regressions; standalone excluded
+  because it already ran against the built artifact).
+- No skips, failures or errors.
+
+Real-Wayland Create/reopen/dirty-Save walkthrough: **PENDING**. This host has
+`XDG_SESSION_TYPE=tty`, no `WAYLAND_DISPLAY` and no `DISPLAY`, so the native
+desktop walkthrough cannot be performed here. The offscreen cases cover the
+same paths; desktop acceptance remains the owner's separate step and is not
+claimed. No shipping or merge is authorized by this evidence.
+
 ## Handoff (stopping point, session end)
 
 - Completed and pushed: 1.1 (`tests/test_init_defaults.py` baseline, later
@@ -66,11 +90,8 @@ missing preset source and preset-restore-after-removal
   (py_compile, `--help`, standalone build + 45 frozen tests, source pytest
   433 passed) with no skips; branch `feat/project-defaults-full-init` synced
   with origin.
-- Exact next task: **1.8** — run `./scripts/check.sh` to a passing result and
-  record commands/results here, record the real-Wayland
-  Create/reopen/dirty-Save walkthrough (or leave it explicitly PENDING), then
-  commit/push.
-- Remaining tasks: 1.8 only.
+- Exact next task: none (1.8 completed in the section above).
+- Remaining tasks: none.
 - Failing/pending checks: none failing; real-Wayland desktop acceptance
   (Create/reopen/dirty-Save walkthrough) remains **PENDING** and is not
   claimed by the offscreen cases. Do not ship or merge.
