@@ -1448,12 +1448,12 @@ def test_outline_previews_raw_provisional_and_final_identical(tmp_path):
                            provider_factory=lambda p: FakeOutlineProvider(p),
                            events=evs.append,
                            preview_events=lambda i: (lambda ev: None))
-    pv = [e for e in evs if e.get("type") == "preview"]
-    assert [e["preview_type"] for e in pv] == [
+    pv = [e for e in evs if e.get("type", "").startswith("preview_")]
+    assert [e["type"] for e in pv] == [
         "preview_start", "preview_delta", "preview_delta", "preview_complete"]
-    assert all(e["candidate"] == 1 for e in pv)
+    assert all(e["candidate_id"] == 1 for e in pv)
     deltas = "".join(e["text"] for e in pv
-                     if e["preview_type"] == "preview_delta")
+                     if e["type"] == "preview_delta")
     assert "OUTLINE ONE BODY" in deltas, "raw answer visible before completion"
     assert not (a / "outline.md").exists(), \
         "no provisional choose/accept from previews"
@@ -1471,7 +1471,7 @@ def test_outline_previews_raw_provisional_and_final_identical(tmp_path):
     plan.generate_outlines(outline_project(tmp_path / "c"), "notes", 1,
                            provider_factory=lambda p: FakeOutlineProvider(p),
                            events=evs2.append)
-    assert not [e for e in evs2 if e.get("type") == "preview"], \
+    assert not [e for e in evs2 if e.get("type", "").startswith("preview_")], \
         "no preview events without a subscriber"
 
 
@@ -1487,8 +1487,8 @@ def test_outline_previews_incomplete_tag_visible_and_reroll_retagged(tmp_path):
                                  events=evs.append,
                                  preview_events=lambda i: (lambda ev: None))
     deltas = "".join(e["text"] for e in evs
-                     if e.get("type") == "preview" and
-                     e["preview_type"] == "preview_delta")
+                     if e.get("type", "").startswith("preview_") and
+                     e["type"] == "preview_delta")
     assert "<outline>OUTLINE ONE BO" in deltas, \
         "incomplete tagged answer is visible as provisional raw text"
     assert any("no <outline> tags" in w for w in out["warnings"]), \
@@ -1501,7 +1501,7 @@ def test_outline_previews_incomplete_tag_visible_and_reroll_retagged(tmp_path):
                            provider_factory=lambda p: FakeOutlineProvider(p),
                            events=evs2.append,
                            preview_events=lambda i: (lambda ev: None))
-    cands = {e["candidate"] for e in evs2 if e.get("type") == "preview"}
+    cands = {e["candidate_id"] for e in evs2 if e.get("type", "").startswith("preview_")}
     assert cands == {1}, "reroll previews restart their own candidate ids"
 
 
@@ -1515,8 +1515,8 @@ def test_outline_previews_two_candidates_each_tagged(tmp_path):
                            preview_events=lambda i: (lambda ev: None))
     per = {}
     for e in evs:
-        if e.get("type") == "preview":
-            per.setdefault(e["candidate"], []).append(e["preview_type"])
+        if e.get("type", "").startswith("preview_"):
+            per.setdefault(e["candidate_id"], []).append(e["type"])
     assert set(per) == {1, 2}
     for c, kinds in per.items():
         assert kinds == ["preview_start", "preview_delta", "preview_delta",
@@ -1532,12 +1532,12 @@ def test_scene_previews_raw_provisional_and_parse_unchanged(tmp_path):
     out = plan.generate_scene_cards(
         a, provider_factory=lambda p: FakeSceneProvider(p),
         events=evs.append, preview_events=lambda ev: None)
-    pv = [e for e in evs if e.get("type") == "preview"]
-    assert [e["preview_type"] for e in pv] == [
+    pv = [e for e in evs if e.get("type", "").startswith("preview_")]
+    assert [e["type"] for e in pv] == [
         "preview_start", "preview_delta", "preview_delta", "preview_complete"]
-    assert all(e["candidate"] == 1 for e in pv)
+    assert all(e["candidate_id"] == 1 for e in pv)
     deltas = "".join(e["text"] for e in pv
-                     if e["preview_type"] == "preview_delta")
+                     if e["type"] == "preview_delta")
     assert SCENES_JSON in deltas, "raw scene JSON visible before completion"
     before = (a / "scenes.json").read_bytes()
     assert (a / "scenes.json").read_bytes() == before, \
@@ -1560,8 +1560,8 @@ def test_scene_previews_invalid_json_recovery_unchanged(tmp_path):
         root, provider_factory=lambda p: FakeSceneProvider(p),
         events=evs.append, preview_events=lambda ev: None)
     deltas = "".join(e["text"] for e in evs
-                     if e.get("type") == "preview" and
-                     e["preview_type"] == "preview_delta")
+                     if e.get("type", "").startswith("preview_") and
+                     e["type"] == "preview_delta")
     assert "<scenes>[not json" in deltas
     assert out["cards"] is None and out["raw_path"], \
         "invalid raw output keeps the existing recovery path"
