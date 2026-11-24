@@ -46,6 +46,19 @@ drafting loop (generation/Stop/close, picker, keyboard, scaling/theme) is record
 shell's pre-drafting smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0) predates generation.
 
 ## Planned desktop workspace
+Selected next change: `openspec/changes/project-defaults-full-init/`, from the
+first unchecked guided-workflow roadmap item on `docs/roadmap-guided-workflow`.
+This selection supersedes the historical stop-planning instruction below only
+for this proposal; it is not implementation or shipping authorization.
+ADR-0010 permits reviewed sanitized runtime defaults derived read-only from
+`/home/daxtm/Documents/fuckpi/project.json` and
+`/home/daxtm/Documents/fuckpi/56295265-LLam_ception-1.3.json`.
+Never write to those sources or require them at startup, build or test time.
+Force empty api_key, FEATHERLESS_API_KEY environment name and project-relative
+writer_preset.json; review all nested values before tracking derived assets.
+The originals remain untracked and are never fixtures. GUI complete init does
+not perform paid generation or fetch limits.
+
 `docs/ROADMAP.md` requires every CLI/TUI feature in the GUI, start to finish;
 no individual change completes the workspace. The sequence is
 `gui-drafting-workspace` (implemented), `gui-project-planning` (implemented),
@@ -104,8 +117,10 @@ switching, and mouse/keyboard work remain an owner acceptance step.
 ## Rules
 - Specs: `openspec/`. Decisions: `docs/adr/`. Plan: `docs/ROADMAP.md`.
 - Roadmap changes get OpenSpec artifacts only when selected for implementation;
-  no speculative change directories. ADR-0004/0005 are reserved on `feat/reader-gui`.
+  no speculative change directories. ADR-0004/0005 are integrated, not available numbers.
 - Keep `myfic/` and the third-party `56295265-LLam_ception-1.3.json` preset untracked.
+  ADR-0010 permits reviewed sanitized application-owned runtime defaults only,
+  not the original private files or private fixtures.
 - Never commit API keys or `.env`; synthetic test credentials only.
 - Tests are offline/deterministic: no live API calls; use MockTransport/fakes and temporary projects.
 - Keep `longform.py` as the thin PEP 723 launcher over `longform_core/` (ADR-0003); behavior, output, and file formats are frozen behind the test suite. Monkeypatch at the owning module (e.g. `longform.api.warn`), not the launcher re-exports.
