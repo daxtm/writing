@@ -25,7 +25,8 @@ Every command is its own step. No command runs another one for you.
   revise DIR --scene ID        passage-by-passage line edit using critiques/ID.md and/or checks/ID.md
   status DIR                   project overview
   export DIR [--out FILE]      write manuscript.md
-  gui DIR                      native Wayland window: saved branches, notes, per-scene steering
+  gui [DIR]                    native Wayland window: saved branches, notes, per-scene steering
+                               (DIR defaults to the current directory; running with no command opens it)
 
 API key: "api_key" in project.json, or else the environment variable named by "api_key_env"
 (default: export FEATHERLESS_API_KEY=...).
@@ -35,6 +36,7 @@ DIR/lorebooks/. A card becomes a character lorebook: its description + personali
 the character's name, plus any embedded character_book entries. Toggle them and mark character books inside the draft loop (lb).
 """
 import argparse
+import os
 
 from .commands import (cmd_bible, cmd_check, cmd_compress, cmd_critique, cmd_draft, cmd_export,
                        cmd_init, cmd_limits, cmd_outline, cmd_revise, cmd_scenes, cmd_status,
@@ -43,7 +45,7 @@ from .project import Project
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
 
     def add(name, **kw):
         sp = sub.add_parser(name, **kw)
@@ -77,14 +79,19 @@ def main():
     add("status")
     sp = add("export")
     sp.add_argument("--out")
-    add("gui")
+    sp = sub.add_parser("gui")
+    sp.add_argument("dir", nargs="?",
+                    help="project directory (default: current directory)")
     args = ap.parse_args()
 
+    if args.cmd is None:
+        args.cmd = "gui"
+        args.dir = None
     if args.cmd == "init":
         return cmd_init(args)
     if args.cmd == "gui":
         from . import gui
-        return gui.run_cli(args.dir)
+        return gui.run_cli(args.dir or os.getcwd())
     p = Project(args.dir)
     {
         "limits": cmd_limits, "bible": cmd_bible, "outline": cmd_outline, "scenes": cmd_scenes, "draft": cmd_draft,
