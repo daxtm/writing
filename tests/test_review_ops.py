@@ -479,9 +479,15 @@ class FakeProvider:
         self.calls = []
 
     def chat(self, role, msgs, max_tokens=None, stream_cb=None, progress=True,
-             token=None, on_retry_event=None):
+             token=None, on_retry_event=None, preview_events=None, **kw):
         self.calls.append(("chat", role, msgs, max_tokens))
-        return self.responses.pop(0), "stop", {}
+        raw = self.responses.pop(0)
+        if preview_events is not None:
+            preview_events({"type": "preview_start", "attempt_id": 1})
+            preview_events({"type": "preview_delta", "attempt_id": 1,
+                            "text": raw})
+            preview_events({"type": "preview_complete", "attempt_id": 1})
+        return raw, "stop", {}
 
 
 def test_ops_prepare_messages_match_cli_request(project):
@@ -1188,3 +1194,156 @@ def test_ops_accept_finishes_inflight_commit_group(project, tmp_path):
     row = next(s for s in scenes if s["id"] == "s001")
     assert row["state_updated"] is True
     assert tok.checks == 1, "the commit group is never re-checked mid-write"
+
+
+REVIEW_STREAM_FAMILIES = ["update", "summary_only", "compress", "critique",
+                          "revise"]
+
+
+def _run_review_family(root, family, preview_collector=None,
+                       provider_factory=None):
+    """Prepare → generate → explicit accept/save for one review family.
+
+    preview_collector (list) receives the provider-level preview events when
+    given; returns the generate result. Nothing else differs."""
+    sub = (lambda ev: preview_collector.append(ev)) \
+        if preview_collector is not None else None
+    pf = provider_factory
+    if family == "update":
+        prep = ro.update_state_prepare(str(root), "s001")
+        res = ro.update_state_generate(
+            str(root), prep, provider_factory=pf or
+            (lambda p: FakeProvider([RECORD_S1])), preview_events=sub)
+        secs = ro.update_state_parse_response(res["raw"], prep)["secs"]
+        ro.update_state_accept(str(root), prep, secs)
+        return res
+    if family == "summary_only":
+        prep = ro.update_state_prepare(str(root), "s002", summary_only=True)
+        res = ro.update_state_generate(
+            str(root), prep, provider_factory=pf or
+            (lambda p: FakeProvider([RECORD_S2])), preview_events=sub)
+        secs = ro.update_state_parse_response(res["raw"], prep)["secs"]
+        ro.update_state_accept(str(root), prep, secs)
+        return res
+    if family == "compress":
+        prep = ro.compress_prepare(str(root), "s001", "s001")
+        res = ro.compress_generate(
+            str(root), prep, provider_factory=pf or
+            (lambda p: FakeProvider([ARC_TEXT])), preview_events=sub)
+        ro.compress_accept(str(root), prep, res["text"])
+        return res
+    if family == "critique":
+        prep = ro.critique_prepare(str(root), "s001")
+        res = ro.critique_generate(
+            str(root), prep, provider_factory=pf or
+            (lambda p: FakeProvider([CRITIQUE_TEXT])), preview_events=sub)
+        ext = ro.critique_extract(res["raw"])
+        ro.critique_save(str(root), prep, ext["text"])
+        return res
+    if family == "revise":
+        session = ro.revise_prepare(str(root), "s001")
+        res = ro.revise_generate(
+            str(root), session, 0,
+            provider_factory=pf or (lambda p: FakeProvider([PASSAGE_1])),
+            preview_events=sub)
+        ro.revise_accept(str(root), session, 0, res, res["text"])
+        ro.revise_finish(str(root), session)
+        return res
+    raise AssertionError(family)
+
+
+@pytest.mark.parametrize("family", REVIEW_STREAM_FAMILIES)
+def test_review_previews_stream_before_completion(project, tmp_path, family):
+    """Task 1.6: every review family streams its live answer (raw, sections
+    possibly incomplete) to the preview subscriber before completion, and the
+    explicit accept/save afterwards produces byte-identical files/history
+    versus an identical no-subscriber run."""
+    import threading
+    import time
+    from reader_support import write_json
+
+    if family == "compress":
+        write_json(project / "summaries.json", {
+            "scenes": {
+                "s001": {"detailed": "Mara opens the gate and counts the "
+                                     "windows.", "brief": "Mara opens the "
+                                     "gate.", "updated": "x",
+                         "text_hash": "h1"},
+                "s002": {"detailed": "Mara closes the gate behind her.",
+                         "brief": "Mara closes the gate.", "updated": "x",
+                         "text_hash": "h2"}},
+            "arcs": []})
+    elif family == "revise":
+        _prime_notes(project)
+
+    response = {"update": RECORD_S1, "summary_only": RECORD_S2,
+                "compress": ARC_TEXT, "critique": CRITIQUE_TEXT,
+                "revise": PASSAGE_1}[family]
+    raw = response
+    half = len(raw) // 2
+
+    class PausedReviewFake(FakeProvider):
+        gate = None
+
+        def chat(self, role, msgs, max_tokens=None, stream_cb=None,
+                 progress=True, token=None, on_retry_event=None,
+                 preview_events=None, **kw):
+            self.calls.append(("chat", role, msgs, max_tokens))
+            if preview_events is not None:
+                preview_events({"type": "preview_start", "attempt_id": 1})
+                preview_events({"type": "preview_delta", "attempt_id": 1,
+                                "text": raw[:half]})
+            gate = PausedReviewFake.gate
+            if gate is not None and not gate.wait(30):
+                raise AssertionError("review fake gate never opened")
+            if preview_events is not None:
+                preview_events({"type": "preview_delta", "attempt_id": 1,
+                                "text": raw[half:]})
+                preview_events({"type": "preview_complete", "attempt_id": 1})
+            self.responses.pop(0)
+            return raw, "stop", {}
+
+    a, b = _copy(project, tmp_path, "a"), _copy(project, tmp_path, "b")
+    evs = []
+    gate = threading.Event()
+    PausedReviewFake.gate = gate
+    try:
+        started = threading.Event()
+        box = {}
+
+        def run():
+            box["res"] = _run_review_family(
+                a, family, evs, provider_factory=lambda p: PausedReviewFake(
+                    [response]))
+            started.set()
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        for _ in range(600):
+            if any(e["type"] == "preview_delta" for e in evs):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("no preview delta before completion")
+        assert t.is_alive(), "the paused run has not completed pre-release"
+        assert "".join(e["text"] for e in evs
+                       if e["type"] == "preview_delta") == raw[:half], \
+            "the incomplete raw answer is visible before release"
+    finally:
+        gate.set()
+        t.join(30)
+        PausedReviewFake.gate = None
+    assert started.wait(30), "the paused run settles after release"
+    res = box["res"]
+    types = [e["type"] for e in evs]
+    assert types == ["preview_start", "preview_delta", "preview_delta",
+                     "preview_complete"]
+    assert "".join(e["text"] for e in evs if e["type"] == "preview_delta") == \
+        raw, "the streamed raw answer is the completed response"
+
+    res2 = _run_review_family(b, family)
+    assert res.get("text") == res2.get("text") and \
+        res.get("ok") == res2.get("ok"), \
+        "preview streaming does not change parsing"
+    assert rf.snapshot(a) == rf.snapshot(b), \
+        "accept/save files and history are identical with and without previews"

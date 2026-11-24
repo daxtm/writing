@@ -2338,6 +2338,224 @@ def case_stream_planning(root):
     win.close()
 
 
+def case_stream_review(root):
+    """Paused live previews for every review family (task 1.6).
+
+    Parameterized over update-state (full/summary-only), compression,
+    critique and revision (initial + Regenerate): the raw answer — sections
+    possibly incomplete — is visible in the family's pane while the gate is
+    closed and the worker is busy, nothing is written or accepted pre-release
+    (gates always released in finally), and the explicit accept/save produces
+    the same committed results as the settled journeys."""
+    import longform_core.gui_window as gw
+    a = app()
+    import review_fixtures as rf
+
+    UPDATE_PREFIX = ("<record>\n=== DETAILED SUMMARY ===\nMara opens the gate "
+                     "and counts the windows.\n\n=== BRIEF SUMMARY ===\nMara "
+                     "opens the gate.\n\n")
+    SO_PREFIX = ("<record>\n=== DETAILED SUMMARY ===\nMara closes the gate "
+                 "behind her.\n\n")
+    ARC_PREFIX = "<summary>Mara opened the gate."
+    CRIT_PREFIX = '<critique>1. [style-ru'
+    PASS_PREFIX = "<passage>Mara pushed the gate ope"
+
+    def _window(name, responses):
+        project = _review_project(root, name)
+        fake = ReviewChatFake(responses)
+        win = gw.MainWindow(str(project), choice=_no_dialogs("stream review"),
+                            provider_factory=lambda _p: fake)
+        win.show()
+        return project, fake, win
+
+    def _pre_release(win, pane_text, fragment, unchanged):
+        assert _pump(a, lambda: fragment in pane_text()), \
+            "the raw answer fragment is visible while the gate is closed"
+        assert win._busy, "the worker is busy while the gate is closed"
+        assert win._op_previews, \
+            "the preview state is keyed for the running attempt"
+        for label, read in unchanged:
+            before, after = read
+            assert before == after, f"{label} unchanged before release"
+
+    # --- update state (full): raw incomplete sections stream pre-release
+    project, fake, win = _window(
+        "s_update", [REVIEW_RECORD_S1])
+    try:
+        win.select_item("manuscript", "s001", None)
+        win.tabs.setCurrentIndex(gw.CONTINUITY)
+        state_before = (project / "state.md").read_text(encoding="utf-8")
+        sums_before = (project / "summaries.json").read_bytes()
+        fake.preview_text = UPDATE_PREFIX
+        fake.gate = threading.Event()
+        win.update_state_btn.click()
+        pane = win.continuity_preview.toPlainText
+        _pre_release(win, pane, "=== DETAILED SUMMARY ===",
+                     [("state.md", (state_before,
+                                    (project / "state.md").read_text(
+                                        encoding="utf-8"))),
+                      ("summaries.json", (sums_before,
+                                          (project / "summaries.json")
+                                          .read_bytes()))])
+        assert "UPDATED STATE" not in pane(), \
+            "the raw preview is incomplete before release"
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "update settles on release"
+    assert "STATE DIFF" in pane() and "+Mara is inside the yard." in pane(), \
+        "the completed preview shows the parsed sections and diff"
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (project / "state.md").read_text(encoding="utf-8") == \
+        "Mara is inside the yard.\n"
+    assert len(list((project / "state_history").glob("before_s001_*.md"))) == 1
+    win.close()
+
+    # --- summary-only: same streaming, state.md never touched
+    project, fake, win = _window("s_summary", [REVIEW_RECORD_S2])
+    try:
+        win.select_item("manuscript", "s002", None)
+        win.tabs.setCurrentIndex(gw.CONTINUITY)
+        state_before = (project / "state.md").read_text(encoding="utf-8")
+        fake.preview_text = SO_PREFIX
+        fake.gate = threading.Event()
+        win.summary_only_btn.click()
+        pane = win.continuity_preview.toPlainText
+        _pre_release(win, pane, "=== DETAILED SUMMARY ===",
+                     [("state.md", (state_before,
+                                    (project / "state.md").read_text(
+                                        encoding="utf-8")))])
+        assert "UPDATED STATE" not in pane()
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "summary-only settles"
+    assert "Mara closes the gate behind her." in pane() and \
+        "STATE DIFF" not in pane(), "summary-only previews no state section"
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((project / "scenes.json").read_text())
+    assert not scenes[1].get("state_updated")
+    assert (project / "state.md").read_text(encoding="utf-8") == state_before
+    win.close()
+
+    # --- compress: raw arc streams pre-release, nothing appended pre-accept
+    project, fake, win = _window("s_compress", [REVIEW_ARC])
+    sums = {"scenes": {
+        "s001": {"detailed": "Mara opens the gate and counts the windows.",
+                 "brief": "Mara opens the gate.", "updated": "x",
+                 "text_hash": "h1"},
+        "s002": {"detailed": "Mara closes the gate behind her.",
+                 "brief": "Mara closes the gate.", "updated": "x",
+                 "text_hash": "h2"}},
+        "arcs": []}
+    _write_json(project / "summaries.json", sums)
+    try:
+        win.tabs.setCurrentIndex(gw.CONTINUITY)
+        fake.preview_text = ARC_PREFIX
+        fake.gate = threading.Event()
+        win.compress_from.setCurrentText("s001")
+        win.compress_to.setCurrentText("s001")
+        win.compress_btn.click()
+        pane = win.continuity_preview.toPlainText
+        _pre_release(win, pane, "Mara opened the gate",
+                     [("summaries.json", (sums,
+                                          json.loads((project /
+                                                      "summaries.json")
+                                                     .read_text())))])
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "compress settles on release"
+    assert "Mara opened the gate." in pane(), "the arc preview is complete"
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    arcs = json.loads((project / "summaries.json").read_text())["arcs"]
+    assert arcs and arcs[0]["text"] == "Mara opened the gate." and \
+        arcs[0]["from"] == "s001" and arcs[0]["to"] == "s001"
+    win.close()
+
+    # --- critique: raw report streams pre-release, saved only on Save
+    project, fake, win = _window("s_critique", [REVIEW_CRITIQUE])
+    try:
+        win.select_item("manuscript", "s001", None)
+        win.tabs.setCurrentIndex(gw.REVIEW)
+        crits_before = sorted(x.name for x in (project / "critiques").glob("*"))
+        fake.preview_text = CRIT_PREFIX
+        fake.gate = threading.Event()
+        win.critique_btn.click()
+        pane = win.report_view.toPlainText
+        _pre_release(win, pane, "1. [style-ru",
+                     [("critiques", (crits_before,
+                                     sorted(x.name for x in
+                                            (project / "critiques")
+                                            .glob("*"))))])
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "critique settles on release"
+    assert '1. [style-rule] "counts"' in pane()
+    win.report_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    crit = (project / "critiques" / "s001.md").read_text(encoding="utf-8")
+    assert crit.startswith("# Critique s001 (") and \
+        crit.endswith("vary the verb\n")
+    win.close()
+
+    # --- revision: first passage streams pre-release; Regenerate too;
+    #     accepting the regenerated passage updates node + history once
+    project, fake, win = _window(
+        "s_revise",
+        [REVIEW_PASSAGE, "<passage>Mara pushed the gate open again.</passage>",
+         "NO CHANGES"])
+    rf.run_cli(project, "critique", [REVIEW_CRITIQUE], args={"scene": "s001"})
+    rf.run_cli(project, "check", [], args={"scene": "s001"})
+    try:
+        win.select_item("manuscript", "s001", None)
+        win.tabs.setCurrentIndex(gw.REVISION)
+        tree_before = json.loads(
+            (project / "trees" / "s001.json").read_text())
+        fake.preview_text = PASS_PREFIX
+        fake.gate = threading.Event()
+        win.revise_btn.click()
+        pane = win.revise_view.toPlainText
+        _pre_release(win, pane, "Mara pushed the gate ope",
+                     [("trees/s001.json", (tree_before,
+                                           json.loads((project / "trees" /
+                                                       "s001.json")
+                                                      .read_text())))])
+        assert "</passage>" not in pane(), \
+            "the raw passage preview is incomplete before release"
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "first passage settles"
+    assert "Mara pushed the gate open." in pane(), "the parsed revision shows"
+
+    # Regenerate re-streams with a fresh attempt before settling
+    fake.preview_text = "<passage>Mara pushed the gate open ag"
+    fake.gate = threading.Event()
+    try:
+        win.revise_regen_btn.click()
+        _pre_release(win, pane, "Mara pushed the gate open ag",
+                     [("trees/s001.json", (tree_before,
+                                           json.loads((project / "trees" /
+                                                       "s001.json")
+                                                      .read_text())))])
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "regeneration settles"
+    assert "Mara pushed the gate open again." in pane()
+    win.revise_accept_btn.click()
+    assert _pump(a, lambda: not win._busy), "accept + no-change advance"
+    assert "revised 1 passages" in win.status.text()
+    assert win._revision is None
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert t["nodes"]["n1"]["text"] == "Mara pushed the gate open again."
+    assert t["nodes"]["n1"]["history"][-1]["by"] == "revise"
+    assert t["nodes"]["n1"]["history"][-1]["text"] == \
+        "Mara counts the lit windows."
+    assert t["head"] == "n2"
+    win.close()
+
+
+
 def case_planning_scenes(root):
     """Scenes pane: generate from the saved outline, preview/edit, force
     protection, confirmed replace with backups, kept trees, invalid output."""
@@ -2625,13 +2843,27 @@ class ReviewChatFake:
         self.gate = None
 
     def chat(self, role, msgs, max_tokens=None, stream_cb=None, progress=True,
-             token=None, on_retry_event=None):
+             token=None, on_retry_event=None, preview_events=None):
         self.calls.append(("chat", role, msgs, max_tokens))
         if token is not None:
             token.check()
+        raw = self.responses[0]
+        prefix = getattr(self, "preview_text", None)
+        if preview_events is not None:
+            preview_events({"type": "preview_start", "attempt_id": 1})
+            preview_events({"type": "preview_delta", "attempt_id": 1,
+                            "text": prefix if prefix else raw})
         if self.gate is not None and not self.gate.wait(10):
             raise AssertionError("fake provider gate never opened")
-        return self.responses.pop(0), "stop", {}
+        raw = self.responses.pop(0)
+        if preview_events is not None:
+            if prefix:
+                rest = raw[len(prefix):] if raw.startswith(prefix) else ""
+                if rest:
+                    preview_events({"type": "preview_delta", "attempt_id": 1,
+                                    "text": rest})
+            preview_events({"type": "preview_complete", "attempt_id": 1})
+        return raw, "stop", {}
 
 
 def _scripted_choice(answers):
@@ -3561,7 +3793,8 @@ class SettleFake(ReviewChatFake):
     boundary check sees it."""
 
     def chat(self, role, msgs, max_tokens=None, stream_cb=None,
-             progress=True, token=None, on_retry_event=None):
+             progress=True, token=None, on_retry_event=None,
+             preview_events=None):
         self.calls.append(("chat", role, msgs, max_tokens))
         if self.gate is not None:
             self.gate.wait(10)
@@ -4532,6 +4765,7 @@ CASES = {
     "case_planning_outline": case_planning_outline,
     "case_stream_planning": case_stream_planning,
     "case_stream_draft_candidates": case_stream_draft_candidates,
+    "case_stream_review": case_stream_review,
     "case_planning_scenes": case_planning_scenes,
     "case_planning_card_edit": case_planning_card_edit,
     "case_review_update_state": case_review_update_state,

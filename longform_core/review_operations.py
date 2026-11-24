@@ -21,7 +21,8 @@ from .checks import check_report
 from .config import CRITIC_SYSTEM, EDITOR_SYSTEM, SUMMARIZER_SYSTEM
 from .draft_operations import (OpError, _advance, _capture, _check_tree_writable,
                                _emit, _project_of, _provider, _save_tree,
-                               _stale_check, _tree, scrub_credentials)
+                               _stale_check, _tree, preview_factory,
+                               scrub_credentials)
 from .prompt import format_card, layered_summary
 from .reader_model import _no_symlink_below
 from .tree import Tree
@@ -128,8 +129,11 @@ def compress_overlap_set(root, from_id, to_id):
 
 
 def compress_generate(root, prep, *, provider=None, provider_factory=None,
-                      token=None, events=None):
-    """One summarizer chat call for the arc summary; nothing written."""
+                      token=None, events=None, preview_events=None):
+    """One summarizer chat call for the arc summary; nothing written.
+
+    `preview_events` (ADR-0012, single candidate) receives the live answer
+    before completion; parsing/acceptance stay unchanged."""
     p = _project_of(root)
     if token:
         token.check()
@@ -140,7 +144,10 @@ def compress_generate(root, prep, *, provider=None, provider_factory=None,
         raw, finish, _ = provider.chat("summarizer", prep.msgs, token=token,
                                        on_retry_event=(lambda why, delay:
                                                        _emit(events, "retry"))
-                                                      if events else None)
+                                                      if events else None,
+                                       preview_events=None if preview_events is None else
+                                       preview_factory(events,
+                                                       lambda i: preview_events)(0))
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr) as e:
@@ -260,8 +267,11 @@ def critique_prepare(root, scene_id, *, token=None):
 
 
 def critique_generate(root, prep, *, provider=None, provider_factory=None,
-                      token=None, events=None):
-    """One critic chat call with the prepared messages; nothing written."""
+                      token=None, events=None, preview_events=None):
+    """One critic chat call with the prepared messages; nothing written.
+
+    `preview_events` (ADR-0012, single candidate) receives the live answer
+    before completion; the report is only written on explicit Save."""
     p = _project_of(root)
     if token:
         token.check()
@@ -271,7 +281,10 @@ def critique_generate(root, prep, *, provider=None, provider_factory=None,
         raw, finish, _ = provider.chat("critic", prep.msgs, token=token,
                                        on_retry_event=(lambda why, delay:
                                                        _emit(events, "retry"))
-                                                      if events else None)
+                                                      if events else None,
+                                       preview_events=None if preview_events is None else
+                                       preview_factory(events,
+                                                       lambda i: preview_events)(0))
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr) as e:
@@ -495,8 +508,11 @@ def revise_passage(root, session, k):
 
 
 def revise_generate(root, session, k, *, provider=None, provider_factory=None,
-                    token=None, events=None):
-    """One editor chat call for passage k; nothing written."""
+                    token=None, events=None, preview_events=None):
+    """One editor chat call for passage k; nothing written.
+
+    `preview_events` (ADR-0012, single candidate) receives the live answer
+    before completion; the node changes only on explicit Accept."""
     p = _project_of(root)
     psg = revise_passage(root, session, k)
     if token:
@@ -509,7 +525,10 @@ def revise_generate(root, session, k, *, provider=None, provider_factory=None,
                                        max_tokens=psg["cap"], token=token,
                                        on_retry_event=(lambda why, delay:
                                                        _emit(events, "retry"))
-                                                      if events else None)
+                                                      if events else None,
+                                       preview_events=None if preview_events is None else
+                                       preview_factory(events,
+                                                       lambda i: preview_events)(0))
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr) as e:
@@ -886,8 +905,12 @@ def provider_for(root, api_cls=None):
 
 
 def update_state_generate(root, prep, *, provider_factory=None, provider=None,
-                          token=None, events=None):
-    """One summarizer chat call with the prepared messages; nothing written."""
+                          token=None, events=None, preview_events=None):
+    """One summarizer chat call with the prepared messages; nothing written.
+
+    `preview_events` (ADR-0012, single candidate) receives the live answer
+    before completion (full and summary-only alike); parsing/acceptance stay
+    unchanged."""
     p = _project_of(root)
     if token:
         token.check()
@@ -897,7 +920,10 @@ def update_state_generate(root, prep, *, provider_factory=None, provider=None,
         raw, finish, _ = provider.chat("summarizer", prep.msgs, token=token,
                                        on_retry_event=(lambda why, delay:
                                                        _emit(events, "retry"))
-                                                      if events else None)
+                                                      if events else None,
+                                       preview_events=None if preview_events is None else
+                                       preview_factory(events,
+                                                       lambda i: preview_events)(0))
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr) as e:

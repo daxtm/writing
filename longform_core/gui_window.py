@@ -1279,7 +1279,8 @@ class MainWindow(QMainWindow):
             prep = ro.critique_prepare(self._root, scene, token=token)
             res = ro.critique_generate(
                 self._root, prep, provider_factory=self._seam(),
-                token=token, events=sink)
+                token=token, events=sink,
+                preview_events=lambda ev: None)
             ext = ro.critique_extract(res["raw"])
             return {"prep": prep, "text": ext["text"], "ok": ext["ok"]}
 
@@ -1519,7 +1520,8 @@ class MainWindow(QMainWindow):
                                            token=token)
             res = ro.update_state_generate(
                 self._root, prep, provider_factory=self._seam(),
-                token=token, events=sink)
+                token=token, events=sink,
+                preview_events=lambda ev: None)
             return {"prep": prep, "raw": res["raw"], "finish": res["finish"],
                     "kind": "summary-only" if prep.summary_only else "update"}
 
@@ -1662,7 +1664,7 @@ class MainWindow(QMainWindow):
                 res = ro.compress_generate(
                     self._root, prep,
                     provider_factory=self._seam(), token=token,
-                    events=sink)
+                    events=sink, preview_events=lambda ev: None)
                 return {"prep": prep, "text": res["text"], "ok": res["ok"]}
 
             self._dispatch(fn, kind="compress_generate")
@@ -1671,7 +1673,8 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             res = ro.update_state_generate(
                 self._root, prep, provider_factory=self._seam(),
-                token=token, events=sink)
+                token=token, events=sink,
+                preview_events=lambda ev: None)
             return {"prep": prep, "raw": res["raw"], "finish": res["finish"],
                     "kind": self._cont["kind"]}
 
@@ -1743,7 +1746,8 @@ class MainWindow(QMainWindow):
                                        token=token)
             res = ro.compress_generate(self._root, prep,
                                        provider_factory=self._seam(),
-                                       token=token, events=sink)
+                                       token=token, events=sink,
+                                       preview_events=lambda ev: None)
             return {"prep": prep, "text": res["text"], "ok": res["ok"]}
 
         self._dispatch(fn, kind="compress_generate")
@@ -2196,7 +2200,8 @@ class MainWindow(QMainWindow):
             session = ro.revise_prepare(self._root, scene, token=token)
             res = ro.revise_generate(self._root, session, 0,
                                      provider_factory=self._seam(),
-                                     token=token, events=sink)
+                                     token=token, events=sink,
+                                     preview_events=lambda ev: None)
             return {"session": session, "psg": res}
 
         self._dispatch(fn, kind="revise_generate")
@@ -2338,7 +2343,8 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             res = ro.revise_generate(self._root, session, k,
                                      provider_factory=self._seam(),
-                                     token=token, events=sink)
+                                     token=token, events=sink,
+                                     preview_events=lambda ev: None)
             return {"session": session, "psg": res}
 
         self._dispatch(fn, kind="revise_generate")
@@ -4419,6 +4425,9 @@ class MainWindow(QMainWindow):
         self._op_id += 1
         self._op_kind = kind
         self._op_rows = rows
+        target = self._preview_target()
+        if target:
+            self._clear_op_previews((target,))
         self._view_override = None
         op_id = self._op_id
         self._token = CancellationToken()
@@ -4516,6 +4525,9 @@ class MainWindow(QMainWindow):
             return "scenes"
         if self._op_kind in ("generate", "reroll", "add"):
             return "draft"
+        if self._op_kind in ("continuity_generate", "compress_generate",
+                             "revise_generate", "critique_generate"):
+            return "review"
         return None
 
     def _candidate_states(self):
@@ -4559,6 +4571,19 @@ class MainWindow(QMainWindow):
                 self.scenes_stream.setPlainText(st["text"])
                 bar = self.scenes_stream.verticalScrollBar()
                 bar.setValue(bar.maximum())
+        elif target == "review":
+            st = self._candidate_states().get(1)
+            if st is None or not st["text"]:
+                return
+            if self._op_kind in ("continuity_generate", "compress_generate"):
+                widget = self.continuity_preview
+            elif self._op_kind == "revise_generate":
+                widget = self.revise_view
+            else:
+                widget = self.report_view
+            widget.setPlainText(st["text"])
+            bar = widget.verticalScrollBar()
+            bar.setValue(bar.maximum())
         elif target == "draft":
             states = self._candidate_states()
             cands = sorted(states)
@@ -4606,6 +4631,8 @@ class MainWindow(QMainWindow):
             self.outline_stream.setPlainText("")
         if "scenes" in targets:
             self.scenes_stream.setPlainText("")
+        if "review" in targets:
+            pass   # review panes keep the last completed preview
         if "draft" in targets:
             self.draft_stream_list.blockSignals(True)
             self.draft_stream_list.clear()
@@ -5115,7 +5142,8 @@ class MainWindow(QMainWindow):
                             self._root, value["session"],
                             value["session"].k,
                             provider_factory=self._seam(),
-                            token=token, events=sink)
+                            token=token, events=sink,
+                            preview_events=lambda ev: None)
                         return {"session": value["session"], "psg": r}
 
                     self._dispatch(nxt, kind="revise_generate")
