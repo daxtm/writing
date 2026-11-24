@@ -20,11 +20,12 @@ from .cancel import Cancelled
 from .config import BIBLE_TEMPLATE, DEFAULT_CONFIG, STATE_TEMPLATE
 from .draft_operations import (_advance, _capture, _emit, _project_of,
                                _provider, _read_bytes, _scenes_or_error,
-                               _stale_check, OpError)
+                               _stale_check, OpError, credential_state,
+                               redaction_secrets, scrub_credentials)
 from .reader_model import _no_symlink_below
 from .project import Project
 from .utils import (FatalError, deep_merge, now, read_text, save_input, stamp,
-                    write_text)
+                    write_text, redact_text)
 
 # ------------------------------------------------------- initialization
 
@@ -661,7 +662,8 @@ def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
     except Cancelled:
         raise
     except Exception as e:  # noqa: BLE001 — sanitized outcome
-        raise OpError(f"outline generation failed: {e}", soft=True) from None
+        raise OpError(f"outline generation failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
     ts = stamp()
     existing = 0
     d = p.f("outlines")
@@ -679,7 +681,8 @@ def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
         if not _no_symlink_below(p.root, "outlines", name):
             raise OpError(f"outlines/{name} is a symlink; refusing to write")
         write_text(p.f("outlines", name),
-                   (f"<!-- notes: {notes} -->\n" if notes else "") + body + "\n")
+                   (f"<!-- notes: {notes} -->\n" if notes else "")
+                   + scrub_credentials(p, body, provider) + "\n")
         saved.append(name)
     if not saved:
         warnings.append("no candidates came back")
@@ -1060,7 +1063,9 @@ def generate_scene_cards(root, *, force=False, provider_factory=None,
     except Cancelled:
         raise
     except Exception as e:  # noqa: BLE001 — sanitized outcome
-        raise OpError(f"scene generation failed: {e}", soft=True) from None
+        raise OpError(f"scene generation failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
+    text = scrub_credentials(p, text, provider)
     arr = extract_json_array(text)
     if arr is None or not all(isinstance(x, dict) for x in arr):
         name = f"scenes_raw_{stamp()}.txt"
@@ -1148,12 +1153,14 @@ def _safe_read_json(path, warnings, label):
     return raw
 
 
-def project_overview(root):
+def project_overview(root, *, session=False):
     """Read-only sanitized setup view for the Setup pane (no writes, no calls).
 
     Works for missing directories, empty directories and invalid configs; the
-    only credential facts are the environment name and boolean availability —
-    an existing inline api_key is never echoed or migrated.
+    only credential facts are the environment name, boolean availability and
+    the winning source (session/project/environment/missing) — an existing
+    inline api_key is never echoed or migrated. `session` is the GUI's
+    window-credential availability input (ADR-0011).
     """
     root = canonical_root(root)
     out = {"root": str(root), "exists": root.is_dir(), "config_ok": False,
@@ -1193,11 +1200,12 @@ def project_overview(root):
             out["trees"] = sorted(p.name for p in trees.glob("*.json"))
         except OSError:
             warnings.append("trees/ could not be listed")
-    env = str(cfg.get("api_key_env") or "")
-    out["api_key_env"] = env
-    out["env_set"] = bool(env) and bool(os.environ.get(env, "").strip())
-    out["inline_key"] = bool(str(cfg.get("api_key") or "").strip())
-    out["creds_ok"] = out["inline_key"] or out["env_set"]
+    creds = credential_state(cfg, session=session)
+    out["api_key_env"] = creds["api_key_env"]
+    out["env_set"] = creds["env_set"]
+    out["inline_key"] = creds["inline_key"]
+    out["cred_source"] = creds["source"]
+    out["creds_ok"] = creds["available"]
     preset = str(cfg.get("roles", {}).get("writer", {}).get("preset", "")
                  or "writer_preset.json")
     ppath = Path(preset).expanduser()
@@ -1340,10 +1348,11 @@ def _get_setting(cfg, dotted):
     return "" if v is None else v
 
 
-def settings_state(root):
+def settings_state(root, *, session=False):
     """Read-only settings view: supported values (merged with defaults),
-    credential name/availability booleans, ignored-sampler warnings and the
-    unknown fields the patch must preserve. Never includes a key value."""
+    credential name/availability/source booleans, ignored-sampler warnings
+    and the unknown fields the patch must preserve. Never includes a key
+    value or the environment value (ADR-0011)."""
     root = canonical_root(root)
     p = _project_of(root)
     raw = _read_bytes(p.f("project.json"), "project.json")
@@ -1373,13 +1382,12 @@ def settings_state(root):
                         " are preserved but have no control here (not sent "
                         "to the provider)")
     unknown = _unknown_paths(parsed)
-    env = str(cfg.get("api_key_env") or "")
+    creds = credential_state(cfg, session=session)
     state = {"root": str(root), "values": values, "warnings": warnings,
-             "unknown_fields": unknown, "api_key_env": env,
-             "env_set": bool(env) and bool(os.environ.get(env, "").strip()),
-             "inline_key": bool(str(cfg.get("api_key") or "").strip()),
-             "env_value": os.environ.get(env, "") if env else ""}
-    state["creds_ok"] = state["inline_key"] or state["env_set"]
+             "unknown_fields": unknown, "api_key_env": creds["api_key_env"],
+             "env_set": creds["env_set"], "inline_key": creds["inline_key"],
+             "cred_source": creds["source"]}
+    state["creds_ok"] = creds["available"]
     return state
 
 
@@ -1586,28 +1594,24 @@ _SECRET_KEY_RE = re.compile(r"api[-_]?key|secret|authorization|bearer",
                             re.I)
 
 
-def _scrub_text(p, text):
-    """Remove resolved credential values from provider text (GUI only)."""
-    key = str(p.cfg.get("api_key") or "").strip()
-    env = str(p.cfg.get("api_key_env") or "")
-    envval = os.environ.get(env, "").strip() if env else ""
-    out = text or ""
-    for secret in (key, envval):
-        if secret:
-            out = out.replace(secret, "[redacted]")
-    return out
+def _scrub_text(p, text, provider=None):
+    """Remove resolved credential values from provider text (GUI only).
+
+    Knows every nonempty source (session override, saved-project key,
+    configured environment value), not only the winning one (ADR-0011)."""
+    return scrub_credentials(p, text, provider)
 
 
-def _sanitize_raw(obj, p=None):
+def _sanitize_raw(obj, p=None, provider=None):
     """Drop credential-ish keys and scrub resolved secrets from model
     metadata before GUI display (limits.json keeps the CLI shape)."""
     if isinstance(obj, dict):
-        return {k: _sanitize_raw(v, p) for k, v in obj.items()
+        return {k: _sanitize_raw(v, p, provider) for k, v in obj.items()
                 if not _SECRET_KEY_RE.search(str(k))}
     if isinstance(obj, list):
-        return [_sanitize_raw(x, p) for x in obj]
+        return [_sanitize_raw(x, p, provider) for x in obj]
     if isinstance(obj, str) and p is not None:
-        return _scrub_text(p, obj)
+        return _scrub_text(p, obj, provider)
     return obj
 
 
@@ -1619,16 +1623,19 @@ def _first_int(d, keys):
     return None
 
 
-def fetch_limits(root, *, provider_factory=None, token=None, events=None):
+def fetch_limits(root, *, provider_factory=None, token=None, events=None,
+                 session=False):
     """Explicit limits fetch through the shared Api (CLI `limits`).
 
     One /plan request and one /models/<id> lookup per distinct configured
     model; 404 is a found:false result, transport/plan/unexpected failures or
-    Stop keep the previous limits.json. The saved shape matches cmd_limits."""
+    Stop keep the previous limits.json. The saved shape matches cmd_limits.
+    `session` is the GUI's window-credential availability input (ADR-0011):
+    it satisfies the missing-key guard without touching config/environment."""
     p = _project_of(root)
-    key = str(p.cfg.get("api_key") or "").strip()
-    env = str(p.cfg.get("api_key_env") or "")
-    if not key and not (env and os.environ.get(env, "").strip()):
+    creds = credential_state(p.cfg, session=session)
+    if not creds["available"]:
+        env = creds["api_key_env"]
         raise OpError(
             f'no API key: set "api_key" in project.json, or export {env}=...',
             soft=True)
@@ -1646,7 +1653,7 @@ def fetch_limits(root, *, provider_factory=None, token=None, events=None):
     except Cancelled:
         raise
     except Exception as e:  # noqa: BLE001 — sanitized outcome, file untouched
-        raise OpError(f"limits fetch failed: {_scrub_text(p, str(e))}",
+        raise OpError(f"limits fetch failed: {_scrub_text(p, str(e), provider)}",
                       soft=True) from None
     out = {"fetched": now(), "plan": plan, "models": {}}
     _emit(events, "plan_fetched", plan_max=(
@@ -1668,11 +1675,11 @@ def fetch_limits(root, *, provider_factory=None, token=None, events=None):
                 entry = None   # a model 404 is a found:false result
             else:
                 raise OpError(f"limits fetch failed: "
-                              f"{_scrub_text(p, str(e))}", soft=True) from None
+                              f"{_scrub_text(p, str(e), provider)}", soft=True) from None
         except Cancelled:
             raise
         except Exception as e:  # noqa: BLE001
-            raise OpError(f"limits fetch failed: {_scrub_text(p, str(e))}",
+            raise OpError(f"limits fetch failed: {_scrub_text(p, str(e), provider)}",
                           soft=True) from None
         if isinstance(entry, dict) and "id" not in entry and entry.get("data"):
             d = entry["data"]
@@ -1711,7 +1718,7 @@ def fetch_limits(root, *, provider_factory=None, token=None, events=None):
             "role": role, "model": rc["model"], "found": m["found"],
             "context": m.get("context"), "max_completion": m.get("max_completion"),
             "available": m.get("available_on_current_plan"),
-            "raw": _sanitize_raw(m.get("raw"), p) if m["found"] else None,
+            "raw": _sanitize_raw(m.get("raw"), p, provider) if m["found"] else None,
         })
     _emit(events, "limits_saved")
     return {"saved": str(p.f("limits.json")), "view": view,

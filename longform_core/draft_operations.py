@@ -21,7 +21,8 @@ from .lore import is_present, Lore, pov_name
 from .prompt import build_writer_prompt, clean_continuation, format_card, writer_sampling
 from .reader_model import _no_symlink_below
 from .tree import Tree
-from .utils import FatalError, keep_lead, now, write_text
+from .utils import (FatalError, keep_lead, now, redact_text, write_text,
+                    StreamRedactor)
 
 
 class OpError(Exception):
@@ -96,6 +97,47 @@ def _provider(p, factory):
         return (factory or (lambda pp: Api(pp)))(p)
     except FatalError as e:
         raise OpError(str(e.msg), from_die=True) from None
+
+
+def credential_state(cfg, session=False):
+    """Availability-only credential facts (ADR-0011): effective source
+    ('session'|'project'|'environment'|'missing') and booleans; never a key
+    value. `session` is the GUI's window-override availability input."""
+    key = str(cfg.get("api_key") or "").strip()
+    env = str(cfg.get("api_key_env") or "")
+    env_set = bool(env) and bool(os.environ.get(env, "").strip())
+    if session:
+        source = "session"
+    elif key:
+        source = "project"
+    elif env_set:
+        source = "environment"
+    else:
+        source = "missing"
+    return {"available": source != "missing", "source": source,
+            "api_key_env": env, "inline_key": bool(key), "env_set": env_set}
+
+
+def redaction_secrets(p, provider=None):
+    """Every nonempty credential value this call knows (session, saved
+    project, configured environment) for scrubbing echoes; provider objects
+    built by the GUI window carry the full context in `secrets`."""
+    vals = []
+    for v in (getattr(provider, "secrets", None) or ()):
+        if v and v not in vals:
+            vals.append(v)
+    key = str(p.cfg.get("api_key") or "").strip()
+    env = str(p.cfg.get("api_key_env") or "")
+    envval = os.environ.get(env, "").strip() if env else ""
+    for v in (key, envval):
+        if v and v not in vals:
+            vals.append(v)
+    return tuple(vals)
+
+
+def scrub_credentials(p, text, provider=None):
+    """Redact all known credential values from one text (errors, echoes)."""
+    return redact_text(text or "", redaction_secrets(p, provider))
 
 
 def _find_idx(scenes, scene_id):
@@ -238,10 +280,15 @@ def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
     try:
         if count == 1:
             _emit(events, "stream_start")
+            red = StreamRedactor(redaction_secrets(p, provider))
             results = [provider.complete("writer", prompt, params, extra,
-                                         stream_cb=(lambda t: _emit(events, "delta", text=t)) if events else None,
+                                         stream_cb=(lambda t: _emit(events, "delta",
+                                                                    text=red.feed(t))) if events else None,
                                          meta=meta, token=token,
                                          on_retry_event=(lambda kind: _emit(events, kind)) if events else None)]
+            rest = red.flush()
+            if rest and events:
+                _emit(events, "delta", text=rest)
             _emit(events, "stream_end")
             streamed = True
         else:
@@ -253,13 +300,15 @@ def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr, httpx.HTTPError, FatalError) as e:
-        raise OpError(f"generation failed: {e}", soft=True) from None
+        raise OpError(f"generation failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
     _advance(p, baseline, "calib.json")   # our own calls may record calibration
     ids = []
+    secrets = redaction_secrets(p, provider)
     for text, finish, _ in results:
         if token:
             token.check()
-        clean, ended, trimmed = clean_continuation(text, finish, rep["continuing"])
+        clean, ended, trimmed = clean_continuation(redact_text(text, secrets), finish, rep["continuing"])
         if not clean.strip():
             _emit(events, "skipped_empty")
             continue
@@ -638,13 +687,15 @@ def lore_import(root, src, scene_id=None, replace=False, *, token=None, events=N
 
 # ------------------------------------------------------ session/inspection
 
-def session_info(root, scene_id=None):
+def session_info(root, scene_id=None, *, session=False):
     """Plain session defaults and prerequisite/warning report (no calls).
 
     `warnings` holds ignored project sampler keys and earlier-scene warnings;
     `sampler_warnings` holds preset sampler notes. The CLI prints warnings,
     then its preset line, then sampler warnings — keep that order when
-    adapting; the GUI shows both lists combined."""
+    adapting; the GUI shows both lists combined. `session` is the GUI's
+    window-credential availability input (ADR-0011); only availability facts
+    are reported, never a key value."""
     info = {"swipes": 1, "passage_words": 220, "model": "", "preset_found": False,
             "creds_ok": False, "api_key_env": "", "warnings": [],
             "sampler_warnings": [], "scene_ok": False}
@@ -653,12 +704,9 @@ def session_info(root, scene_id=None):
     rc = p.cfg["roles"]["writer"]
     info.update(swipes=max(1, int(rc.get("swipes", 1))),
                 passage_words=int(rc.get("passage_words", 220)), model=rc["model"])
-    key = str(p.cfg.get("api_key") or "").strip()
-    env = str(p.cfg.get("api_key_env") or "")
-    info["api_key_env"] = env
-    if not key and env and os.environ.get(env, "").strip():
-        key = "env"
-    info["creds_ok"] = bool(key)
+    creds = credential_state(p.cfg, session=session)
+    info.update(api_key_env=creds["api_key_env"], cred_source=creds["source"])
+    info["creds_ok"] = creds["available"]
     stale = [k for k in SAMPLING_KEYS if k in rc]
     if stale:
         info["warnings"].append("writer keys " + ", ".join(stale)

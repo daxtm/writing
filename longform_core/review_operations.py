@@ -21,7 +21,7 @@ from .checks import check_report
 from .config import CRITIC_SYSTEM, EDITOR_SYSTEM, SUMMARIZER_SYSTEM
 from .draft_operations import (OpError, _advance, _capture, _check_tree_writable,
                                _emit, _project_of, _provider, _save_tree,
-                               _stale_check, _tree)
+                               _stale_check, _tree, scrub_credentials)
 from .prompt import format_card, layered_summary
 from .reader_model import _no_symlink_below
 from .tree import Tree
@@ -144,8 +144,10 @@ def compress_generate(root, prep, *, provider=None, provider_factory=None,
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr) as e:
-        raise OpError(f"summarizer failed: {e}", soft=True) from None
+        raise OpError(f"summarizer failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
     _advance(p, prep.baseline, "calib.json")
+    raw = scrub_credentials(p, raw, provider)
     text, ok = extract_tagged(raw, "summary")
     return {"text": text, "ok": ok, "raw": raw,
             "from": prep.from_id, "to": prep.to_id}
@@ -273,9 +275,11 @@ def critique_generate(root, prep, *, provider=None, provider_factory=None,
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr) as e:
-        raise OpError(f"critic failed: {e}", soft=True) from None
+        raise OpError(f"critic failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
     _advance(p, prep.baseline, "calib.json")
-    return {"raw": raw, "finish": finish, "scene": prep.scene_id}
+    return {"raw": scrub_credentials(p, raw, provider), "finish": finish,
+            "scene": prep.scene_id}
 
 
 def critique_save(root, prep, text, *, baseline=None, token=None, events=None):
@@ -509,8 +513,10 @@ def revise_generate(root, session, k, *, provider=None, provider_factory=None,
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr) as e:
-        raise OpError(f"editor failed: {e}", soft=True) from None
+        raise OpError(f"editor failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
     _advance(p, session.baseline, "calib.json")
+    raw = scrub_credentials(p, raw, provider)
     text, ok = extract_tagged(raw, "passage")
     return dict(psg, text=text, ok=ok, finish=finish)
 
@@ -895,9 +901,11 @@ def update_state_generate(root, prep, *, provider_factory=None, provider=None,
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr) as e:
-        raise OpError(f"summarizer failed: {e}", soft=True) from None
+        raise OpError(f"summarizer failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
     _advance(p, prep.baseline, "calib.json")
-    return {"raw": raw, "finish": finish, "scene": prep.scene_id}
+    return {"raw": scrub_credentials(p, raw, provider), "finish": finish,
+            "scene": prep.scene_id}
 
 
 def update_state_parse_response(raw, prep):

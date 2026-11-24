@@ -710,6 +710,63 @@ def test_fetch_limits_missing_credentials_makes_no_call(tmp_path):
     assert prov.calls == [], "no request without credentials"
 
 
+def test_fetch_limits_session_availability_makes_call_without_disk_key(tmp_path,
+                                                                        monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    root = tmp_path / "p"
+    plan.init_project(root)          # empty api_key, no environment value
+    prov = FakeLimitsProvider(PLAN, {"meta-llama/Llama-3.3-70B-Instruct":
+                                     MODEL_OK})
+    out = plan.fetch_limits(root, provider_factory=lambda p: prov,
+                            session=True)
+    assert ("GET", "/plan") in prov.calls, \
+        "the window session credential satisfies the availability guard"
+    assert (root / "limits.json").is_file()
+    blob = json.dumps(out["view"]) + json.dumps(
+        (root / "limits.json").read_text())
+    assert "session-sentinel" not in blob, "the session key never persists"
+
+
+def test_fetch_limits_prefers_saved_key_over_environment(tmp_path,
+                                                         monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "env-sentinel")
+    root = init_p(tmp_path / "p")     # inline sk-test wins over env
+    prov = FakeLimitsProvider(PLAN, {})
+    plan.fetch_limits(root, provider_factory=lambda p: prov)
+    assert ("GET", "/plan") in prov.calls
+
+
+def test_settings_state_reports_source_and_never_values(tmp_path,
+                                                         monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "env-sentinel")
+    root = tmp_path / "p"
+    plan.init_project(root)
+    st = plan.settings_state(root)
+    assert st["inline_key"] is False and st["env_set"] is True
+    assert st["creds_ok"] is True and st["cred_source"] == "environment"
+    blob = json.dumps(st)
+    assert "env_value" not in blob, "the environment value is not exposed"
+    assert "env-sentinel" not in blob, "no credential value in state"
+    st2 = plan.settings_state(root, session=True)
+    assert st2["cred_source"] == "session" and st2["creds_ok"] is True
+
+
+def test_project_overview_reports_source_and_never_values(tmp_path,
+                                                          monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    root = tmp_path / "p"
+    plan.init_project(root)
+    ov = plan.project_overview(root)
+    assert ov["creds_ok"] is False and ov["cred_source"] == "missing"
+    assert "session-sentinel" not in json.dumps(ov)
+    (root / "project.json").write_text(
+        json.dumps({"api_key": "sk-inline-secret"}), encoding="utf-8")
+    ov2 = plan.project_overview(root)
+    assert ov2["creds_ok"] is True and ov2["cred_source"] == "project"
+    assert "sk-inline-secret" not in json.dumps(ov2), "no key echo"
+    assert ov2["inline_key"] is True
+
+
 def test_fetch_limits_stop_keeps_file(tmp_path):
     from longform_core.cancel import CancellationToken
     root = init_p(tmp_path / "p")

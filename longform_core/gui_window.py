@@ -106,6 +106,7 @@ class MainWindow(QMainWindow):
         self._choice = choice or _ask_choice
         self._timer_factory = timer_factory
         self._provider_factory = provider_factory
+        self._session_key = None      # window-only credential (ADR-0011); never config/environment
         self._picker = picker or self._default_picker
         self._dir_picker = dir_picker or self._default_dir_picker
         self._preset_picker = preset_picker or self._default_preset_picker
@@ -122,7 +123,8 @@ class MainWindow(QMainWindow):
         self._revision = None        # shared revise session + active passage
         self._rev_editing = False
         self._status_facts = None    # last read-only status overview
-        self._plan = plan.project_overview(self._root)
+        self._plan = plan.project_overview(self._root,
+                                           session=self._availability())
 
         self.snap = None              # last valid Snapshot
         self._stale_config = False    # required configuration currently invalid
@@ -173,7 +175,8 @@ class MainWindow(QMainWindow):
         self._scenes_preview_baseline = None
         self._scenes_force_once = False
         try:
-            self._session = dop.session_info(self._root)
+            self._session = dop.session_info(
+                self._root, session=self._availability())
         except dop.OpError as e:
             self._session = {"swipes": 1, "passage_words": 220, "model": "",
                              "preset_found": False, "creds_ok": False,
@@ -189,6 +192,61 @@ class MainWindow(QMainWindow):
         self._start_timer()
 
     # ------------------------------------------------------------------ UI
+
+    def _availability(self):
+        """Availability input for shared ops: this window's session credential
+        (ADR-0011). False lets the ops resolve project then environment."""
+        return bool(self._session_key)
+
+    def _credential_secrets(self):
+        """Every nonempty credential value this window knows (session,
+        saved project, configured environment) for redaction before events,
+        logs and persistence (ADR-0011). Never returned to callers that
+        display text."""
+        vals = []
+        if self._session_key:
+            vals.append(self._session_key)
+        try:
+            p = dop._project_of(plan.canonical_root(self._root))
+            for v in dop.redaction_secrets(p):
+                if v and v not in vals:
+                    vals.append(v)
+        except Exception:  # noqa: BLE001 — invalid config still redacts the session value
+            pass
+        return tuple(vals)
+
+    def _seam(self):
+        """Provider factory for this window's provider calls (ADR-0007 and
+        ADR-0011): captures the current session credential and redaction
+        context before dispatch. The production wrapper constructs `Api`
+        with the session override; an injected test factory stays usable and
+        is annotated with the same redaction context. No session means the
+        unchanged factory-or-Api behavior."""
+        base = self._provider_factory
+        if not self._session_key:
+            return base
+        session = self._session_key
+        secrets = self._credential_secrets()
+
+        def factory(p):
+            from .api import Api
+            if base is not None:
+                provider = base(p)
+            else:
+                provider = Api(p, session_key=session)
+            if isinstance(provider, Api) and provider.session_key != session:
+                provider = Api(p, session_key=session)
+            try:
+                provider.secrets = secrets
+            except AttributeError:
+                pass
+            if hasattr(provider, "session_key"):
+                try:
+                    provider.session_key = session
+                except AttributeError:
+                    pass
+            return provider
+        return factory
 
     def _build_ui(self):
         central = QWidget()
@@ -1200,7 +1258,7 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             prep = ro.critique_prepare(self._root, scene, token=token)
             res = ro.critique_generate(
-                self._root, prep, provider_factory=self._provider_factory,
+                self._root, prep, provider_factory=self._seam(),
                 token=token, events=sink)
             ext = ro.critique_extract(res["raw"])
             return {"prep": prep, "text": ext["text"], "ok": ext["ok"]}
@@ -1440,7 +1498,7 @@ class MainWindow(QMainWindow):
             prep = ro.update_state_prepare(self._root, scene_id, summary_only,
                                            token=token)
             res = ro.update_state_generate(
-                self._root, prep, provider_factory=self._provider_factory,
+                self._root, prep, provider_factory=self._seam(),
                 token=token, events=sink)
             return {"prep": prep, "raw": res["raw"], "finish": res["finish"],
                     "kind": "summary-only" if prep.summary_only else "update"}
@@ -1583,7 +1641,7 @@ class MainWindow(QMainWindow):
             def fn(sink, token):
                 res = ro.compress_generate(
                     self._root, prep,
-                    provider_factory=self._provider_factory, token=token,
+                    provider_factory=self._seam(), token=token,
                     events=sink)
                 return {"prep": prep, "text": res["text"], "ok": res["ok"]}
 
@@ -1592,7 +1650,7 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             res = ro.update_state_generate(
-                self._root, prep, provider_factory=self._provider_factory,
+                self._root, prep, provider_factory=self._seam(),
                 token=token, events=sink)
             return {"prep": prep, "raw": res["raw"], "finish": res["finish"],
                     "kind": self._cont["kind"]}
@@ -1664,7 +1722,7 @@ class MainWindow(QMainWindow):
             prep = ro.compress_prepare(self._root, lo, hi, replace=replace,
                                        token=token)
             res = ro.compress_generate(self._root, prep,
-                                       provider_factory=self._provider_factory,
+                                       provider_factory=self._seam(),
                                        token=token, events=sink)
             return {"prep": prep, "text": res["text"], "ok": res["ok"]}
 
@@ -2117,7 +2175,7 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             session = ro.revise_prepare(self._root, scene, token=token)
             res = ro.revise_generate(self._root, session, 0,
-                                     provider_factory=self._provider_factory,
+                                     provider_factory=self._seam(),
                                      token=token, events=sink)
             return {"session": session, "psg": res}
 
@@ -2136,7 +2194,7 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             res = ro.revise_generate(self._root, session, session.k,
-                                     provider_factory=self._provider_factory,
+                                     provider_factory=self._seam(),
                                      token=token, events=sink)
             return {"session": session, "psg": res}
 
@@ -2259,7 +2317,7 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             res = ro.revise_generate(self._root, session, k,
-                                     provider_factory=self._provider_factory,
+                                     provider_factory=self._seam(),
                                      token=token, events=sink)
             return {"session": session, "psg": res}
 
@@ -2489,7 +2547,7 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             return plan.generate_scene_cards(
                 root, force=force,
-                provider_factory=self._provider_factory, token=token,
+                provider_factory=self._seam(), token=token,
                 events=sink)
 
         self._dispatch(fn, kind="scenes_generate")
@@ -2793,7 +2851,7 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             return plan.generate_outlines(root, notes_form, n,
-                                          provider_factory=self._provider_factory,
+                                          provider_factory=self._seam(),
                                           token=token, events=sink)
 
         self._dispatch(fn, kind="outline_generate")
@@ -3346,7 +3404,8 @@ class MainWindow(QMainWindow):
     def _load_settings_form(self):
         """Fill the form from the shared read-only state (no calls)."""
         try:
-            state = plan.settings_state(self._root)
+            state = plan.settings_state(self._root,
+                                        session=self._availability())
         except dop.OpError as e:
             self.settings_note.setText(f"(settings unavailable: {e})")
             return
@@ -3432,7 +3491,8 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             return plan.fetch_limits(
-                root, provider_factory=self._provider_factory,
+                root, provider_factory=self._seam(),
+                session=self._availability(),
                 token=token, events=sink)
 
         self._dispatch(fn, kind="limits")
@@ -3581,7 +3641,8 @@ class MainWindow(QMainWindow):
             return   # the save settles first; settlement continues the Open
         self._pending_action = None
         if target == plan.canonical_root(self._root):
-            self._plan = plan.project_overview(target)
+            self._plan = plan.project_overview(target,
+                                               session=self._availability())
             self.refresh(force=True)
             self._status("Reopened the current project.")
             return
@@ -3606,7 +3667,8 @@ class MainWindow(QMainWindow):
         self._view_override = None
         self._draft_left = False
         self._stale_config = False
-        self._plan = plan.project_overview(self._root)
+        self._plan = plan.project_overview(self._root,
+                                           session=self._availability())
         self._bible_overview = None
         self._bible_session = False
         self._bible_heading = None
@@ -3806,12 +3868,14 @@ class MainWindow(QMainWindow):
     def refresh(self, force=False):
         """Reload the snapshot; preserve selection, tab, scroll, focus, dirty."""
         if force:
-            self._plan = plan.project_overview(self._root)
+            self._plan = plan.project_overview(self._root,
+                                               session=self._availability())
             self._refresh_bible_overview()
             self._refresh_outline_overview()
             self._refresh_scenes_overview()
             try:
-                self._session = dop.session_info(self._root)
+                self._session = dop.session_info(
+                    self._root, session=self._availability())
             except dop.OpError:
                 pass   # keep the last known session facts
         self._update_setup_tab()
@@ -4600,7 +4664,7 @@ class MainWindow(QMainWindow):
                         r = ro.revise_generate(
                             self._root, value["session"],
                             value["session"].k,
-                            provider_factory=self._provider_factory,
+                            provider_factory=self._seam(),
                             token=token, events=sink)
                         return {"session": value["session"], "psg": r}
 
@@ -4752,7 +4816,7 @@ class MainWindow(QMainWindow):
             return dop.generate_candidates(
                 self._root, self._batch["scene"], count=count,
                 parent=self._batch["parent"],
-                provider_factory=self._provider_factory, token=token,
+                provider_factory=self._seam(), token=token,
                 events=sink)
 
         self._dispatch(fn, kind=kind, rows=rows)
@@ -4968,7 +5032,7 @@ class MainWindow(QMainWindow):
             return dop.generate_candidates(
                 self._root, scene, count=self.count_spin.value(),
                 passage_words=self.length_spin.value(),
-                provider_factory=self._provider_factory, token=token,
+                provider_factory=self._seam(), token=token,
                 events=sink)
 
         self._dispatch(fn)

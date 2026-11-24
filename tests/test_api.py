@@ -24,8 +24,10 @@ ROLES = {
 
 CFG = {
     "api_key": "test-key-123",
+    "api_key_env": "FEATHERLESS_API_KEY",
     "api_base": BASE,
     "request_timeout_s": 10,
+    "max_parallel": 2,
     "roles": ROLES,
 }
 
@@ -92,9 +94,9 @@ def bodies(calls):
     return calls
 
 
-def make_api(mock_http, handler, p=None):
+def make_api(mock_http, handler, p=None, session_key=None):
     mock_http(handler)
-    return longform.Api(p or FakeP())
+    return longform.Api(p or FakeP(), session_key=session_key)
 
 
 # --------------------------------------------------------------------------- GET and retries
@@ -350,3 +352,162 @@ def test_complete_non_extra_400_propagates(mock_http, api_env):
 def test_unexpected_real_network_is_blocked():
     with pytest.raises(AssertionError, match="real network access"):
         httpx.get("https://api.example.invalid/v1/plan")
+
+
+# ------------------------------------------------------- session credential (ADR-0011)
+
+
+def test_session_override_wins_over_project_and_environment(mock_http, monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "env-sentinel-2")
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return json_response({"plan": True})
+
+    api = make_api(mock_http, handler, session_key="  session-sentinel-1  ")
+    api.get("/plan")
+    assert seen == ["Bearer session-sentinel-1"], \
+        "session > project > environment; the value is trimmed"
+    assert api.cred_source == "session"
+    assert api.session_key == "session-sentinel-1"
+    assert set(api.secrets) == {"session-sentinel-1", "test-key-123",
+                                "env-sentinel-2"}, \
+        "redaction covers every nonempty source, not only the winner"
+    assert mock_http.calls == [("GET", BASE + "/plan")]
+
+
+def test_no_override_prefers_project_then_environment(mock_http, monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "env-sentinel-2")
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return json_response({"plan": True})
+
+    api = make_api(mock_http, handler)          # project key wins over env
+    api.get("/plan")
+    assert seen == ["Bearer test-key-123"]
+    assert api.cred_source == "project"
+
+    cfg = json.loads(json.dumps(CFG))
+    cfg["api_key"] = ""
+    api2 = make_api(mock_http, handler, FakeP(cfg))   # environment fallback
+    api2.get("/plan")
+    assert seen[-1] == "Bearer env-sentinel-2"
+    assert api2.cred_source == "environment"
+    assert "env-sentinel-2" in api2.secrets and "test-key-123" not in api2.secrets
+
+
+def test_empty_session_key_keeps_no_override_behavior(mock_http):
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return json_response({"plan": True})
+
+    api = make_api(mock_http, handler, session_key="   ")
+    api.get("/plan")
+    assert seen == ["Bearer test-key-123"]
+    assert api.session_key is None and api.cred_source == "project"
+
+
+def test_no_override_missing_key_dies_unchanged(mock_http, monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    cfg = json.loads(json.dumps(CFG))
+    cfg["api_key"] = ""
+    mock_http(lambda request: json_response({}))
+    with pytest.raises(SystemExit) as e:
+        longform.Api(FakeP(cfg))
+    assert "no API key" in getattr(e.value, "msg", "")
+
+
+def test_no_override_invalid_env_name_dies_unchanged(mock_http):
+    cfg = json.loads(json.dumps(CFG))
+    cfg["api_key"] = ""
+    cfg["api_key_env"] = "sk-not-a-name"
+    mock_http(lambda request: json_response({}))
+    with pytest.raises(SystemExit) as e:
+        longform.Api(FakeP(cfg))
+    assert "must be the NAME" in getattr(e.value, "msg", "")
+
+
+def test_session_override_never_dies_on_missing_disk_credentials(mock_http):
+    cfg = json.loads(json.dumps(CFG))
+    cfg["api_key"] = ""
+    cfg["api_key_env"] = "FEATHERLESS_API_KEY"
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Authorization"])
+        return json_response({"plan": True})
+
+    api = make_api(mock_http, handler, FakeP(cfg), session_key="sess")
+    api.get("/plan")
+    assert seen == ["Bearer sess"]
+
+
+def test_http_error_body_echoing_credentials_is_redacted(mock_http, monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "env-sentinel-2")
+
+    def handler(request):
+        return json_response(
+            {"error": "bad key test-key-123 / env-sentinel-2"}, status=403)
+
+    api = make_api(mock_http, handler, session_key="session-sentinel-1")
+    with pytest.raises(longform.HttpErr) as e:
+        api.get("/plan")
+    msg = str(e.value)
+    assert "[redacted]" in msg
+    for s in ("session-sentinel-1", "test-key-123", "env-sentinel-2"):
+        assert s not in msg
+
+
+def test_chat_log_and_result_echoes_are_redacted(mock_http):
+    def handler(request):
+        return sse(delta_chunk({"content": "key echo test-key-123 mid"},
+                               finish="stop", usage={"prompt_tokens": 3}))
+
+    api = make_api(mock_http, handler, session_key="session-sentinel-1")
+    answer, _, _ = api.chat("quietrole", [{"role": "user", "content": "q"}],
+                            progress=False)
+    assert answer == "key echo [redacted] mid"
+    rec = api.p.logs[0]
+    blob = json.dumps(rec)
+    assert "test-key-123" not in blob and "session-sentinel-1" not in blob
+    assert rec["output"] == "key echo [redacted] mid"
+
+
+def test_streamed_split_secret_is_never_emitted(mock_http):
+    def handler(request):
+        return sse(text_chunk("before test-key-"),
+                   text_chunk("123 after", finish="stop",
+                              usage={"prompt_tokens": 2}))
+
+    api = make_api(mock_http, handler)   # project credential sk-test... wait
+    got = []
+    text, _, _ = api.complete("writer", "PROMPT", {}, stream_cb=got.append)
+    joined = "".join(got)
+    assert "test-key-123" not in joined, "a split secret never reaches the callback"
+    assert "before " in joined and " after" in joined
+    assert "test-key-123" not in text
+    assert "[redacted]" in text
+    blob = json.dumps(api.p.logs[0])
+    assert "test-key-123" not in blob
+
+
+def test_candidate_failure_echo_is_redacted(mock_http):
+    def handler(request):
+        raise httpx.ConnectError("boom test-key-123", request=request)
+
+    api = make_api(mock_http, handler)
+    events = []
+
+    def fn():
+        raise RuntimeError("echoed test-key-123 inside failure")
+
+    out = api.many(fn, 1, on_event=events.append)
+    assert out == []
+    why = events[0]["why"]
+    assert "test-key-123" not in why and "[redacted]" in why
+    assert api.p.logs[0]["candidate_failed"] == why

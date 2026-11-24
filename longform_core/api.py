@@ -11,7 +11,7 @@ import httpx
 
 from .cancel import Cancelled
 from .config import LOCK, RETRY_STATUS, SAMPLING_KEYS
-from .utils import col, die, now, warn
+from .utils import col, die, now, redact_obj, redact_text, warn, StreamRedactor
 
 class HttpErr(Exception):
     def __init__(self, status, body):
@@ -65,17 +65,38 @@ class Progress:
 
 
 class Api:
-    def __init__(self, p):
+    def __init__(self, p, session_key=None):
+        """HTTP client for one project's credential chain (ADR-0011).
+
+        The effective key is the optional window `session_key` first, then
+        the project's inline `api_key`, then the configured environment
+        variable — without mutating config or environment. `session_key=None`
+        (or empty) keeps the unchanged no-override CLI behavior, including
+        its missing-key diagnostics. Every nonempty source value is kept in
+        `secrets` so echoed credentials can be redacted before logging."""
         self.p = p
-        key = str(p.cfg.get("api_key") or "").strip()
-        if not key:
-            env = str(p.cfg.get("api_key_env") or "")
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env):
+        self.session_key = str(session_key or "").strip() or None
+        project_key = str(p.cfg.get("api_key") or "").strip()
+        env = str(p.cfg.get("api_key_env") or "")
+        env_ok = bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env))
+        envval = os.environ.get(env, "").strip() if env and env_ok else ""
+        if self.session_key:
+            key = self.session_key
+        elif project_key:
+            key = project_key
+        elif env_ok and envval:
+            key = envval
+        else:
+            if env and not env_ok:
                 die('project.json "api_key_env" must be the NAME of an environment variable (e.g. FEATHERLESS_API_KEY), '
                     'not the key itself. Put the key in "api_key" instead.')
-            key = os.environ.get(env, "").strip()
-            if not key:
-                die(f'no API key: set "api_key" in {p.f("project.json")}, or export {env}=...')
+            die(f'no API key: set "api_key" in {p.f("project.json")}, or export {env}=...')
+        self.auth_key = key
+        self.cred_source = ("session" if self.session_key
+                            else "project" if project_key
+                            else "environment")
+        self.secrets = tuple(s for s in (self.session_key, project_key, envval)
+                             if s)
         self.base = p.cfg["api_base"].rstrip("/")
         self.headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         self.timeout = httpx.Timeout(float(p.cfg["request_timeout_s"]), connect=30.0)
@@ -90,7 +111,7 @@ class Api:
         def once():
             r = httpx.get(self.base + path, headers=self.headers, timeout=self.timeout)
             if r.status_code != 200:
-                raise HttpErr(r.status_code, r.text)
+                raise HttpErr(r.status_code, redact_text(r.text, self.secrets))
             return r.json()
         if on_retry_event is not None:
             return self._retry(once, lambda why, delay: on_retry_event(why, delay),
@@ -129,10 +150,11 @@ class Api:
         Returns (content, finish_reason, usage, reasoning, bad_chunks)."""
         parts, rparts, bad, finish, usage = [], [], [], None, {}
         closed = False
+        red = StreamRedactor(self.secrets)
         with httpx.stream("POST", url, headers=self.headers, json=dict(body, stream=True), timeout=self.timeout) as r:
             if r.status_code != 200:
                 r.read()
-                raise HttpErr(r.status_code, r.text)
+                raise HttpErr(r.status_code, redact_text(r.text, self.secrets))
             for line in r.iter_lines():
                 if token:
                     token.check()
@@ -144,7 +166,7 @@ class Api:
                 try:
                     j = json.loads(data)
                 except json.JSONDecodeError:
-                    bad.append(data)
+                    bad.append(redact_text(data, self.secrets))
                     continue
                 if j.get("usage"):
                     usage = j["usage"]
@@ -162,13 +184,20 @@ class Api:
                 if t:
                     parts.append(t)
                     if stream_cb:
-                        stream_cb(t)
+                        out = red.feed(t)
+                        if out:
+                            stream_cb(out)
                     if progress:
                         if thinking and not closed and "</think>" in "".join(parts[-50:]).lower():
                             closed = True
                         progress("thinking" if thinking and not closed else "answer", len(t))
                 if chs[0].get("finish_reason"):
                     finish = chs[0]["finish_reason"]
+            # a withheld potential secret-prefix suffix is emitted (or
+            # retracted) once the stream is over — never an unsafe prefix
+            rest = red.flush()
+            if rest and stream_cb:
+                stream_cb(rest)
         return "".join(parts), finish, usage, "".join(rparts), bad
 
     def _report_stream_problems(self, role, finish, bad):
@@ -222,17 +251,19 @@ class Api:
         finally:
             if prog:
                 prog.done()
+        content = redact_text(content, self.secrets)
+        reasoning = redact_text(reasoning, self.secrets)
         stream_notes = self._report_stream_problems(role, finish, bad)
         answer, thought, closed = split_thinking(content, reasoning)
         if thinking_on and not reasoning and "</think>" not in content.lower() and finish == "length":
             answer, thought, closed = "", content, False  # template opened <think>; the model never closed it
         self.p.record_calib(rc["model"], sum(len(m["content"]) for m in messages), usage.get("prompt_tokens"))
-        self.p.log_call({
+        self.p.log_call(redact_obj({
             "time": now(), "role": role, "model": rc["model"], "endpoint": "chat", "seconds": round(time.time() - t0, 1),
             "params": {k: v for k, v in body.items() if k not in ("messages", "model")},
             "messages": messages, "output": answer, "thinking": thought, "raw_content": content,
             "finish_reason": finish, "usage": usage, "stream_problems": stream_notes, "bad_chunks": bad,
-        })
+        }, self.secrets))
         if not answer:
             if not closed:
                 raise NoAnswerErr(
@@ -284,15 +315,16 @@ class Api:
                 text, finish, usage, _, bad = retriable(attempt)
             else:
                 raise
+        text = redact_text(text, self.secrets)
         stream_notes = self._report_stream_problems(role, finish, bad)
         self.p.record_calib(rc["model"], len(prompt), usage.get("prompt_tokens"))
-        self.p.log_call({
+        self.p.log_call(redact_obj({
             "time": now(), "role": role, "model": rc["model"], "endpoint": "completions", "seconds": round(time.time() - t0, 1),
             "params": {k: v for k, v in body.items() if k not in ("prompt", "model")},
             "extra_sent": sent_extra, "extra": extra or {}, "meta": meta or {},
             "prompt": prompt, "output": text, "finish_reason": finish, "usage": usage,
             "stream_problems": stream_notes, "bad_chunks": bad,
-        })
+        }, self.secrets))
         return text, finish, usage
 
     def many(self, fn, n, token=None, on_event=None):
@@ -319,7 +351,7 @@ class Api:
                 except Cancelled:
                     was_cancelled = True
                 except Exception as e:  # noqa: BLE001
-                    why = f"{type(e).__name__}: {e}"
+                    why = f"{type(e).__name__}: {redact_text(str(e), self.secrets)}"
                     self._candidate_event(on_event, f"  candidate {k}/{n} failed: {why}", k, n,
                                           "candidate_failed", "31", why=why)
                     self.p.log_call({"time": now(), "candidate_failed": why})
