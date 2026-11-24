@@ -603,6 +603,93 @@ def test_settings_save_missing_project(tmp_path):
         plan.save_settings(tmp_path / "nope", {"title": "x"})
 
 
+# ------------------------------------------------------- credentials (ADR-0011)
+
+
+def test_save_credential_store_replace_and_clear(tmp_path):
+    root = init_p(tmp_path / "p", cfg={"title": "T", "target_words": 9000})
+    out = plan.save_credential(root, "save", "  sk-new-sentinel  ")
+    cfg = json.loads((root / "project.json").read_text())
+    assert cfg["api_key"] == "sk-new-sentinel", "the value is trimmed"
+    assert cfg["title"] == "T" and cfg["target_words"] == 9000, \
+        "unrelated fields survive"
+    assert out["creds_ok"] is True and out["cred_source"] == "project"
+    assert "sk-new-sentinel" not in json.dumps(out), "no value echo"
+
+    plan.save_credential(root, "replace", "sk-second")
+    assert json.loads((root / "project.json").read_text())["api_key"] == \
+        "sk-second"
+
+    out = plan.save_credential(root, "clear")
+    cfg = json.loads((root / "project.json").read_text())
+    assert cfg["api_key"] == "" and cfg["title"] == "T"
+    assert out["creds_ok"] is False
+    assert "sk-second" not in (root / "project.json").read_text()
+    assert "sk-second" not in json.dumps(out)
+    # no input history or backups carry the old key
+    assert not (root / "inputs").exists() or all(
+        "sk-second" not in f.read_text()
+        for f in (root / "inputs").iterdir() if f.is_file())
+
+
+def test_save_credential_rejects_empty_and_unknown_action(tmp_path):
+    root = init_p(tmp_path / "p")
+    with pytest.raises(OpError) as e:
+        plan.save_credential(root, "save", "   ")
+    assert "no credential value" in str(e.value)
+    assert json.loads((root / "project.json").read_text())["api_key"] == \
+        "sk-test", "a failed save writes nothing"
+    with pytest.raises(OpError, match="unsupported credential action"):
+        plan.save_credential(root, "destroy", "x")
+    with pytest.raises(OpError, match="unsupported credential action"):
+        plan.save_credential(root, "clear-via-save")
+
+
+def test_save_credential_stale_refusal_and_invalid_json(tmp_path):
+    root = init_p(tmp_path / "p", cfg={"title": "mine"})
+    base = plan.settings_baseline(root)
+    (root / "project.json").write_text('{"title": "external"}\n',
+                                       encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.save_credential(root, "save", "sk-x", baseline=base)
+    assert getattr(e.value, "stale", False), "stale save is refused"
+    assert json.loads((root / "project.json").read_text())["title"] == \
+        "external"
+
+    (root / "project.json").write_text("[]", encoding="utf-8")
+    base2 = plan.settings_baseline(root)
+    with pytest.raises(OpError, match="not a JSON object"):
+        plan.save_credential(root, "save", "sk-y", baseline=base2)
+    assert (root / "project.json").read_text() == "[]"
+
+
+def test_save_credential_refuses_symlink_target(tmp_path):
+    root = init_p(tmp_path / "p")
+    (root / "project.json").unlink()
+    other = tmp_path / "elsewhere.json"
+    other.write_text("{}", encoding="utf-8")
+    (root / "project.json").symlink_to(other)
+    with pytest.raises(OpError, match="symlink"):
+        plan.save_credential(root, "save", "sk-x")
+    assert other.read_text() == "{}", "the symlink target is untouched"
+
+
+def test_save_credential_missing_project(tmp_path):
+    with pytest.raises(OpError):
+        plan.save_credential(tmp_path / "nope", "save", "sk-x")
+
+
+def test_save_credential_stop_writes_nothing(tmp_path):
+    from longform_core.cancel import CancellationToken
+    root = init_p(tmp_path / "p")
+    before = (root / "project.json").read_bytes()
+    tok = CancellationToken()
+    tok.cancel()
+    with pytest.raises(Exception):
+        plan.save_credential(root, "save", "sk-x", token=tok)
+    assert (root / "project.json").read_bytes() == before
+
+
 # ---------------------------------------------------------------- limits
 
 class FakeLimitsProvider:

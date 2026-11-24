@@ -1527,6 +1527,58 @@ def settings_baseline(root):
     return _capture(p, ["project.json"])
 
 
+def save_credential(root, action, value=None, *, baseline=None, token=None,
+                    events=None):
+    """Credential-only project.json patch beside save_settings (ADR-0011).
+
+    `action` is "save"/"replace" (store the trimmed value in api_key) or
+    "clear" (write an empty api_key). Only the existing api_key field
+    changes; unrelated fields survive byte-for-byte semantics of the parsed
+    document and no old key is copied into input history or backups. The
+    same baseline capture, parsing, stale and temporary-path safety checks
+    as save_settings apply; refusing leaves disk unchanged. Returns
+    availability/source facts only, never the stored value."""
+    if action not in ("save", "replace", "clear"):
+        raise OpError(f"unsupported credential action: {action}")
+    if action == "clear":
+        value = ""
+    key = str(value or "").strip()
+    if not key and action != "clear":
+        raise OpError("no credential value was provided", soft=True)
+    root = canonical_root(root)
+    p = _project_of(root)
+    if baseline is None:
+        baseline = _capture(p, ["project.json"])
+    if token:
+        token.check()
+    if not _no_symlink_below(p.root, "project.json"):
+        raise OpError("project.json is a symlink; refusing to write")
+    raw = baseline["project.json"]
+    try:
+        parsed = json.loads(raw.decode("utf-8")) if raw is not None else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise OpError("project.json is not valid JSON; not saved") from None
+    if not isinstance(parsed, dict):
+        raise OpError("project.json is not a JSON object; not saved")
+    _stale_check(p, baseline)
+    parsed["api_key"] = key if action in ("save", "replace") else ""
+    data = (json.dumps(parsed, indent=2, ensure_ascii=False) + "\n").encode()
+    try:
+        _write_bytes_safe(p.f("project.json"), data)
+    except OSError as e:
+        raise OpError(f"project.json could not be written "
+                      f"({type(e).__name__})") from None
+    _advance(p, baseline, "project.json")
+    creds = credential_state(parsed)
+    _emit(events, "credential_saved", action=action)
+    return {"action": action,
+            "creds_ok": creds["available"],
+            "cred_source": creds["source"],
+            "api_key_env": creds["api_key_env"],
+            "inline_key": creds["inline_key"],
+            "env_set": creds["env_set"]}
+
+
 def save_settings(root, values, *, baseline=None, token=None, events=None):
     """Validate and commit a settings patch over the original JSON object.
 
