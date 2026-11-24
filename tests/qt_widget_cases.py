@@ -618,12 +618,36 @@ class FakeProvider:
         self.gate = None          # threading.Event: block between chunks when set
         self.fail_after = None    # raise after this many chunks were delivered
         self.fail_on = set()      # call indexes (0-based) that raise
+        self.parallel = False     # many() runs slots concurrently (indexed mode)
 
     def complete(self, role, prompt, params, extra=None, stream_cb=None,
-                 meta=None, token=None, **kw):
+                 meta=None, token=None, preview_events=None, _stream=None,
+                 **kw):
         self.calls.append({"role": role, "prompt": prompt, "params": params,
                            "extra": extra, "meta": meta})
         self.started += 1
+        if token is not None:
+            token.check()
+        if _stream is not None:
+            # paused-stream mode (gui-generated-text-streaming): deliver the
+            # first fragment, block on the shared gate, then finish.
+            first, rest = _stream
+            sub = preview_events
+            if sub:
+                sub({"type": "preview_start", "attempt_id": 1})
+            if token is not None:
+                token.check()
+            if sub:
+                sub({"type": "preview_delta", "attempt_id": 1, "text": first})
+            if self.gate is not None and not self.gate.wait(30):
+                raise AssertionError("fake provider gate never opened")
+            if token is not None:
+                token.check()
+            if sub:
+                sub({"type": "preview_delta", "attempt_id": 1, "text": rest})
+            if sub:
+                sub({"type": "preview_complete", "attempt_id": 1})
+            return first + rest, "stop", {}
         if self.responses is not None:
             i = len(self.calls) - 1
             if i in self.fail_on:
@@ -642,8 +666,31 @@ class FakeProvider:
                 raise RuntimeError("fake provider failed midstream")
         return "".join(out), "stop", {}
 
-    def many(self, fn, n, token=None, on_event=None):
+    def many(self, fn, n, token=None, on_event=None, indexed=None):
         results = []
+        if self.parallel:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            futs = []
+            with ThreadPoolExecutor(max_workers=max(1, n)) as ex:
+                for i in range(n):
+                    if token is not None:
+                        token.check()
+                    futs.append(ex.submit(
+                        indexed(i) if indexed is not None else fn))
+                for k, fut in enumerate(as_completed(futs), 1):
+                    try:
+                        results.append(fut.result())
+                        if on_event:
+                            on_event({"type": "candidate_done", "k": k,
+                                      "n": n})
+                    except longform_core.cancel.Cancelled:
+                        raise
+                    except Exception as e:  # noqa: BLE001  (mirrors Api.many)
+                        if on_event:
+                            on_event({"type": "candidate_failed", "k": k,
+                                      "n": n,
+                                      "why": f"{type(e).__name__}: {e}"})
+            return results
         for k in range(1, n + 1):
             if token is not None:
                 token.check()
@@ -666,8 +713,9 @@ class PlanningFake(FakeProvider):
     Records every request kind so the journey can prove no implicit calls:
     calls holds ("GET", path) and ("chat"/"chat_many", role) tuples."""
 
-    def __init__(self, responses=None, plan=None, models=None):
+    def __init__(self, responses=None, plan=None, models=None, fragments=None):
         super().__init__(responses=responses)
+        self.fragments = list(fragments) if fragments is not None else None
         self.plan = plan if plan is not None else {"max_context_length": 8192,
                                                    "concurrency": 2}
         self.models = dict(models or {})
@@ -693,7 +741,8 @@ class PlanningFake(FakeProvider):
         raise HttpErr(404, '{"error": {"message": "model not found: 404"}}')
 
     def chat(self, role, messages, max_tokens=None, stream_cb=None,
-             progress=True, token=None, on_retry_event=None):
+             progress=True, token=None, on_retry_event=None,
+             preview_events=None, _stream=None):
         self.calls.append(("chat", role))
         self.started += 1
         if token is not None:
@@ -703,14 +752,44 @@ class PlanningFake(FakeProvider):
             if i in self.fail_on:
                 raise RuntimeError(f"fake provider failed call {i}")
             return self.responses[i], "stop", {}
+        if _stream is not None:
+            first, rest = _stream
+            sub = preview_events
+            if sub:
+                sub({"type": "preview_start", "attempt_id": 1})
+            if token is not None:
+                token.check()
+            if sub:
+                sub({"type": "preview_delta", "attempt_id": 1, "text": first})
+            if self.gate is not None and not self.gate.wait(30):
+                raise AssertionError("fake provider gate never opened")
+            if token is not None:
+                token.check()
+            if sub:
+                sub({"type": "preview_delta", "attempt_id": 1, "text": rest})
+            if sub:
+                sub({"type": "preview_complete", "attempt_id": 1})
+            return first + rest, "stop", {}
         return "CHUNK ONE. ", "stop", {}
 
     def chat_many(self, role, messages, n, max_tokens=None, token=None,
-                  on_event=None):
+                  on_event=None, preview_events=None):
         self.calls.append(("chat_many", role))
+        if self.fragments is None and preview_events is None:
+            return self.many(lambda: self.chat(role, messages, max_tokens,
+                                               token=token), n, token=token,
+                             on_event=on_event)
+
+        def indexed(i):
+            first, rest = self.fragments[i]
+            sub = preview_events(i) if preview_events is not None else None
+            return lambda: self.chat(role, messages, max_tokens, token=token,
+                                     preview_events=sub,
+                                     _stream=(first, rest))
+
         return self.many(lambda: self.chat(role, messages, max_tokens,
                                            token=token), n, token=token,
-                         on_event=on_event)
+                         on_event=on_event, indexed=indexed)
 
 
 def _pump(a, cond, limit=6000):
@@ -2121,6 +2200,58 @@ def case_planning_outline(root):
     assert win2.outline_list.count() == 3, "saved candidates listed on reopen"
     assert win2.outline_body_edit.toPlainText() == ""
     win2.close()
+
+
+def case_stream_planning(root):
+    """Paused two-candidate outline generation (gui-generated-text-streaming).
+
+    Both labelled live answer previews show their first fragment while the
+    completion gates are closed and the worker is busy; the gates are always
+    released in finally, and completion binds both saved candidate files."""
+    import longform_core.gui_window as gw
+    a = app()
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    proj = root / "p"
+    (proj / "trees").mkdir(parents=True)
+    _write_json(proj / "project.json", {"api_key": "sk-test"})
+    _write_json(proj / "scenes.json", [])
+    _write_json(proj / "summaries.json", {"scenes": {}, "arcs": []})
+    _write_text(proj / "bible.md", "# Story bible\n\nQuiet town.\n")
+
+    fake = PlanningFake(fragments=[("<outline>ONE BODY", "</outline>"),
+                                   ("<outline>TWO BODY", "</outline>")])
+    fake.parallel = True
+    win = gw.MainWindow(str(proj), choice=_no_dialogs("stream planning"),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.tabs.setCurrentIndex(gw.OUTLINE)
+    assert _pump(a, lambda: not win._busy), "outline overview settles"
+    fake.gate = threading.Event()   # closed: block after the first fragment
+    win.outline_generate_btn.click()
+    try:
+        assert _pump(a, lambda: fake.started >= 2), "both candidates started"
+        assert _pump(a, lambda: win.outline_stream_list.count() == 2), \
+            "two labelled live candidate rows"
+        assert "streaming" in win.outline_stream_list.item(0).text().lower()
+        win.outline_stream_list.setCurrentRow(0)
+        assert _pump(a, lambda: "ONE BODY" in win.outline_stream.toPlainText()), \
+            "candidate 1's fragment is visible while the gate is closed"
+        win.outline_stream_list.setCurrentRow(1)
+        assert _pump(a, lambda: "TWO BODY" in win.outline_stream.toPlainText()), \
+            "candidate 2's fragment is visible while the gate is closed"
+        assert win._busy, "the worker is still busy while the gates are closed"
+        assert not list((proj / "outlines").glob("candidate_*.md")), \
+            "no candidate file exists before completion"
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "the worker settles on release"
+    assert len(win._outline_candidates) == 2
+    texts = [(proj / "outlines" / n).read_text() for n in
+             win._outline_candidates]
+    assert "ONE BODY" in texts[0] and "TWO BODY" in texts[1], \
+        "completion binds each candidate to its own saved file"
+    win.close()
 
 
 def case_planning_scenes(root):
@@ -4312,6 +4443,7 @@ CASES = {
     "case_credentials_redaction": case_credentials_redaction,
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
+    "case_stream_planning": case_stream_planning,
     "case_planning_scenes": case_planning_scenes,
     "case_planning_card_edit": case_planning_card_edit,
     "case_review_update_state": case_review_update_state,
@@ -4323,6 +4455,12 @@ CASES = {
     "case_review_dirty_sources": case_review_dirty_sources,
     "case_review_journey": case_review_journey,
 }
+
+
+# Cases for openspec/changes/gui-generated-text-streaming whose widgets/seams
+# are not implemented yet. Skipped loudly, never silently: a pending case must
+# not count as coverage. Each task that makes a case pass removes its name.
+PENDING_STREAM_CASES = {"case_stream_planning"}
 
 
 def _teardown():
@@ -4360,6 +4498,10 @@ def main(argv):
         return 2
     failures = []
     for name in names:
+        if name in PENDING_STREAM_CASES:
+            print(f"pending {name} (gui-generated-text-streaming seam not "
+                  "implemented yet)")
+            continue
         try:
             with tempfile.TemporaryDirectory() as td:
                 CASES[name](Path(td))
