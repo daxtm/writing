@@ -1650,6 +1650,10 @@ def case_planning_create_open(root):
     assert _pump(a, lambda: not win._busy)
     assert (missing / "project.json").exists() and (missing / "trees").is_dir()
     assert "initialized" in win.status.text().lower()
+    assert "bundled writer_preset.json created" in win.status.text(), \
+        "completion reports the bundled preset as created"
+    assert "writer preset" not in win.generate_note.text().lower(), \
+        "the bundled preset is no longer a missing drafting prerequisite"
     assert win._root == missing
 
     # partial project: existing files are never replaced by a repeated Create
@@ -1704,6 +1708,7 @@ def case_planning_create_open(root):
     assert _pump(a, lambda: not win._busy)
     assert "not valid JSON" in win.status.text()
     assert not (missing / "writer_preset.json").exists()
+    (missing / "writer_preset.json").write_bytes(bundled)
 
     # dirty steering: Save proceeds, Cancel blocks the destructive switch
     _write_json(missing / "scenes.json", [_scene("s001")])
@@ -1736,6 +1741,29 @@ def case_planning_create_open(root):
     assert _pump(a, lambda: not win._busy)
     assert win._root == other, "an invalid Open does not replace the project"
     assert "no valid project.json" in win.status.text()
+
+    # partial-failure Create: a name collision reports the failed path and
+    # completed writes, keeps the current project, and retry fills the rest
+    coll = root / "coll"
+    coll.mkdir()
+    (coll / "writer_preset.json").mkdir()   # collision, not a regular file
+    dir_picks[:] = [str(coll)]
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "not a regular file" in win.status.text()
+    assert "created before the error" in win.status.text(), \
+        "completed writes are reported truthfully"
+    assert win._root == other, "a failed Create never rebinds the project"
+    assert (coll / "project.json").is_file() and (coll / "trees").is_dir()
+    (coll / "writer_preset.json").rmdir()
+    dir_picks[:] = [str(coll)]
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win._root == coll, "retry after correction binds the new project"
+    assert "writer_preset.json" in win.status.text()
+    assert "bundled writer_preset.json created" in win.status.text()
+    assert json.loads((coll / "project.json").read_text())["title"] == \
+        "Untitled", "defaults do not inherit old-project settings"
 
     # open a valid project
     dir_picks[:] = [str(missing)]

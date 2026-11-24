@@ -4210,6 +4210,12 @@ class MainWindow(QMainWindow):
             self._status(f"revised {changed} passages — stopped; remaining "
                          "passages were not revised.")
             return
+        if kind == "init":
+            self._pending_root = None
+            self._status("Stopped; the initialization is incomplete — "
+                         "completed writes stay saved and retrying Create "
+                         "fills only the missing paths.", error=True)
+            return
         self._preview_text = ""
         self.preview.setPlainText("")
         self._status("Stopped; nothing was saved. Head and saved "
@@ -4375,7 +4381,10 @@ class MainWindow(QMainWindow):
                     (", ".join(created) if created else
                      "(nothing; all files already exist)")
                 if value.get("preset"):
-                    msg += "; writer_preset.json imported"
+                    if value["preset"].get("default"):
+                        msg += "; bundled writer_preset.json created"
+                    else:
+                        msg += "; writer_preset.json imported"
                 self._status(msg)
             else:
                 self.refresh(force=True)
