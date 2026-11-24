@@ -1,4 +1,4 @@
-# ADR-0009: Bundle sanitized owner defaults for shared project initialization
+# ADR-0010: Bundle sanitized owner defaults for shared project initialization
 
 - Status: Accepted
 - Date: 2026-11-23

@@ -104,9 +104,9 @@ complete result. Add all tests to `scripts/check.sh`; real native Wayland
 credential entry, live previews, Stop/close and focus remain separate desktop
 acceptance, not inferred from offscreen results.
 
-Milestone 1 forces [ADR-0009](adr/0009-sanitized-new-project-defaults.md),
-[ADR-0010](adr/0010-gui-project-credentials.md) and
-[ADR-0011](adr/0011-shared-generation-stream-events.md).
+Milestone 1 forces [ADR-0010](adr/0010-sanitized-new-project-defaults.md),
+[ADR-0011](adr/0011-gui-project-credentials.md) and
+[ADR-0012](adr/0012-shared-generation-stream-events.md).
 
 ### Milestone 2 — Guided setup and a coherent writing workspace
 
@@ -148,7 +148,7 @@ extension complete; an unavailable desktop leaves acceptance explicitly pending.
 **Open questions:** no blocking product choices remain. Exact visual styling
 can be decided in the selected navigation change against the above journey.
 Encrypted/system-keyring storage and a shared key across projects are not
-implied by API-key entry; ADR-0010 deliberately retains existing per-project
+implied by API-key entry; ADR-0011 deliberately retains existing per-project
 storage with an unsaved-session alternative.
 
 ## Planning baseline and completion bar

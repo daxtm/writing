@@ -1,4 +1,4 @@
-# ADR-0011: Deliver all generated answers through shared preview events
+# ADR-0012: Deliver all generated answers through shared preview events
 
 - Status: Accepted
 - Date: 2026-11-23

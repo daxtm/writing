@@ -1,4 +1,4 @@
-# ADR-0010: Enter project credentials in the GUI using existing storage
+# ADR-0011: Enter project credentials in the GUI using existing storage
 
 - Status: Accepted
 - Date: 2026-11-23

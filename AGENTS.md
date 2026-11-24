@@ -54,10 +54,10 @@ is `project-defaults-full-init`, `gui-api-key-setup`,
 OpenSpec changes. Create artifacts only when an individual change is selected.
 This explicit request supersedes the earlier stop-planning instruction below,
 not the prohibition on shipping or the outstanding real Wayland acceptance.
-ADR-0009 chooses reviewed bundled nonsecret defaults and shared complete init;
-ADR-0010 chooses masked per-project/session GUI credential entry using the
+ADR-0010 chooses reviewed bundled nonsecret defaults and shared complete init;
+ADR-0011 chooses masked per-project/session GUI credential entry using the
 existing api_key field only on explicit save (plaintext, not a system keyring);
-ADR-0011 extends existing streaming callbacks/worker events to every generated
+ADR-0012 extends existing streaming callbacks/worker events to every generated
 answer and candidate. Existing name-only credentials/completion-only planning
 previews are baseline limitations, not fulfillment of this plan.
 The read-only defaults sources are
@@ -131,7 +131,7 @@ switching, and mouse/keyboard work remain an owner acceptance step.
 - Roadmap changes get OpenSpec artifacts only when selected for implementation;
   no speculative change directories. ADR-0004/0005 are integrated, not available numbers.
 - Keep `myfic/` and the third-party `56295265-LLam_ception-1.3.json` preset untracked.
-  ADR-0009 permits only reviewed, sanitized application-owned runtime defaults,
+  ADR-0010 permits only reviewed, sanitized application-owned runtime defaults,
   not the original private files or private test fixtures.
 - Never commit API keys or `.env`; synthetic test credentials only.
 - Tests are offline/deterministic: no live API calls; use MockTransport/fakes and temporary projects.
