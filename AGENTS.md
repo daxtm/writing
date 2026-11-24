@@ -41,6 +41,31 @@ drafting loop (generation/Stop/close, picker, keyboard, scaling/theme) is record
 shell's pre-drafting smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0) predates generation.
 
 ## Planned desktop workspace
+The next owner-authorized plan is **Guided writing workflow** in
+`docs/ROADMAP.md`, extending the historical GUI milestones below. Milestone 1
+is `project-defaults-full-init`, `gui-api-key-setup`,
+`gui-generated-text-streaming`; milestone 2 is `gui-workflow-navigation`,
+`gui-project-setup-wizard`. These are roadmap-only, not implemented or proposed
+OpenSpec changes. Create artifacts only when an individual change is selected.
+This explicit request supersedes the earlier stop-planning instruction below,
+not the prohibition on shipping or the outstanding real Wayland acceptance.
+ADR-0009 chooses reviewed bundled nonsecret defaults and shared complete init;
+ADR-0010 chooses masked per-project/session GUI credential entry using the
+existing api_key field only on explicit save (plaintext, not a system keyring);
+ADR-0011 extends existing streaming callbacks/worker events to every generated
+answer and candidate. Existing name-only credentials/completion-only planning
+previews are baseline limitations, not fulfillment of this plan.
+The read-only defaults sources are
+`/home/daxtm/Documents/fuckpi/project.json` and
+`/home/daxtm/Documents/fuckpi/56295265-LLam_ception-1.3.json`; never write there
+or require them at app startup, build time or test execution. Review derived
+runtime assets before tracking; force empty api_key, FEATHERLESS_API_KEY
+environment name and project-relative writer_preset.json. The originals remain
+untracked and are never fixtures. GUI full init includes the preset, not
+automatic paid generation. Bible setup currently composes local answer forms;
+do not invent an AI bible generation endpoint. Reuse planning/review/draft
+operations and the one worker; redesign the workflow, not the writing engine.
+
 `docs/ROADMAP.md` requires every CLI/TUI feature in the GUI, start to finish;
 no individual change completes the workspace. The sequence is
 `gui-drafting-workspace` (implemented), `gui-project-planning` (implemented),
@@ -99,8 +124,10 @@ switching, and mouse/keyboard work remain an owner acceptance step.
 ## Rules
 - Specs: `openspec/`. Decisions: `docs/adr/`. Plan: `docs/ROADMAP.md`.
 - Roadmap changes get OpenSpec artifacts only when selected for implementation;
-  no speculative change directories. ADR-0004/0005 are reserved on `feat/reader-gui`.
+  no speculative change directories. ADR-0004/0005 are integrated, not available numbers.
 - Keep `myfic/` and the third-party `56295265-LLam_ception-1.3.json` preset untracked.
+  ADR-0009 permits only reviewed, sanitized application-owned runtime defaults,
+  not the original private files or private test fixtures.
 - Never commit API keys or `.env`; synthetic test credentials only.
 - Tests are offline/deterministic: no live API calls; use MockTransport/fakes and temporary projects.
 - Keep `longform.py` as the thin PEP 723 launcher over `longform_core/` (ADR-0003); behavior, output, and file formats are frozen behind the test suite. Monkeypatch at the owning module (e.g. `longform.api.warn`), not the launcher re-exports.

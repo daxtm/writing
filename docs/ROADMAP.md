@@ -11,6 +11,13 @@ run the existing planning, drafting, review, and export flow through buttons,
 with a persistent multiline steering box and native Wayland support. The CLI
 remains available and uses the same writing operations and project files.
 
+The next owner-requested extension is a beginner-friendly, guided workspace:
+every new project gets the owner's sanitized configuration and writer preset,
+GUI Create performs complete initialization, API keys can be entered in the
+GUI, and a resumable wizard leads through bible, outline and scenes into
+drafting, review and export. All provider-generated answer text appears while
+it arrives, including multiple candidates, rather than only when a call finishes.
+
 ## Out of scope
 
 New model/provider capabilities, autonomous whole-book generation, browser/server
@@ -19,6 +26,130 @@ editing, standalone installers, private sample/preset fixtures, and live API
 tests. Existing CLI capabilities becoming GUI controls are in scope; changing
 their prompts, sampling policy, or file formats is not. Dependency provisioning
 may use network; test execution must not.
+
+For this extension, replacing new-project defaults and adding explicit GUI
+credential entry are intentional exceptions to the earlier frozen-default and
+credential-name-only scope. Existing projects are not migrated or reset.
+The original private project and preset remain outside the repository; only
+reviewed, sanitized runtime defaults may be bundled, not private test fixtures.
+No new toolkit, provider, model capability, secret-service dependency, automatic
+paid pipeline, key synchronization, installer or shipping authorization is added.
+
+## Next extension — Guided writing workflow
+
+This section supersedes the earlier instruction to stop planning after GUI
+milestone 3, and its credential-name-only/completion-based-progress limitations.
+The implemented milestone/history sections below remain baseline evidence,
+not acceptance of this extension. No OpenSpec change directories are created
+for these roadmap items; select one for build before writing its artifacts.
+
+### Milestone 1 — Walking skeleton: initialized project to live outline
+
+- [ ] project-defaults-full-init — Fix shared CLI/GUI init to create every initial file/directory plus a usable bundled writer preset, using the owner's sanitized project defaults; cover immediate and deferred GUI Create paths and copied-executable resource loading.
+- [ ] gui-api-key-setup — Extend existing Setup/settings and shared provider construction with masked session-key entry and explicit local-project Save/Replace/Clear, missing/available status and an explicit Test connection action; never copy credentials into defaults.
+- [ ] gui-generated-text-streaming — Extend existing Api callbacks, candidate batching, shared operations and the one worker so every generated answer streams into its owning preview, including planner, writer, summarizer, critic and editor calls and every candidate.
+
+**Observable slice:** launch
+`QT_QPA_PLATFORM=wayland uv run --script longform.py gui /path/to/new-project`,
+choose Create, inspect complete local setup without a preset picker, enter a
+key, save bible answers using the existing forms, then Generate an outline.
+The first answer chunks appear before completion; the author explicitly
+chooses a completed candidate. No terminal, external preset path, manual JSON
+editing or environment export is required. This is the walking skeleton,
+not the completed wizard or redesigned workspace.
+
+**Defaults contract:** the read-only sources are
+`/home/daxtm/Documents/fuckpi/project.json` and
+`/home/daxtm/Documents/fuckpi/56295265-LLam_ception-1.3.json`.
+Read them only when preparing the implementation's reviewed defaults, never
+at app startup, build time or test execution. Copy supported nonsecret project
+settings and the validated master-export preset into application-owned runtime
+resources. Force `api_key` empty, `api_key_env` to `FEATHERLESS_API_KEY`, and
+`roles.writer.preset` to project-relative `writer_preset.json`; keep the
+source's other supported defaults, including model/sampler/prompt settings.
+Use the chosen project title when supplied, otherwise the source's Untitled
+default. Review all nested values for credentials/private data before tracking
+derived assets. Record source provenance and preset notices without including
+the original private files. Never use the owner's source files as test fixtures.
+
+Full init means the existing five files and seven directories plus the default
+`writer_preset.json`, not implicit bible/outline/scene generation or limits
+fetching. Both adapters use the same operation. Existing files/presets are
+never overwritten; repeated init only fills missing paths. Explicit CLI
+`--preset FILE` overrides the bundled preset only when creating a missing
+destination. Existing configured external paths are not silently rewritten.
+Open remains read-only. Report collisions and partial-init failures truthfully;
+retry fills missing paths without resetting prior work.
+
+**Streaming coverage:** outline Generate/Reroll (N candidates), scene
+Generate/Regenerate, draft Generate/Reroll/Add N, continuity full/summary-only,
+compression, critique and revision/Regenerate all show answer deltas before
+completion. Bible answers currently compose locally with no provider request;
+the wizard must not invent an AI bible call. Show waiting/thinking status
+before answer tokens, not fabricated text or a blank unexplained box.
+Incomplete JSON/tagged responses are provisional raw previews; existing parsers
+and acceptance gates run on the completed answer. Candidate and retry-attempt
+identities prevent mixing fragments; retries reset only the affected preview.
+Keep hidden reasoning separate, Stop/close cooperative, controls responsive,
+existing completed saves intact and partial answers out of accepted files.
+Preserve existing final-output parsing, prompts, samplers and CLI transcripts.
+
+**Acceptance:** offline paused fake streams prove intermediate text is visible
+while a request is still blocked, for each operation family and concurrent
+candidate, including retry/Stop/failure. Synthetic secret sentinels prove no
+credential reaches events, logs, errors, export or bundled defaults. Fresh
+source/frozen CLI init results agree away from the checkout with the owner's
+source paths unavailable. GUI Create and deferred Create produce the same
+complete result. Add all tests to `scripts/check.sh`; real native Wayland
+credential entry, live previews, Stop/close and focus remain separate desktop
+acceptance, not inferred from offscreen results.
+
+Milestone 1 forces [ADR-0009](adr/0009-sanitized-new-project-defaults.md),
+[ADR-0010](adr/0010-gui-project-credentials.md) and
+[ADR-0011](adr/0011-shared-generation-stream-events.md).
+
+### Milestone 2 — Guided setup and a coherent writing workspace
+
+- [ ] gui-workflow-navigation — Rework the existing Qt window into Plan → Write → Review → Export navigation with a project overview, plain-language readiness/next actions, focused stage layouts and context-only generation/steering controls; retain every existing advanced action through secondary panels and update the parity map.
+- [ ] gui-project-setup-wizard — Compose shared init/settings/bible/outline/scenes operations into a back/next, save-and-resume wizard: location/title and defaults → credentials → bible questions → generate/choose outline → generate/edit/accept scene cards → enter the first unfinished scene, with streaming previews, explicit paid actions and acceptance.
+
+The wizard launches after successful new-project Create and can be reopened
+for incomplete projects. It uses saved project artifacts/answer histories to
+derive readiness rather than a second authoritative project format; no hidden
+wizard-only document owns bible/outline/scenes. Back/Next never generate, accept
+or discard edits implicitly. Save/Discard/Cancel resolves dirty forms; leaving
+and reopening resumes saved work and shows incomplete prerequisites. Replacing
+an outline or scene plan explains downstream impact and preserves existing
+history/trees under the existing confirmation rules. Manual planning and the
+advanced controls remain available; the wizard is guidance, not a lockstep
+requirement for existing writers.
+
+Each stage identifies what it does, what input is missing, where output goes
+and the one primary next action. Move the always-visible draft steering and
+Generate controls into Write; do not show a wall of fifteen equal-priority tabs.
+Keep scene/branch navigation, candidate selection, lore, exact prompts, settings,
+continuity, revision, reports and destination-picked export discoverable.
+Review/Export can be entered deliberately; readiness warnings explain concerns
+without inventing new mandatory review gates or automatic model calls.
+Keyboard navigation, focus order, labels, empty/error states, resize/scaling and
+light/dark readability are acceptance criteria within these two changes, not
+a later polish milestone.
+
+**Acceptance:** a first-time user follows visible instructions from a missing
+directory through credential setup, accepted bible/outline/scenes, streamed
+draft candidates and Accept, continuity/review/revision and picked export, with
+no terminal/config/preset knowledge. An offline offscreen journey uses
+synthetic credentials, fake streams and interruption/reopen checks; the full
+existing CLI/GUI action parity map is re-audited. `scripts/check.sh` runs the
+journey and all new regressions. Record a separate real Wayland walkthrough
+including keyboard, pickers, scaling/theme and Stop/close before claiming this
+extension complete; an unavailable desktop leaves acceptance explicitly pending.
+
+**Open questions:** no blocking product choices remain. Exact visual styling
+can be decided in the selected navigation change against the above journey.
+Encrypted/system-keyring storage and a shared key across projects are not
+implied by API-key entry; ADR-0010 deliberately retains existing per-project
+storage with an unsaved-session alternative.
 
 ## Planning baseline and completion bar
 
