@@ -22,3 +22,14 @@ Task 1.4 follow-up: the marker was removed and the suite reports
 as `created: project.json, bible.md, state.md, scenes.json, summaries.json,
 writer_preset.json`, failures exit nonzero via `die()`/`FatalError` with
 truthful partial-work diagnostics, and explicit `--preset` copies exact bytes.
+
+Task 1.6: the deferred Create/Open continuation was dead code — `_resolve_dirty`
+returned False for both cancel and a dispatched save, and the callers cleared
+`_pending_action` on False, so the settings-save settlement never resumed. The
+resolver now returns `ok`/`cancel`/`deferred`, Create/Open pick the target
+first and keep `_pending_action` across the deferred save, cancelled/stopped
+operations clear the pending transition, and a stopped initialization reports
+completed writes with retry-fills-missing semantics. Covered by the registered
+offscreen case `case_planning_deferred_create` (save-before-init, no
+old-project inheritance, immediate/deferred byte agreement, cancelled
+resolution, stale-save refusal, Stop then retry).

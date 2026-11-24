@@ -3612,6 +3612,163 @@ def case_review_dirty_sources(root):
     assert "Export cancelled; nothing was written." in win.status.text()
 
 
+def case_planning_deferred_create(root):
+    """Deferred Create continuation after a dirty-settings Save (1.6).
+
+    The save settles first on the existing worker, then the picked directory
+    receives complete shared initialization identical to immediate Create;
+    cancelled/failed saves and an initialization Stop never create or bind a
+    new project incorrectly and never lose prior work.
+    """
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)   # no credentials in this case
+    choices, dir_picks = [], []
+    import longform_core.defaults as dfl
+    import longform_core.planning_operations as planmod
+    from longform_core.cancel import Cancelled
+
+    old = root / "old"
+    planmod.init_project(old)
+    cfg = json.loads((old / "project.json").read_text())
+    cfg["title"] = "Old Title"
+    (old / "project.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    win = gw.MainWindow(str(old), choice=lambda t, x, o: choices.pop(0),
+                        dir_picker=lambda t, p: dir_picks.pop(0),
+                        preset_picker=lambda t: None)
+    win.show()
+    win.tabs.setCurrentIndex(gw.SETUP)
+    win.set_setting("title", "Dirty Old")
+    assert win.settings_dirty()
+
+    # cancelled resolution: nothing is created, the current project stays
+    dest = root / "newproj"
+    choices.append("Cancel")
+    dir_picks.append(str(dest))
+    win.create_btn.click()
+    assert not dest.exists(), "a cancelled resolution creates nothing"
+    assert win._root == old
+    assert json.loads((old / "project.json").read_text())["title"] == \
+        "Old Title", "no save ran for Cancel"
+
+    # deferred Create: Save settles first, then init runs on the same worker
+    choices.append("Save")
+    dir_picks.append(str(dest))
+    win.create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert json.loads((old / "project.json").read_text())["title"] == \
+        "Dirty Old", "the save completed before the initialization"
+    assert win._root == dest, "the new project is bound after settlement"
+    assert json.loads((dest / "project.json").read_text())["title"] == \
+        "Untitled", "defaults never inherit old-project settings"
+    for name in ("project.json", "bible.md", "state.md", "scenes.json",
+                 "summaries.json", "writer_preset.json"):
+        assert (dest / name).is_file(), name
+    for d in ("trees", "outlines", "critiques", "checks", "state_history",
+              "lorebooks", "bible_history"):
+        assert (dest / d).is_dir(), d
+    assert (dest / "writer_preset.json").read_bytes() == \
+        dfl.writer_preset_bytes()
+    assert "bundled writer_preset.json created" in win.status.text()
+
+    # both Create paths agree: an immediate Create is byte-identical
+    immediate = root / "immediate"
+    planmod.init_project(immediate)
+    for name in ("project.json", "bible.md", "state.md", "scenes.json",
+                 "summaries.json", "writer_preset.json"):
+        assert (immediate / name).read_bytes() == (dest / name).read_bytes(), \
+            f"deferred and immediate Create agree on {name}"
+
+    # a stale settings save refuses and never continues the deferred Create
+    old2 = root / "old2"
+    planmod.init_project(old2)
+    win2 = gw.MainWindow(str(old2), choice=lambda t, x, o: choices.pop(0),
+                         dir_picker=lambda t, p: dir_picks.pop(0),
+                         preset_picker=lambda t: None)
+    win2.show()
+    win2.tabs.setCurrentIndex(gw.SETUP)
+    win2.set_setting("title", "Stale Edit")
+    cfg2 = json.loads((old2 / "project.json").read_text())
+    cfg2["target_words"] = 1   # changed behind the form: the save goes stale
+    (old2 / "project.json").write_text(json.dumps(cfg2), encoding="utf-8")
+    dest2 = root / "never"
+    choices.append("Save")
+    dir_picks.append(str(dest2))
+    win2.create_btn.click()
+    assert _pump(a, lambda: not win2._busy)
+    assert not dest2.exists(), "a stale save never continues the deferred Create"
+    assert win2._root == old2, "the current project remains selected"
+    assert json.loads((old2 / "project.json").read_text())["target_words"] == 1
+    assert json.loads((old2 / "project.json").read_text())["title"] == \
+        "Untitled", "the stale edit is refused, prior work is intact"
+
+    # cooperative Stop during the deferred initialization: completed writes
+    # stay saved, the old project is never rebound, retry fills the rest
+    old3 = root / "old3"
+    planmod.init_project(old3)
+    win3 = gw.MainWindow(str(old3), choice=lambda t, x, o: choices.pop(0),
+                         dir_picker=lambda t, p: dir_picks.pop(0),
+                         preset_picker=lambda t: None)
+    win3.show()
+    win3.tabs.setCurrentIndex(gw.SETUP)
+    win3.set_setting("title", "Dirty Three")
+    dest3 = root / "stopped"
+    real_init = planmod.init_project
+
+    class _StopSoon:
+        def __init__(self, after):
+            self.n = 0
+            self.after = after
+
+        def check(self):
+            self.n += 1
+            if self.n > self.after:
+                raise Cancelled("stopped")
+
+    def stopping_init(target, *, token=None, events=None, **kw):
+        return real_init(target, token=_StopSoon(2), events=events, **kw)
+
+    planmod.init_project = stopping_init
+    try:
+        choices.append("Save")
+        dir_picks.append(str(dest3))
+        win3.create_btn.click()
+        assert _pump(a, lambda: not win3._busy)
+        assert win3._root == old3, "a stopped init never binds the new project"
+        assert (dest3 / "project.json").is_file(), \
+            "completed writes stay saved"
+        assert not (dest3 / "writer_preset.json").exists(), \
+            "the stopped run created no preset and reports the partial state"
+        assert "incomplete" in win3.status.text().lower()
+        assert json.loads((old3 / "project.json").read_text())["title"] == \
+            "Dirty Three", "prior work is preserved through the Stop"
+        planmod.init_project = real_init
+        dir_picks.append(str(dest3))
+        win3.create_btn.click()
+        assert _pump(a, lambda: not win3._busy)
+        assert win3._root == dest3, "retry after the Stop binds the new project"
+        assert (dest3 / "writer_preset.json").read_bytes() == \
+            dfl.writer_preset_bytes(), "retry fills only the missing paths"
+        assert json.loads((dest3 / "project.json").read_text())["title"] == \
+            "Untitled"
+    finally:
+        planmod.init_project = real_init
+    choices.append("Discard")   # win2's refused edit stays unsaved by design
+    win.close()
+    win2.close()
+    win3.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -3638,6 +3795,7 @@ CASES = {
     "case_invalid_config_and_recovery": case_invalid_config_and_recovery,
     "case_planning_journey": case_planning_journey,
     "case_planning_create_open": case_planning_create_open,
+    "case_planning_deferred_create": case_planning_deferred_create,
     "case_planning_settings_limits": case_planning_settings_limits,
     "case_planning_bible": case_planning_bible,
     "case_planning_outline": case_planning_outline,
