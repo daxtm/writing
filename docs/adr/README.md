@@ -19,6 +19,7 @@ except to mark it superseded by a newer ADR.
 | [0010](0010-sanitized-new-project-defaults.md) | Bundle sanitized owner defaults for shared project initialization | Accepted | 2026-11-23 |
 | [0011](0011-gui-project-credentials.md) | Enter project credentials in the GUI using existing storage | Accepted | 2026-11-23 |
 | [0012](0012-shared-generation-stream-events.md) | Deliver all generated answers through shared preview events | Accepted | 2026-11-23 |
+| [0013](0013-cpython-minor-runtime-pin.md) | Pin the CPython minor and accept patch updates automatically | Accepted | 2026-11-25 |
 
 ADR-0004/0005 are the reader-baseline decisions integrated from the
 `feat/reader-gui` branch; ADR-0006 supersedes 0005's Tk presentation choice for
