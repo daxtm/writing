@@ -5715,28 +5715,47 @@ def case_setup_wizard_journey(root):
     assert not json.loads((missing / "scenes.json").read_text())
 
     # Scene cards: explicit Generate from the saved outline, then Accept;
-    # the preview alone never replaces scenes.json
-    fake.responses = ['<scenes>[{"chapter": 1, "title": "Yard", "pov": '
-                      '"Mara", "setting": "the yard", "characters": '
-                      '["Mara"], "goal": "count windows", "conflict": '
-                      '"wind", "outcome": "counted", "beats": ["Mara '
-                      'counts."], "target_words": 1700}]</scenes>']
+    # the preview alone never replaces scenes.json. Parse-invalid answers
+    # recover without provisional acceptance; a selected card's descriptive
+    # fields edit through the preview; Accept saves normalized cards.
+    fake.responses = ['<scenes>[{"chapter": "nope"}]</scenes>']
     fake.started = 0
     fake.gate = None
     win.setup_step_list.setCurrentRow(4)
     assert win._guide_step == "scenes"
     assert win.setup_step_label.text().startswith("Step 5 of 6")
     assert win.current_tool() == "scenes"
+    assert "may cost money" in win.setup_step_label.text()
     win.scenes_generate_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert any(c[0] == "chat" for c in fake.calls)
+    assert "card 1" in win.status.text().lower(), \
+        "a parse-invalid answer reports a card error"
+    assert not json.loads((missing / "scenes.json").read_text()), \
+        "an invalid preview is never accepted implicitly"
+    fake.responses = ['<scenes>[{"chapter": 1, "title": "Yard", "pov": '
+                      '"Mara", "setting": "the yard", "characters": '
+                      '["Mara"], "goal": "count windows", "conflict": '
+                      '"wind", "outcome": "counted", "beats": ["Mara '
+                      'counts."], "target_words": 1700}]</scenes>']
+    fake.started = 0
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
     assert "Yard" in win.scenes_preview.toPlainText()
     assert not json.loads((missing / "scenes.json").read_text()), \
         "a preview never replaces scenes.json"
+    win.scenes_list.setCurrentRow(0)
+    win._card_field_editors["title"].setText("Yard Gate")
+    assert "Yard Gate" in win.scenes_preview.toPlainText(), \
+        "card edits rebuild the provisional preview"
     win.scenes_accept_btn.click()
     assert _pump(a, lambda: not win._busy)
     scenes = json.loads((missing / "scenes.json").read_text())
     assert scenes[0]["id"] == "s01" and scenes[0]["status"] == "planned"
+    assert scenes[0]["title"] == "Yard Gate" and \
+        scenes[0]["target_words"] == 1700 and \
+        scenes[0]["beats"] == ["Mara counts."], \
+        "accepted cards are normalized and carry edited fields"
 
     # Write handoff: navigation only — the first unfinished scene is
     # selected with its saved head and steering; no generation, no status
@@ -5744,15 +5763,31 @@ def case_setup_wizard_journey(root):
     win.setup_step_list.setCurrentRow(5)
     assert win._guide_step == "write"
     assert win.setup_step_label.text().startswith("Step 6 of 6")
+    assert "first unfinished" in win.setup_write_label.text().lower()
     n_calls = len(fake.calls)
     win.setup_enter_write_btn.click()
     assert not win._busy
     assert win.current_stage() == "write"
     assert win._scene_sel == "s01"
     assert len(fake.calls) == n_calls, "the handoff makes no provider call"
-    scenes[0]["status"] = "planned"
-    _write_json(missing / "scenes.json", scenes)
+    assert json.loads((missing / "scenes.json").read_text())[0][
+        "status"] == "planned", "the handoff never marks anything done"
     assert win._guide_active is False, "the guide closed for drafting"
+
+    # all done: an explicit sidebar selection is guided instead and Enter
+    # Write resets no status
+    scenes[0]["status"] = "done"
+    _write_json(missing / "scenes.json", scenes)
+    win.refresh(force=True)
+    win.resume_setup_btn.click()
+    assert win._guide_step == "write"
+    assert "all" in win.setup_write_label.text().lower() and \
+        "done" in win.setup_write_label.text().lower()
+    n_calls = len(fake.calls)
+    win.setup_enter_write_btn.click()
+    assert not win._busy and len(fake.calls) == n_calls
+    assert json.loads((missing / "scenes.json").read_text())[0][
+        "status"] == "done", "Enter Write resets no status"
     assert not consents, "no unexpected consent dialog appeared"
     win.close()
 
