@@ -62,6 +62,74 @@ def _build_project(root, **kw):
 
 # ------------------------------------------------------------------- cases
 
+def _project_for_stages(root):
+    """Populated project with two scenes, one drafted."""
+    return _build_project(root, scenes=[
+        _scene("s001"), _scene("s002", status="done"),
+    ], trees={
+        "s001": _tree({"n1": _node("n1", None, "Active prose.")}, head="n1"),
+    }, bible="B")
+
+
+def case_workflow_stages(root):
+    """Plan → Write → Review → Export are the four primary routes; stage
+    purpose/readiness/next action are visible and draft steering/Generate
+    appear only in Write."""
+    import longform_core.gui_window as gw
+    app()
+    project = _project_for_stages(root / "p")
+    win = gw.MainWindow(str(project),
+                        choice=_no_dialogs("case_workflow_stages"))
+    win.show()
+    try:
+        # The primary selector is exactly the four stages, in order.
+        assert win.stages.count() == 4
+        assert [win.stages.tabText(i) for i in range(win.stages.count())] \
+            == ["Plan", "Write", "Review", "Export"]
+        assert gw.STAGE_ORDER == ("plan", "write", "review", "export")
+        assert not hasattr(win, "tabs"), \
+            "the fifteen-tab wall must be gone, not hidden"
+        # Each stage explains its purpose and one next action.
+        for stage in gw.STAGE_ORDER:
+            assert stage in win.stage_purpose
+            text = win.stage_purpose[stage].text()
+            assert text.strip(), f"{stage} stage must show its purpose"
+        # Semantic routes reach every existing pane group.
+        win.select_stage("plan")
+        assert win.current_stage() == "plan"
+        win.select_stage("write")
+        assert win.current_stage() == "write"
+        win.select_stage("review")
+        assert win.current_stage() == "review"
+        win.select_stage("export")
+        assert win.current_stage() == "export"
+        win.select_tool("notes")
+        assert win.route() == ("write", "notes")
+        win.select_tool("bible")
+        assert win.route() == ("plan", "bible")
+        win.select_tool("status")
+        assert win.route() == ("export", "status")
+        # Draft steering/Generate/count are visible only in Write.
+        win.select_stage("write")
+        assert win.steer_editor.isVisible()
+        assert win.generate_btn.isVisible()
+        assert win.count_spin.isVisible()
+        for stage in ("plan", "review", "export"):
+            win.select_stage(stage)
+            assert not win.steer_editor.isVisible(), \
+                f"steering must hide outside Write (was visible in {stage})"
+            assert not win.generate_btn.isVisible(), \
+                f"Generate must hide outside Write (was visible in {stage})"
+            assert not win.count_spin.isVisible()
+        # Stop stays global: the same Stop button is shared by every stage.
+        assert win.stop_btn.isVisible()
+        win.select_stage("plan")
+        assert win.stop_btn.isVisible()
+        win.close()
+    finally:
+        win.deleteLater()
+
+
 def case_owner_flow_reading(root):
     """Owner journey, reading half: one window, inactive node + notes readable."""
     import longform_core.gui_window as gw
@@ -4938,6 +5006,7 @@ class _EchoFail:
 
 
 CASES = {
+    "case_workflow_stages": case_workflow_stages,
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
     "case_draft_midstream_failure": case_draft_midstream_failure,
