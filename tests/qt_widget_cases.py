@@ -5821,6 +5821,146 @@ def case_setup_wizard_dirty_create(root):
     win.close()
 
 
+def case_setup_wizard_resume(root):
+    """Interrupted and reopened journey (1.3): Resume setup derives the
+    step from saved-artifact readiness only, closing the window mid-guide
+    is a safe interruption, every reopen resumes at the earliest
+    incomplete saved step, provisionally saved answers and unchosen
+    streamed candidates never complete a step, and a fully set-up project
+    shows Reopen setup and resumes at Write."""
+    import longform_core.gui_window as gw
+    import longform_core.planning_operations as planmod
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    proj = root / "r"
+    planmod.init_project(proj)
+    cfg = json.loads((proj / "project.json").read_text())
+    cfg["api_key"] = "sk-resume-test"   # synthetic saved credential
+    (proj / "project.json").write_text(json.dumps(cfg), encoding="utf-8")
+    fake = PlanningFake(
+        fragments=[("<outline>ARC ONE", " body</outline>"),
+                   ("<outline>ARC TWO", " body</outline>")])
+    fake.parallel = True
+
+    def _win():
+        w = gw.MainWindow(str(proj), choice=_no_dialogs("resume"),
+                          provider_factory=lambda _p: fake)
+        w.show()
+        return w
+
+    # fresh project: Resume setup (not Reopen) at the saved-facts step; the
+    # credentials page stays reachable by order and takes a masked session
+    # credential without writing anything
+    win = _win()
+    assert win.resume_setup_btn.text() == "Resume setup"
+    win.resume_setup_btn.click()
+    assert win._guide_active and win._guide_step == "bible"
+    assert win.setup_step_label.text().startswith("Step 3 of 6")
+    win.setup_step_list.setCurrentRow(1)
+    assert win._guide_step == "credentials"
+    from PySide6.QtWidgets import QLineEdit
+    assert win.credential_entry.echoMode() == QLineEdit.EchoMode.Password
+    before_cfg = (proj / "project.json").read_bytes()
+    win.credential_entry.setText(SESSION_SENTINEL)
+    win.credential_use_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win.credential_entry.text() == ""
+    assert (proj / "project.json").read_bytes() == before_cfg
+    assert fake.calls == []
+    win.setup_step_list.setCurrentRow(2)
+
+    # interrupted journey: save answers without accepting, then close
+    win.setup_step_list.setCurrentRow(2)
+    win.bible_begin_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    form = win.bible_form_edit.toPlainText()
+    win.bible_form_edit.setPlainText(form.replace("A: ", "A: The Tower", 1))
+    win.bible_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "The Tower" not in (proj / "bible.md").read_text(), \
+        "saved answers stay provisional until Accept"
+    win.close()
+
+    # reopen: the earliest incomplete saved step is still bible
+    win = _win()
+    assert win._ready["next"] == "bible"
+    win.resume_setup_btn.click()
+    assert win._guide_step == "bible"
+    win.bible_begin_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "The Tower" in win.bible_form_edit.toPlainText(), \
+        "the saved provisional answers reload from the saved form file"
+    win.bible_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.bible_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "The Tower" in (proj / "bible.md").read_text()
+    win.close()
+
+    # reopen at outline; a paused two-candidate stream is interrupted and
+    # the unchosen candidates still never complete the outline step
+    win = _win()
+    assert win._ready["next"] == "outline"
+    win.resume_setup_btn.click()
+    assert win._guide_step == "outline"
+    fake.gate = threading.Event()
+    win.outline_generate_btn.click()
+    try:
+        assert _pump(a, lambda: fake.started >= 2)
+    finally:
+        fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    assert len(win._outline_candidates) == 2
+    assert not (proj / "outline.md").exists()
+    win.outline_list.setCurrentRow(0)
+    chosen = win._outline_overview["candidates"][0]
+    win.outline_choose_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    body = re.sub(r"^<!-- notes:.*?-->\n", "",
+                  (proj / "outlines" / chosen).read_text())
+    assert (proj / "outline.md").read_text() == body
+    win.close()
+
+    # reopen at scenes
+    win = _win()
+    assert win._ready["next"] == "scenes"
+    win.resume_setup_btn.click()
+    assert win._guide_step == "scenes"
+    fake.responses = ['<scenes>[{"chapter": 1, "title": "Yard", "pov": '
+                      '"Mara", "setting": "the yard", "characters": '
+                      '["Mara"], "goal": "count windows", "conflict": '
+                      '"wind", "outcome": "counted", "beats": ["Mara '
+                      'counts."], "target_words": 1700}]</scenes>']
+    fake.started = 0   # scenes indexes responses per fresh call
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.scenes_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert json.loads((proj / "scenes.json").read_text())[0]["id"] == "s01"
+    win.close()
+
+    # fully set up: Reopen setup resumes at Write with no key needed
+    win = _win()
+    assert win.resume_setup_btn.text() == "Reopen setup"
+    win.resume_setup_btn.click()
+    assert win._guide_step == "write"
+    assert "first unfinished" in win.setup_write_label.text().lower()
+    win.setup_enter_write_btn.click()
+    assert win.current_stage() == "write" and win._scene_sel == "s01"
+    assert win._guide_active is False
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -5880,6 +6020,7 @@ CASES = {
     "case_workflow_presentation": case_workflow_presentation,
     "case_setup_wizard_journey": case_setup_wizard_journey,
     "case_setup_wizard_dirty_create": case_setup_wizard_dirty_create,
+    "case_setup_wizard_resume": case_setup_wizard_resume,
 }
 
 

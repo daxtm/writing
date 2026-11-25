@@ -2089,6 +2089,62 @@ def test_readiness_malformed_config_reports_setup_recovery(tmp_path):
     assert any("not valid JSON" in w for w in r["warnings"])
 
 
+def test_readiness_guides_resume_steps_without_any_wizard_document(
+        tmp_path, monkeypatch):
+    """The setup guide's earliest-incomplete step is exactly readiness.next
+    ("setup" → "location"); readiness reads and writes no wizard-state
+    document, unchosen outline candidates and provisional previews never
+    complete a step, and an externally broken source only degrades the
+    matching step."""
+    root = tmp_path / "p"
+    plan.init_project(root)
+
+    def _files():
+        return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+    before = _files()
+    r = plan.readiness(root)
+    assert _files() == before, "readiness creates no wizard-state document"
+    step = "location" if r["next"] == "setup" else r["next"]
+    assert step == "credentials", "fresh init resumes at credentials"
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "sk-env-test")
+
+    bible = (root / "bible.md").read_text(encoding="utf-8")
+    (root / "bible.md").write_text(
+        bible.replace("(working title)", "The Tower"), encoding="utf-8")
+    r = plan.readiness(root)
+    assert ("location" if r["next"] == "setup" else r["next"]) == "outline"
+
+    # unchosen candidates are provisional: the outline step stays open
+    (root / "outlines").mkdir(exist_ok=True)
+    (root / "outlines" / "candidate_20260101-000000_1.md").write_text(
+        "<!-- notes: x -->\nBODY\n", encoding="utf-8")
+    r = plan.readiness(root)
+    assert ("location" if r["next"] == "setup" else r["next"]) == "outline"
+
+    (root / "outline.md").write_text("Act 1: the climb.\n", encoding="utf-8")
+    r = plan.readiness(root)
+    assert ("location" if r["next"] == "setup" else r["next"]) == "scenes"
+
+    # an externally broken scenes.json only degrades saved-fact steps
+    (root / "scenes.json").write_text("{nope", encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["cards"]["ok"] is False
+    assert any("scenes.json" in w for w in r["warnings"])
+    step = "location" if r["next"] == "setup" else r["next"]
+    assert step in ("bible", "scenes"), \
+        "the guide falls back to the earliest degraded step, never write"
+
+    _write_json(root / "scenes.json", [{"id": "s01", "chapter": 1,
+                                        "title": "Opening", "status":
+                                        "planned", "target_words": 1000}])
+    before = _files()   # now includes the artifacts the case wrote itself
+    r = plan.readiness(root)
+    assert ("location" if r["next"] == "setup" else r["next"]) == "write"
+    assert r["write"]["next_scene"] == "s01"
+    assert _files() == before, "resuming setup wrote nothing"
+
+
 def test_readiness_makes_no_provider_calls(tmp_path, monkeypatch):
     """Constructing the provider would raise; readiness performs no calls."""
     import longform_core.api as api_mod
