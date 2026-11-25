@@ -16,7 +16,7 @@ except to mark it superseded by a newer ADR.
 | [0007](0007-shared-writing-operations.md) | Share writing operations between CLI and an asynchronous GUI | Accepted | 2026-11-23 |
 | [0008](0008-standalone-native-executable.md) | Distribute a frozen native executable alongside the source launcher | Accepted | 2026-11-23 |
 | [0009](0009-single-cli-gui-executable.md) | Bundle CLI and Qt workspace in the same executable | Accepted | 2026-11-23 |
-| [0013](0013-exact-python-runtime-pin.md) | Pin one exact CPython release across source, checks, and freezing | Accepted | 2026-11-24 |
+| [0013](0013-cpython-minor-runtime-pin.md) | Pin the CPython minor and accept patch updates automatically | Accepted | 2026-11-25 |
 
 ADR-0004/0005 are the reader-baseline decisions integrated from the
 `feat/reader-gui` branch; ADR-0006 supersedes 0005's Tk presentation choice for

@@ -4,16 +4,16 @@
 
 “The python version should never drift. Fix the python drift, and fix the crash in the standalone.”
 
-Commit `dd9803e` on `feat/guided-workflow` already fixes the reported standalone crash by moving its build to Python 3.13, requiring at least 3.12, and testing Qt/None-reference churn. However, a minor-version request and a lower bound still allow interpreter changes between source runs, checks, and rebuilds without review.
+Commit `dd9803e` on `feat/guided-workflow` already fixes the reported standalone crash by moving its build to Python 3.13, requiring at least 3.12, and testing Qt/None-reference churn. Source metadata and independently selected check interpreters still permit unintended minor-version drift. The owner chose to hold the CPython minor at 3.13 while accepting patch updates automatically.
 
 ## What Changes
 
-- Preserve `dd9803e` as an implementation prerequisite; do not redo its floor fix or existing regression.
-- Pin ordinary CPython **3.13.15**, the interpreter recorded by the existing local build, including its patch version.
-- Make source launch, syntax checks, both test phases, and freezing agree with one authoritative pin. Reject unavailable or mismatched interpreters instead of falling back.
-- Extend the existing build metadata, artifact-reuse checks, and tests to enforce the pin and retain the crash regression.
+- Preserve `dd9803e` as an implementation prerequisite; leave its independent CPython >=3.12 assertion and Qt/None-refcount regression unchanged.
+- Set authoritative `.python-version` to `cpython@3.13` and PEP 723 `requires-python` to `>=3.13,<3.14`; never pin a patch.
+- Make build/check provisioning resolve the latest available 3.13 patch automatically (currently 3.13.15), then explicitly select and verify CPython 3.13.x in every phase. Reject other minors or implementations.
+- Record the requested minor and actual full version in existing build metadata; invalidate cached artifacts with a different actual minor, not a different 3.13 patch.
 
-Fix the existing launcher/build/check entry points rather than add a parallel runner. A new `.python-version` is necessary because no existing file owns a shared exact interpreter selection.
+Fix existing launcher/build/check entry points, not a parallel runner. A new `.python-version` is necessary because no existing file owns their shared interpreter policy. Only a minor bump requires a reviewed pin/mirror change.
 
 ## Capabilities
 
@@ -23,8 +23,8 @@ None.
 
 ### Modified Capabilities
 
-- `standalone-distribution`: freeze only the reviewed exact interpreter; reject stale or mismatched build evidence.
-- `offline-regression`: run source/check processes on that same interpreter and detect pin/metadata disagreement.
+- `standalone-distribution`: freeze the reviewed CPython minor with automatic patch updates and minor-aware cache validation.
+- `offline-regression`: keep source/check processes within that minor and detect pin/mirror disagreement.
 
 ## Impact
 
@@ -32,4 +32,4 @@ Existing launcher metadata, build/check scripts, sidecars, regression fixtures, 
 
 **Out of scope:** dependency upgrades, a new packager, bit-identical binaries, additional platforms, GUI redesign, shipping, or claiming pending real Wayland acceptance.
 
-**See it work:** `./scripts/check.sh` prints `== python: CPython 3.13.15`, runs the mandatory suites, and exits 0; `dist/longform-build.json` records that same interpreter.
+**See it work:** `./scripts/check.sh` reports `== python: CPython 3.13.<patch>`, runs mandatory suites, and exits 0; the sidecar records `cpython@3.13` and the actual full version.
