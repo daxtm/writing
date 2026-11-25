@@ -32,7 +32,7 @@ def test_qt_presentation_case_at_scale_2(net_guard_env):
     env["QT_SCALE_FACTOR"] = "2"
     r = subprocess.run(
         [sys.executable, str(REPO / "tests" / "qt_widget_cases.py"),
-         "case_workflow_presentation"],
+         "case_workflow_presentation", "case_setup_wizard_presentation"],
         capture_output=True, text=True, env=env, timeout=300, cwd=str(REPO))
     assert r.returncode == 0, \
         f"scale-2 presentation case failed\n{r.stdout}\n{r.stderr}"

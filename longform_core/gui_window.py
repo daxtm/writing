@@ -8,6 +8,7 @@ lore) runs as a shared draft_operations call on one background worker
 touches widgets. No terminal helpers, external editors or subprocesses.
 """
 
+import json
 import sys
 from pathlib import Path
 

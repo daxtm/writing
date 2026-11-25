@@ -6079,6 +6079,268 @@ def case_setup_wizard_resume(root):
     win.close()
 
 
+def case_setup_wizard_replacement(root):
+    """Replacement and downstream effects (1.7): with drafted work saved,
+    the guide's outline step shows the plain downstream note, a new Choose
+    backs up the previous outline while scene cards and trees stay
+    byte-identical, an external outline change refuses a stale choose until
+    Refresh recaptures the baseline, replacing drafted scenes confirms
+    first (declining makes no request) and a confirmed replace keeps every
+    tree file, and one cooperative Stop leaves no candidate file."""
+    import longform_core.gui_window as gw
+    import longform_core.planning_operations as planmod
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    proj = root / "rep"
+    planmod.init_project(proj)
+    cfg = json.loads((proj / "project.json").read_text())
+    cfg["api_key"] = "sk-rep-test"
+    (proj / "project.json").write_text(json.dumps(cfg), encoding="utf-8")
+    bible = (proj / "bible.md").read_text(encoding="utf-8")
+    (proj / "bible.md").write_text(
+        bible.replace("(working title)", "The Tower"), encoding="utf-8")
+    (proj / "outline.md").write_text("Act 1: the original climb.\n",
+                                     encoding="utf-8")
+    _write_json(proj / "scenes.json", [{
+        "id": "s01", "chapter": 1, "title": "Opening", "pov": "Mara",
+        "setting": "the yard", "characters": ["Mara"], "goal": "g",
+        "conflict": "c", "outcome": "o", "beats": ["b"],
+        "target_words": 1700, "status": "writing"}])
+    _write_json(proj / "trees" / "s01.json", {
+        "head": "n1", "nodes": {"n1": {"id": "n1", "parent": None,
+                                       "text": "Mara counts.",
+                                       "children": []}}})
+    fake = PlanningFake(responses=[])
+    fake.parallel = True
+    choices = []
+    win = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    assert win.resume_setup_btn.text() == "Reopen setup"
+
+    # outline step: the downstream note names the untouched saved work
+    win.resume_setup_btn.click()
+    assert win._guide_step == "write"   # fully set up: resume lands on Write
+    win.setup_step_list.setCurrentRow(3)
+    assert win._guide_step == "outline"
+    assert "does not update downstream work" in win.setup_step_label.text()
+    assert "1 saved scene card(s)" in win.setup_step_label.text()
+    assert "1 saved tree file(s)" in win.setup_step_label.text()
+    scenes_bytes = (proj / "scenes.json").read_bytes()
+    tree_bytes = (proj / "trees" / "s01.json").read_bytes()
+
+    # a replacement Choose backs up the previous outline and touches no
+    # downstream artifact
+    fake.responses = ["<outline>REPLACED OUTLINE</outline>"]
+    fake.started = 0
+    fake.gate = None
+    win.outline_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.outline_list.setCurrentRow(0)
+    win.outline_choose_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (proj / "outline.md").read_text() == "REPLACED OUTLINE\n"
+    prevs = list((proj / "outlines").glob("outline_prev_*.md"))
+    assert prevs and prevs[0].read_text() == "Act 1: the original climb.\n", \
+        "the replaced outline is backed up"
+    assert (proj / "scenes.json").read_bytes() == scenes_bytes
+    assert (proj / "trees" / "s01.json").read_bytes() == tree_bytes
+
+    # an external outline change makes a second choose stale; Refresh
+    # recaptures the baseline and the choose then succeeds
+    (proj / "outline.md").write_text("EXTERNALLY EDITED\n", encoding="utf-8")
+    win.outline_list.setCurrentRow(0)
+    win.outline_choose_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "changed on disk" in win.status.text()
+    assert (proj / "outline.md").read_text() == "EXTERNALLY EDITED\n", \
+        "a refused choose leaves the external bytes alone"
+    win.refresh(force=True)
+    win.outline_list.setCurrentRow(0)
+    win.outline_choose_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (proj / "outline.md").read_text() == "REPLACED OUTLINE\n"
+
+    # scenes step: replacing drafted scenes confirms first; declining
+    # makes no request and changes nothing
+    win.setup_step_list.setCurrentRow(4)
+    fake.started = 0
+    fake.responses = ['<scenes>[{"chapter": 1, "title": "New Yard", "pov": '
+                      '"Mara", "setting": "the yard", "characters": '
+                      '["Mara"], "goal": "g", "conflict": "c", "outcome": '
+                      '"o", "beats": ["b"], "target_words": 1700}]</scenes>']
+    choices.append("Cancel")   # declining the force confirm
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.started == 0, "a declined force makes no provider request"
+    assert (proj / "scenes.json").read_bytes() == scenes_bytes
+    choices.append("Generate (force)")
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.started == 1, "the confirmed force makes the request"
+    assert "New Yard" in win.scenes_preview.toPlainText()
+    assert (proj / "scenes.json").read_bytes() == scenes_bytes, \
+        "the preview alone never replaces drafted scenes"
+    choices.append("Replace")
+    win.scenes_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    new_scenes = json.loads((proj / "scenes.json").read_text())
+    assert new_scenes[0]["title"] == "New Yard", "the confirmed replace lands"
+    assert not choices, "the replace confirm dialog was offered exactly once"
+    backups = list((proj / "outlines").glob("scenes_prev_*.json"))
+    assert backups and json.loads(backups[0].read_text())[0][
+        "title"] == "Opening", "the replaced scenes list is backed up"
+    assert (proj / "trees" / "s01.json").read_bytes() == tree_bytes, \
+        "draft trees are kept verbatim through a scene replacement"
+
+    # one cooperative Stop mid-generation leaves no candidate file and the
+    # guide intact
+    fake.started = 0
+    fake.responses = None
+    fake.fragments = [("<outline>NEVER", " lands</outline>"),
+                      ("<outline>NEVER", " lands</outline>")]
+    fake.gate = threading.Event()
+    win.setup_step_list.setCurrentRow(3)
+    win.outline_generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 2)
+    n_cands = len(list((proj / "outlines").glob("candidate_*.md")))
+    win.stop_btn.click()
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    assert "stopp" in win.status.text().lower()
+    assert len(list((proj / "outlines").glob("candidate_*.md"))) == n_cands, \
+        "a stopped generation saves no candidate"
+    assert win._guide_active and win._guide_step == "outline"
+    assert (proj / "outline.md").read_text() == "REPLACED OUTLINE\n"
+    assert not choices, "no unexpected dialog appeared"
+    win.close()
+
+
+def case_setup_wizard_presentation(root):
+    """Guide presentation (1.7): keyboard/focus reach the chrome, Enter
+    never triggers a chrome action from a multiline editor, labels stay
+    explicit, the guide stays usable at 900x600 and 1150x760 with a larger
+    prose size, and a dark system palette window shows the same guide.
+    Scale 2 is exercised by the scale-2 offscreen run of this case."""
+    import longform_core.gui_window as gw
+    import longform_core.planning_operations as planmod
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt as QtCore
+    a = app()
+    import longform_core.utils as utils
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    proj = root / "pres"
+    planmod.init_project(proj)
+    fake = PlanningFake(responses=[])
+    choices = []
+    win = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.resume_setup_btn.click()
+    assert win._guide_active and win._guide_step == "credentials"
+
+    # no default button anywhere: Enter in a multiline editor never
+    # triggers a chrome action
+    assert not any(b.isDefault() for b in win.findChildren(gw.QPushButton))
+
+    # keyboard: the step list is focusable and arrows move the guide step
+    win.setup_step_list.setFocus()
+    QTest.keyClick(win.setup_step_list, QtCore.Key.Key_Down)
+    a.processEvents()
+    assert win._guide_step == "bible", "arrow keys move the guide step"
+    win.setup_back_btn.click()
+    assert win._guide_step == "credentials"
+    win.setup_next_btn.click()
+    assert win._guide_step == "bible"
+
+    # Enter inside the bible form inserts a newline and never saves
+    win.bible_begin_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.bible_form_edit.setPlainText("draft line")
+    win.bible_form_edit.moveCursor(gw.QTextCursor.MoveOperation.End)
+    QTest.keyClick(win.bible_form_edit, QtCore.Key.Key_Return)
+    assert win.bible_form_edit.toPlainText() == "draft line\n", \
+        "Enter inserts a newline in the guide's form editor"
+    assert not (proj / "inputs").exists() or \
+        not list((proj / "inputs").glob("bible_answers_*.md")), \
+        "Enter must not trigger a save"
+    choices.append("Discard")   # the unsaved newline draft is reloaded
+    win.setup_resume_later_btn.click()   # returns to Plan
+    assert not win._guide_active
+
+    # labels: the chrome names its steps and actions explicitly
+    win.resume_setup_btn.click()
+    assert win.setup_step_label.text().startswith("Step 2 of 6")
+    assert "&Create project" in win.setup_create_btn.text()
+    rl = win.setup_resume_later_btn.text().replace("&", "").lower()
+    assert "resume" in rl and "later" in rl
+    assert "&Write" in win.setup_enter_write_btn.text()
+    for i, key in enumerate(gw.SETUP_STEPS):
+        win.setup_step_list.setCurrentRow(i)
+        assert win.setup_step_label.text().startswith(f"Step {i + 1} of 6")
+
+    # the guide stays usable at 900x600 and 1150x760
+    win.setup_step_list.setCurrentRow(0)
+    win.resize(900, 600)
+    a.processEvents()
+    assert win.isVisible() and win._guide_chrome.isVisible()
+    assert win.setup_step_label.isVisible()
+    win.setup_title_edit.setText("Resized")
+    win.resize(1150, 760)
+    a.processEvents()
+    win.prose_size.setValue(win.prose_size.value() + 6)
+    a.processEvents()
+    for i, key in enumerate(gw.SETUP_STEPS):
+        win.setup_step_list.setCurrentRow(i)
+        a.processEvents()
+        page = win._guide_stack.currentWidget()
+        assert page.isVisible(), f"{key} page shows at 1150x760"
+    win.close()
+    win.deleteLater()
+
+    # a dark system palette window shows the same explicit guide
+    from PySide6.QtGui import QPalette, QColor
+    dark = QPalette()
+    dark.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
+    dark.setColor(QPalette.ColorRole.WindowText, QColor(230, 230, 230))
+    a.setPalette(dark)
+    try:
+        win2 = gw.MainWindow(str(proj), choice=_no_dialogs("dark"),
+                             provider_factory=lambda _p: fake)
+        win2.show()
+        win2.resize(900, 600)
+        a.processEvents()
+        assert win2.styleSheet() == "" and \
+            win2.plan_overview.styleSheet() == "", \
+            "no fixed light-only colors in the guide window"
+        win2.resume_setup_btn.click()
+        assert win2._guide_active and win2._guide_step == "credentials"
+        win2.close()
+        win2.deleteLater()
+    finally:
+        a.setPalette(QPalette())
+    a.processEvents()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -6139,6 +6401,8 @@ CASES = {
     "case_setup_wizard_journey": case_setup_wizard_journey,
     "case_setup_wizard_dirty_create": case_setup_wizard_dirty_create,
     "case_setup_wizard_resume": case_setup_wizard_resume,
+    "case_setup_wizard_replacement": case_setup_wizard_replacement,
+    "case_setup_wizard_presentation": case_setup_wizard_presentation,
 }
 
 
