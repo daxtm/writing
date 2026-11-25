@@ -721,6 +721,17 @@ class MainWindow(QMainWindow):
         self._guide_chrome.setVisible(True)
         self._apply_guide_step()
 
+    def _after_save_settle(self):
+        """A Save dispatched by Save-and-resume-later returns to Plan after
+        the write settles; saved answers are never an implicit Accept and no
+        provider action runs."""
+        if not self._pending_guide_leave:
+            return
+        self._pending_guide_leave = False
+        self._leave_guide()
+        self._status("Setup guide closed; saved progress resumes from the "
+                     "saved artifacts (Plan → Resume setup).")
+
     def _leave_guide(self):
         """Advanced planning / resume later: hide the guide chrome and
         return to the ordinary Plan tools. Everything stays as it is."""
@@ -4486,6 +4497,7 @@ class MainWindow(QMainWindow):
         state = self._resolve_dirty()
         if state == "cancel":
             self._pending_action = None
+            self._pending_title = None
             self._status("Create cancelled; nothing was created.")
             return
         if state == "deferred":
@@ -5543,6 +5555,7 @@ class MainWindow(QMainWindow):
         happened (never a rollback promise)."""
         self._pending_action = None   # a stopped save never continues a
         self._pending_root = None     # deferred transition
+        self._pending_guide_leave = False
         self._fail_running_previews()
         self._update_steering_ui()
         kind = self._op_kind
@@ -5605,6 +5618,7 @@ class MainWindow(QMainWindow):
         self._pending_action = None   # a failed save never continues a
         self._pending_root = None     # deferred transition
         self._pending_title = None    # a failed init never carries a title
+        self._pending_guide_leave = False
         self._fail_running_previews()
         if getattr(value, "collision", False) and \
                 self._op_kind in ("import", "scenes_generate",
@@ -5810,6 +5824,8 @@ class MainWindow(QMainWindow):
             self._status(msg)
             if self._pending_action is not None:
                 self._run_pending_action()
+            else:
+                self._after_save_settle()
         elif kind == "credential_save" and isinstance(value, dict):
             self._load_settings_form()
             self._settings_state["loaded"] = True
@@ -5860,6 +5876,9 @@ class MainWindow(QMainWindow):
                 "bible.md is unchanged until you press Accept section")
             self._status(f"saved answers to {value['form_path']} and input "
                          "history; bible.md unchanged until Accept")
+            if self._pending_action is not None:
+                self._run_pending_action()
+            self._after_save_settle()
         elif kind == "bible_accept" and isinstance(value, dict):
             self._bible_preview_section = None
             self._bible_preview_is_current = True
@@ -5912,6 +5931,9 @@ class MainWindow(QMainWindow):
             self._status("saved the edited outline to outline.md (previous "
                          "outline backed up); the candidate file is "
                          "unchanged")
+            if self._pending_action is not None:
+                self._run_pending_action()
+            self._after_save_settle()
         elif kind == "scenes_generate" and isinstance(value, dict):
             self._scenes_preview_baseline = dict(value.get("baseline") or {})
             if value.get("raw") is not None:

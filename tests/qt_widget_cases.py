@@ -5684,6 +5684,143 @@ def case_setup_wizard_journey(root):
     win.close()
 
 
+def case_setup_wizard_dirty_create(root):
+    """Guide dirty continuations (1.2): Back/Next are pure navigation over
+    dirty forms, Save-and-resume-later waits for a successful save and
+    returns to Plan, Cancel/Discard keep or reload the saved state, dirty
+    Create resolves explicitly (Cancel creates nothing, Save settles first
+    then initializes with the carried title), and close offers the same
+    resolve without implicit acceptance."""
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+    import longform_core.planning_operations as planmod
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    proj = root / "p"
+    planmod.init_project(proj)
+    choices, dir_picks = [], []
+    win = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0),
+                        dir_picker=lambda t, p: dir_picks.pop(0),
+                        provider_factory=lambda _p: PlanningFake(responses=[]))
+    win.show()
+    win.create_btn.click()
+    assert win._guide_active and win._guide_step == "location"
+
+    # dirty a bible form on the bible step; Back/Next never save, accept or
+    # discard — the dirty editor survives navigation unchanged
+    win.setup_step_list.setCurrentRow(2)
+    win.bible_begin_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    bible_before = (proj / "bible.md").read_bytes()
+    win.bible_form_edit.setPlainText("unsaved drift")
+    assert win._bible_dirty()
+    win.setup_back_btn.click()
+    assert win._guide_step == "credentials" and win._bible_dirty()
+    win.setup_next_btn.click()
+    assert win._guide_step == "bible" and win._bible_dirty()
+    assert "unsaved drift" in win.bible_form_edit.toPlainText()
+    assert (proj / "bible.md").read_bytes() == bible_before, \
+        "navigation never writes"
+    assert not (proj / "inputs").exists() or \
+        not list((proj / "inputs").glob("bible_answers_*.md")), \
+        "navigation never saves answers"
+
+    # Save-and-resume-later: Cancel keeps the guide and the dirty editor
+    choices.append("Cancel")
+    win.setup_resume_later_btn.click()
+    assert win._guide_active and win._guide_step == "bible"
+    assert win._bible_dirty()
+
+    # Resume later with Discard reloads the saved state and leaves the
+    # guide; nothing was written
+    choices.append("Discard")
+    win.setup_resume_later_btn.click()
+    assert not win._guide_active
+    assert (proj / "bible.md").read_bytes() == bible_before
+    assert not (proj / "inputs").exists() or \
+        not list((proj / "inputs").glob("bible_answers_*.md"))
+
+    # dirty Create: Cancel resolves the dirty form first and creates nothing
+    win.create_btn.click()
+    win.setup_step_list.setCurrentRow(2)
+    win.bible_begin_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.bible_form_edit.setPlainText("second drift")
+    choices.append("Cancel")
+    dest = root / "never"
+    dir_picks.append(str(dest))
+    win.setup_title_edit.setText("Carried")
+    win.setup_create_btn.click()
+    assert not dest.exists(), "a cancelled dirty Create creates nothing"
+    assert win._root == proj
+    assert win._guide_active, "a cancelled Create stays in the guide"
+    assert "second drift" in win.bible_form_edit.toPlainText(), \
+        "a cancelled Create keeps the dirty editor"
+
+    # dirty Create with Save: the save settles on the old project first,
+    # then the picked directory initializes with the carried title
+    choices.append("Save")
+    dir_picks.append(str(dest))
+    win.setup_create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (proj / "inputs" / "bible_answers_title.md").read_text() == \
+        "second drift", "the save completed before the initialization"
+    assert win._root == dest, "the new project binds after settlement"
+    assert json.loads((dest / "project.json").read_text())["title"] == \
+        "Carried", "the location step's title is carried to the new project"
+    assert json.loads((dest / "project.json").read_text())["api_key"] == ""
+    assert win._guide_step == "credentials", \
+        "the guide continues at Credentials after Create"
+
+    # dirty Create with a failed/stale save never continues the init
+    win.setup_title_edit.setText("")
+    old_root = dest
+    win.set_setting("title", "Later Edit")
+    cfg = json.loads((dest / "project.json").read_text())
+    cfg["target_words"] = 1
+    (dest / "project.json").write_text(json.dumps(cfg), encoding="utf-8")
+    stale = root / "stale"
+    choices.append("Save")
+    dir_picks.append(str(stale))
+    win.setup_create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert not stale.exists(), "a refused save never continues the Create"
+    assert win._root == old_root
+    assert json.loads((dest / "project.json").read_text())["target_words"] == 1
+    choices.append("Cancel")   # the refused edit stays unsaved by design
+    win.close()
+    win2 = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0),
+                         dir_picker=lambda t, p: dir_picks.pop(0)
+                         if dir_picks else None,
+                         provider_factory=lambda _p:
+                         PlanningFake(responses=[]))
+    win2.show()
+    # close with dirty planning: Cancel keeps the window open
+    win2.setup_step_list.setCurrentRow(2)
+    win2.bible_begin_btn.click()
+    assert _pump(a, lambda: not win2._busy)
+    win2.bible_form_edit.setPlainText("closing drift")
+    choices.append("Cancel")
+    win2.close()
+    assert win2.isVisible(), "a cancelled close keeps the window"
+    assert "closing drift" in win2.bible_form_edit.toPlainText()
+    # Discard closes cleanly; the saved bible bytes are unchanged
+    choices.append("Discard")
+    win2.close()
+    assert (proj / "bible.md").read_bytes() == bible_before
+    choices.append("Cancel")   # win keeps its refused stale edit by design
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -5742,6 +5879,7 @@ CASES = {
     "case_workflow_parity": case_workflow_parity,
     "case_workflow_presentation": case_workflow_presentation,
     "case_setup_wizard_journey": case_setup_wizard_journey,
+    "case_setup_wizard_dirty_create": case_setup_wizard_dirty_create,
 }
 
 
