@@ -8,12 +8,14 @@ or a conflicting `UV_PYTHON`.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
 import pytest
+from packaging.specifiers import SpecifierSet
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "check.sh"
@@ -299,3 +301,100 @@ def test_real_check_script_enforces_minor_policy():
         if stripped.startswith("uv run"):
             assert "--python" in stripped, f"explicit request missing: {stripped}"
             assert "--managed-python" in stripped, f"managed selection missing: {stripped}"
+
+
+# ---------------------------------------------------------------------------
+# Authoritative pin and PEP 723 mirror agreement (task 1.2, ADR-0013)
+# ---------------------------------------------------------------------------
+
+def expected_mirror_for(pin_text):
+    """Derive the bounded requires-python range from a cpython@X.Y pin, or
+    None when the pin text is not a clean minor request."""
+    m = re.fullmatch(r"cpython@(\d+)\.(\d+)", pin_text.strip())
+    if not m:
+        return None
+    return f">={m.group(1)}.{m.group(2)},<{m.group(1)}.{int(m.group(2)) + 1}"
+
+
+def read_launcher_mirror(path):
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = re.search(r'requires-python\s*=\s*"([^"]+)"', line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def test_authoritative_pin_and_pep723_mirrors_agree():
+    """The root pin is the single authority; both PEP 723 blocks must mirror
+    its inclusive lower/exclusive next-minor bounds, so a one-sided edit of
+    either the pin or a mirror fails this test."""
+    pin_text = (REPO / ".python-version").read_text(encoding="utf-8")
+    expected = expected_mirror_for(pin_text)
+    assert expected is not None, f"pin is not a clean cpython@X.Y request: {pin_text!r}"
+    assert re.fullmatch(r"cpython@3\.13", pin_text.strip()), \
+        "only a reviewed minor bump may change the pin"
+    for launcher in ("longform.py", Path("longform_core") / "cli.py"):
+        actual = read_launcher_mirror(REPO / launcher)
+        assert actual == expected, \
+            f"{launcher} mirror {actual!r} disagrees with the pin-derived {expected!r}"
+
+
+def test_reviewed_mirror_range_accepts_all_313_patches():
+    """Every allowed 3.13 patch satisfies the mirror without a policy edit;
+    3.12 and 3.14+ are rejected."""
+    mirror = read_launcher_mirror(REPO / "longform.py")
+    spec = SpecifierSet(mirror)
+    for patch in ("3.13.9", "3.13.15", "3.13.16"):
+        assert patch in spec, f"allowed patch {patch} must satisfy {mirror}"
+    for version in ("3.12.14", "3.14.0", "3.14.10", "3.15.0"):
+        assert version not in spec, f"{version} must be rejected by {mirror}"
+
+
+def test_one_sided_pin_or_mirror_edit_fails(tmp_path):
+    """The comparison detects a reviewed-pin edit without the mirror and a
+    mirror edit without the pin."""
+    pin = (REPO / ".python-version").read_text(encoding="utf-8")
+    actual_mirror = read_launcher_mirror(REPO / "longform.py")
+    for drifted_pin in ("cpython@3.12", "cpython@3.14"):
+        assert expected_mirror_for(drifted_pin) != actual_mirror, \
+            f"pin {drifted_pin!r} with the unchanged mirror must fail"
+    drifted_mirror = ">=3.12"
+    assert expected_mirror_for(pin) != drifted_mirror, \
+        "a one-sided mirror edit must fail"
+
+
+@pytest.mark.parametrize("minor", ("3.12", "3.14"))
+def test_source_launcher_rejects_explicit_incompatible_requests(tmp_path, minor):
+    """uv only warns on an explicit interpreter request outside the mirror, so
+    the launcher itself refuses: nonzero exit before any application command
+    and its diagnostic names the reviewed pin."""
+    env = dict(os.environ, UV_PYTHON_DOWNLOADS="never")
+    r = subprocess.run(
+        ["uv", "run", "--python", minor, "--script", str(REPO / "longform.py"), "--help"],
+        cwd=str(tmp_path), capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode != 0, (r.stdout, r.stderr)
+    blob = r.stdout + r.stderr
+    assert "pins cpython@3.13" in blob, blob
+    assert "usage:" not in r.stdout
+
+
+def test_source_help_runs_from_outside_the_checkout(tmp_path):
+    """Absolute-path launcher invocation from an unrelated directory with a
+    different default Python: uv provisions or selects an allowed 3.13 patch
+    and prints the existing help."""
+    r = subprocess.run(
+        ["uv", "run", "--script", str(REPO / "longform.py"), "--help"],
+        cwd=str(tmp_path), capture_output=True, text=True,
+        env=dict(os.environ, UV_PYTHON_DOWNLOADS="never"), timeout=300)
+    assert r.returncode == 0, r.stderr
+    assert "usage:" in r.stdout
+
+
+def test_check_source_suite_runs_on_reviewed_cpython_313():
+    """The suite process itself must sit inside the reviewed minor, proving
+    the check entry point's explicit selection."""
+    import platform
+    import sys
+    assert platform.python_implementation() == "CPython"
+    assert sys.version_info[:2] == (3, 13), \
+        f"suite runs on {sys.version}; checks must select cpython@3.13"

@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.12"
+# requires-python = ">=3.13,<3.14"
 # dependencies = ["httpx>=0.27", "pyside6>=6.12.0,<6.13"]
 # ///
 """longform.py - plan-then-collaborate longform fiction pipeline for Featherless.
@@ -31,6 +31,10 @@ Every command is its own step. No command runs another one for you.
 API key: "api_key" in project.json, or else the environment variable named by "api_key_env"
 (default: export FEATHERLESS_API_KEY=...).
 
+Source runs: `uv run --script longform.py ...` selects CPython 3.13 per the
+authoritative .python-version beside this launcher (patch updates are
+automatic; a minor bump is a reviewed pin/mirror change, ADR-0013).
+
 Lorebooks: put SillyTavern World Info JSON files, or character cards (V1/V2/V3, as .png or .json) in
 DIR/lorebooks/. A card becomes a character lorebook: its description + personality as one entry keyed on
 the character's name, plus any embedded character_book entries. Toggle them and mark character books inside the draft loop (lb).
@@ -57,6 +61,7 @@ from longform_core.utils import *      # noqa: F401,F403
 
 
 if __name__ == "__main__":
+    enforce_python_pin()
     try:
         code = main()
     except KeyboardInterrupt:

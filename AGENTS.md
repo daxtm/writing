@@ -4,10 +4,20 @@
 CLI for writers planning and collaboratively drafting long-form fiction with Featherless.ai: a thin `longform.py` launcher over the `longform_core/` package (ADR-0003).
 
 ## Stack
-Python 3.12+, uv script runner, PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
+Python: CPython 3.13 minor, pinned by the authoritative `.python-version`
+(`cpython@3.13`) and mirrored as PEP 723 `requires-python = ">=3.13,<3.14"` in
+`longform.py`/`longform_core/cli.py` (ADR-0013); patch updates within 3.13 are
+automatic, a minor bump is one reviewed pin/mirror change. uv script runner,
+PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
 
 ## Checks
-`./scripts/check.sh`: py_compile; CLI `--help` if uv exists; `== standalone`
+`./scripts/check.sh`: verifies the pin, provisions the latest available
+managed CPython 3.13 patch (`uv python install --upgrade cpython@3.13`),
+reports `== python: CPython 3.13.<patch>` and runs every phase (syntax, CLI
+`--help`, `== standalone`, both pytest processes) on that explicitly selected
+interpreter — host Python, active environments and `UV_PYTHON` cannot override
+it, and missing/malformed pins, other minors, non-CPython or missing uv fail
+early; `== standalone`
 (builds `dist/longform` through `scripts/build-standalone.sh` and runs the frozen
 executable tests — needs uv and a C compiler providing `cc` for the test-only
 network guard, never skipped); source pytest for the remaining regression and
@@ -22,6 +32,9 @@ PySide6 (~hundreds of MB of wheel downloads plus installed size, and the matchin
 use even for CLI-only users, as accepted in ADR-0006; GUI imports stay lazy, so `--help` needs no display.
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
+Source runs use an explicitly selected CPython 3.13; the launcher itself exits
+nonzero when the running interpreter's minor disagrees with `.python-version`
+(uv only warns on a conflicting explicit `--python` request).
 A bare `uv run --script longform.py` (or a copied standalone executable with no
 arguments, such as a file-manager double-click) opens the GUI for the current
 directory; `gui` accepts an optional DIR.
