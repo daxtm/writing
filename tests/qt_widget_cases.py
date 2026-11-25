@@ -5529,12 +5529,16 @@ def case_setup_wizard_journey(root):
 
     missing = root / "guideproj"
     dir_picks = []
+    consents = []
+
+    def _consent(*_a, **_k):
+        return consents.pop(0)
     fake = PlanningFake(
         fragments=[("<outline>ONE BODY", " tail</outline>"),
                    ("<outline>TWO BODY", " tail</outline>")])
     fake.parallel = True
     win = gw.MainWindow(str(missing),
-                        choice=_no_dialogs("wizard journey"),
+                        choice=_consent,
                         dir_picker=lambda t, p: dir_picks.pop(0),
                         provider_factory=lambda _p: fake)
     win.show()
@@ -5583,6 +5587,26 @@ def case_setup_wizard_journey(root):
     assert (missing / "project.json").read_bytes() == before
     assert "session" in win.credential_status.text().lower()
 
+    # plaintext-save consent: Cancel writes nothing; Save stores the key in
+    # project.json only after the explicit plaintext warning is accepted
+    consents.append("Cancel")
+    win.credential_entry.setText(PROJECT_SENTINEL)
+    win.credential_save_btn.click()
+    assert (missing / "project.json").read_bytes() == before, \
+        "a cancelled consent writes nothing"
+    consents.append("Save")
+    win.credential_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    cfg = json.loads((missing / "project.json").read_text())
+    assert cfg["api_key"] == PROJECT_SENTINEL, \
+        "consented Save stores the key in the api_key field"
+    assert fake.calls == []
+    assert win._session_key == SESSION_SENTINEL, \
+        "an active session key is kept; Save never touches the session"
+    win.credential_clear_session_btn.click()
+    assert win._session_key is None
+    assert win._ready["creds_ok"], "the consented saved key now applies"
+
     # Bible: local composition only — begin, fill the fixed form, save
     # answers (bible.md unchanged), accept the section; zero provider calls
     win.setup_step_list.setCurrentRow(2)
@@ -5604,6 +5628,15 @@ def case_setup_wizard_journey(root):
     assert _pump(a, lambda: not win._busy)
     assert "The Long Tower" in (missing / "bible.md").read_text()
     assert fake.calls == [], "bible composition is entirely local"
+    assert (missing / "inputs" / "bible_answers_title.md").is_file(), \
+        "saved answers accumulate in the inputs/ history"
+    assert not hasattr(win, "bible_accept_all_btn"), \
+        "acceptance stays per-section; no all-sections gate exists"
+    n_calls = len(fake.calls)
+    win.bible_skip_btn.click()
+    assert "skipped" in win.status.text().lower()
+    assert len(fake.calls) == n_calls and \
+        (missing / "bible.md").read_bytes() != b"", "skip writes nothing"
 
     # Outline: explicit Generate with a paused two-candidate stream; the
     # first fragments are visible while the gate is closed and nothing is
@@ -5681,6 +5714,7 @@ def case_setup_wizard_journey(root):
     scenes[0]["status"] = "planned"
     _write_json(missing / "scenes.json", scenes)
     assert win._guide_active is False, "the guide closed for drafting"
+    assert not consents, "no unexpected consent dialog appeared"
     win.close()
 
 
@@ -5877,7 +5911,17 @@ def case_setup_wizard_resume(root):
     assert win.credential_entry.text() == ""
     assert (proj / "project.json").read_bytes() == before_cfg
     assert fake.calls == []
-    win.setup_step_list.setCurrentRow(2)
+
+    # a session key is window-only: closing and reopening loses it while
+    # the saved key keeps applying (interruption during credentials)
+    win.close()
+    win = _win()
+    assert win._session_key is None, "a session key never survives close"
+    assert win._ready["creds_ok"], "the saved key still applies on reentry"
+    assert win.credential_entry.text() == "", \
+        "no masked entry is pre-filled from the saved key"
+    win.resume_setup_btn.click()
+    assert win._guide_step == "bible"
 
     # interrupted journey: save answers without accepting, then close
     win.setup_step_list.setCurrentRow(2)
