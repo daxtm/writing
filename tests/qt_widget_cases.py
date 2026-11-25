@@ -8,6 +8,7 @@ that raises on failure; any failing case (or missing PySide6) exits nonzero.
 
 import json
 import os
+import re
 import sys
 import tempfile
 import traceback
@@ -5491,6 +5492,185 @@ def case_workflow_parity(root):
         a.processEvents()
 
 
+def case_setup_wizard_journey(root):
+    """Ordered setup guide (gui-project-setup-wizard, task 1.1): from a
+    missing directory, Create enters a reopenable same-window guide —
+    location/title/defaults, masked session credentials, local bible
+    composition, paused streamed outline candidates, scene cards and the
+    first unfinished Write handoff. Every action is explicit; no terminal
+    or config/preset editing helper runs, no implicit generation/choose/
+    accept ever fires, and provider calls are bounded and paused."""
+    import longform_core.gui_window as gw
+    a = app()
+    import longform_core.utils as utils
+    import longform_core.defaults as dfl
+
+    def _no_terminal(*_a, **_k):
+        raise AssertionError("terminal/editor helper called")
+
+    utils.edit_text = _no_terminal
+    utils.ask = _no_terminal
+    utils.page = _no_terminal
+    utils.pydoc.pager = _no_terminal
+    os.environ.pop("FEATHERLESS_API_KEY", None)
+
+    missing = root / "guideproj"
+    dir_picks = []
+    fake = PlanningFake(
+        fragments=[("<outline>ONE BODY", " tail</outline>"),
+                   ("<outline>TWO BODY", " tail</outline>")])
+    fake.parallel = True
+    win = gw.MainWindow(str(missing),
+                        choice=_no_dialogs("wizard journey"),
+                        dir_picker=lambda t, p: dir_picks.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    assert fake.calls == [], "opening a missing project makes no provider call"
+
+    # Create… enters the guide at the location step; nothing is picked,
+    # initialized or created by entering
+    win.create_btn.click()
+    assert win._guide_active and win._guide_step == "location"
+    assert win.setup_step_list.count() == 6
+    assert win.setup_step_list.currentRow() == 0
+    assert win.setup_step_label.text().startswith("Step 1 of 6")
+    assert not missing.exists(), "entering the guide creates nothing"
+
+    # Create project picks the directory and initializes the complete
+    # bundled defaults; the guide continues at Credentials
+    dir_picks.append(str(missing))
+    win.setup_title_edit.setText("Guide Story")
+    win.setup_create_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert fake.calls == [], "initialization makes no provider call"
+    cfg = json.loads((missing / "project.json").read_text())
+    assert cfg["api_key"] == "" and cfg["title"] == "Guide Story", \
+        "a new project.json uses the typed title and the forced empty key"
+    assert (missing / "writer_preset.json").read_bytes() == \
+        dfl.writer_preset_bytes(), "Create ships the bundled preset"
+    for name in ("bible.md", "state.md", "scenes.json", "summaries.json"):
+        assert (missing / name).is_file(), name
+    for d in ("trees", "outlines", "critiques", "checks", "state_history",
+              "lorebooks", "bible_history"):
+        assert (missing / d).is_dir(), d
+    assert win._guide_step == "credentials", "the guide continues its order"
+    assert win.setup_step_label.text().startswith("Step 2 of 6")
+    assert win.setup_step_list.currentRow() == 1
+
+    # Credentials: masked entry plus Use for this session only; nothing is
+    # written and no request runs
+    from PySide6.QtWidgets import QLineEdit
+    assert win.credential_entry.echoMode() == QLineEdit.EchoMode.Password
+    win.credential_entry.setText(SESSION_SENTINEL)
+    before = (missing / "project.json").read_bytes()
+    win.credential_use_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert win.credential_entry.text() == ""
+    assert fake.calls == [], "Use for this session makes no request"
+    assert (missing / "project.json").read_bytes() == before
+    assert "session" in win.credential_status.text().lower()
+
+    # Bible: local composition only — begin, fill the fixed form, save
+    # answers (bible.md unchanged), accept the section; zero provider calls
+    win.setup_step_list.setCurrentRow(2)
+    assert win._guide_step == "bible"
+    assert win.setup_step_label.text().startswith("Step 3 of 6")
+    assert win.current_tool() == "bible"
+    win.bible_begin_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    form = win.bible_form_edit.toPlainText()
+    assert "# Section: Title" in form and "A: " in form
+    bible_before = (missing / "bible.md").read_bytes()
+    win.bible_form_edit.setPlainText(
+        form.replace("A: ", "A: The Long Tower", 1))
+    win.bible_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "bible.md unchanged" in win.status.text()
+    assert (missing / "bible.md").read_bytes() == bible_before
+    win.bible_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "The Long Tower" in (missing / "bible.md").read_text()
+    assert fake.calls == [], "bible composition is entirely local"
+
+    # Outline: explicit Generate with a paused two-candidate stream; the
+    # first fragments are visible while the gate is closed and nothing is
+    # saved; Choose is the only way outline.md appears
+    win.setup_step_list.setCurrentRow(3)
+    assert win._guide_step == "outline"
+    assert win.setup_step_label.text().startswith("Step 4 of 6")
+    assert win.current_tool() == "outline"
+    win.refresh(force=True)   # reload panes: the bible accept invalidated
+                              # the outline pane's captured baseline
+    win.outline_notes_edit.setPlainText("Keep chapters short.")
+    fake.gate = threading.Event()
+    win.outline_generate_btn.click()
+    try:
+        assert _pump(a, lambda: fake.started >= 2), "both candidates started"
+        win.outline_stream_list.setCurrentRow(0)
+        assert _pump(a, lambda: "ONE BODY" in win.outline_stream.toPlainText()), \
+            "candidate 1's fragment streams while the gate is closed"
+        assert win._busy
+        assert not list((missing / "outlines").glob("candidate_*.md")), \
+            "no candidate file exists before completion"
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "the worker settles on release"
+    assert len(win._outline_candidates) == 2
+    assert not (missing / "outline.md").exists()
+    n_calls = len(fake.calls)
+    win.outline_list.setCurrentRow(0)
+    chosen = (win._outline_overview or {})["candidates"][0]
+    win.outline_choose_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    body = re.sub(r"^<!-- notes:.*?-->\n", "",
+                  (missing / "outlines" / chosen).read_text())
+    assert (missing / "outline.md").read_text() == body, \
+        "choosing saves that candidate without the notes comment"
+    assert "BODY" in (missing / "outline.md").read_text()
+    assert len(fake.calls) == n_calls, "choosing a saved candidate is local"
+
+    # Scene cards: explicit Generate from the saved outline, then Accept;
+    # the preview alone never replaces scenes.json
+    fake.responses = ['<scenes>[{"chapter": 1, "title": "Yard", "pov": '
+                      '"Mara", "setting": "the yard", "characters": '
+                      '["Mara"], "goal": "count windows", "conflict": '
+                      '"wind", "outcome": "counted", "beats": ["Mara '
+                      'counts."], "target_words": 1700}]</scenes>']
+    fake.started = 0
+    fake.gate = None
+    win.setup_step_list.setCurrentRow(4)
+    assert win._guide_step == "scenes"
+    assert win.setup_step_label.text().startswith("Step 5 of 6")
+    assert win.current_tool() == "scenes"
+    win.scenes_generate_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert any(c[0] == "chat" for c in fake.calls)
+    assert "Yard" in win.scenes_preview.toPlainText()
+    assert not json.loads((missing / "scenes.json").read_text()), \
+        "a preview never replaces scenes.json"
+    win.scenes_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    scenes = json.loads((missing / "scenes.json").read_text())
+    assert scenes[0]["id"] == "s01" and scenes[0]["status"] == "planned"
+
+    # Write handoff: navigation only — the first unfinished scene is
+    # selected with its saved head and steering; no generation, no status
+    # change and no provider call
+    win.setup_step_list.setCurrentRow(5)
+    assert win._guide_step == "write"
+    assert win.setup_step_label.text().startswith("Step 6 of 6")
+    n_calls = len(fake.calls)
+    win.setup_enter_write_btn.click()
+    assert not win._busy
+    assert win.current_stage() == "write"
+    assert win._scene_sel == "s01"
+    assert len(fake.calls) == n_calls, "the handoff makes no provider call"
+    scenes[0]["status"] = "planned"
+    _write_json(missing / "scenes.json", scenes)
+    assert win._guide_active is False, "the guide closed for drafting"
+    win.close()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -5548,6 +5728,7 @@ CASES = {
     "case_workflow_dirty_busy": case_workflow_dirty_busy,
     "case_workflow_parity": case_workflow_parity,
     "case_workflow_presentation": case_workflow_presentation,
+    "case_setup_wizard_journey": case_setup_wizard_journey,
 }
 
 
