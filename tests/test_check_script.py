@@ -97,7 +97,10 @@ def run_script(tmp_repo, tmp_path, with_uv=True, extra_env=None):
 
 
 def log_lines(tmp_repo):
-    return (tmp_repo / "log").read_text(encoding="utf-8").splitlines()
+    log = tmp_repo / "log"
+    if not log.is_file():
+        return []
+    return log.read_text(encoding="utf-8").splitlines()
 
 
 def assert_logged_commands(tmp_repo, expected):
@@ -220,7 +223,7 @@ def test_check_script_failing_pytest_propagates(tmp_repo, tmp_path):
 def test_check_script_failing_frozen_tests_fail_checks(tmp_repo, tmp_path):
     r = run_script(tmp_repo, tmp_path, with_uv=True, extra_env={"FAKE_STANDALONE_EXIT": "5"})
     assert r.returncode == 5
-    assert_logged_commands(tmp_repo, EXPECTED_ORDER[:5])
+    assert_logged_commands(tmp_repo, EXPECTED_ORDER[:6])
     assert "== standalone" in r.stdout
     assert "== tests" not in r.stdout
 
@@ -228,7 +231,7 @@ def test_check_script_failing_frozen_tests_fail_checks(tmp_repo, tmp_path):
 def test_check_script_failing_build_fails_checks(tmp_repo, tmp_path):
     r = run_script(tmp_repo, tmp_path, with_uv=True, extra_env={"FAKE_BUILD_EXIT": "7"})
     assert r.returncode == 7
-    assert_logged_commands(tmp_repo, EXPECTED_ORDER[:4])
+    assert_logged_commands(tmp_repo, EXPECTED_ORDER[:5])
     assert "== standalone" in r.stdout
     assert "== tests" not in r.stdout
 
@@ -237,7 +240,7 @@ def test_check_script_missing_build_script_fails_checks(tmp_repo, tmp_path):
     (tmp_repo / "scripts" / "build-standalone.sh").unlink()
     r = run_script(tmp_repo, tmp_path, with_uv=True)
     assert r.returncode != 0
-    assert_logged_commands(tmp_repo, EXPECTED_ORDER[:3])
+    assert_logged_commands(tmp_repo, EXPECTED_ORDER[:4])
     assert "== standalone" in r.stdout
     assert "== tests" not in r.stdout
 
