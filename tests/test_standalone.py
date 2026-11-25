@@ -323,31 +323,115 @@ def run_source(args, root: Path, cwd=None, extra_env=None, timeout=300):
 # Session-scoped build through the production script
 # ---------------------------------------------------------------------------
 
+def read_python_pin(root=REPO):
+    """The authoritative cpython@X.Y request, or None when the pin is missing,
+    unreadable or malformed (never a patch)."""
+    try:
+        text = (Path(root) / ".python-version").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text if re.fullmatch(r"cpython@\d+\.\d+", text) else None
+
+
+def interpreter_of(python_exe):
+    """(implementation, version_tuple) reported by an interpreter executable,
+    or None when it cannot be queried."""
+    try:
+        r = subprocess.run(
+            [str(python_exe), "-c",
+             "import platform; print(platform.python_implementation() + ' ' + "
+             "platform.python_version())"],
+            capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or " " not in r.stdout.strip():
+        return None
+    impl, _, version = r.stdout.strip().partition(" ")
+    parts = []
+    for part in version.split(".")[:3]:
+        if not part.isdigit():
+            return None
+        parts.append(int(part))
+    return impl, tuple(parts)
+
+
+def cache_mismatch(exe, venv_py, sidecar_path, inputs, request=None):
+    """None when the artifact may be reused under the reviewed minor pin, else
+    a reason. The pin, the sidecar's requested minor and actual
+    implementation/full version, the actual build-venv implementation/minor
+    and ordinary input freshness must all agree; patch differences within the
+    pinned minor never invalidate, and a failure is never a silent fallback."""
+    request = request or read_python_pin(exe.parent.parent)
+    if request is None:
+        return ".python-version missing or malformed"
+    if not exe.is_file():
+        return f"no artifact at {exe}"
+    if not venv_py.is_file():
+        return f"build venv interpreter missing at {venv_py}"
+    if not sidecar_path.is_file():
+        return f"build sidecar missing at {sidecar_path}"
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "build sidecar unreadable"
+    interp = sidecar.get("interpreter") or {}
+    if interp.get("requested") != request:
+        return f"sidecar requested {interp.get('requested')!r}, pin is {request!r}"
+    version = interp.get("version")
+    if interp.get("implementation") != "CPython":
+        return f"sidecar records implementation {interp.get('implementation')!r}, expected CPython"
+    if not isinstance(version, str) or not version.startswith(
+            f"{request.split('@')[1]}."):
+        return f"sidecar records version {version!r}, outside the {request!r} minor"
+    actual = interpreter_of(venv_py)
+    if actual is None:
+        return f"could not query the build venv interpreter at {venv_py}"
+    impl, ver = actual
+    if impl != "CPython":
+        return f"build venv interpreter is {impl}, expected CPython"
+    if f"{ver[0]}.{ver[1]}" != request.split("@")[1]:
+        return f"build venv interpreter is {ver[0]}.{ver[1]}.x, expected {request}"
+    if not all(p.stat().st_mtime_ns <= exe.stat().st_mtime_ns for p in inputs):
+        return "stale against build inputs"
+    return None
+
+
+def rebuild_standalone(runner=None):
+    """Rebuild through the production script; a failure never falls back to
+    the old executable."""
+    runner = runner or subprocess.run
+    proc = runner(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
+                  capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        pytest.fail("scripts/build-standalone.sh failed:\n"
+                    + (proc.stdout or "") + "\n" + (proc.stderr or ""))
+
+
 @pytest.fixture(scope="session")
 def built(tmp_path_factory, net_guard):
     """Build once per session through the documented script, then copy only the
     executable into a temporary directory with spaces. An artifact that is
     newer than every build input (e.g. produced by ./scripts/check.sh moments
-    earlier) is reused; anything missing or stale is rebuilt by the script."""
+    earlier) is reused; anything missing, stale, built under another requested
+    or actual implementation/minor, or with missing/unreadable metadata is
+    rebuilt by the script, and a failed rebuild fails the session."""
     if not BUILD_SCRIPT.is_file():
         pytest.fail(f"scripts/build-standalone.sh not found at {BUILD_SCRIPT}: the documented "
                     "build entry point does not exist, so the standalone owner journey cannot run")
     exe = REPO / "dist" / BINARY_NAME
     venv_py = REPO / "build" / "standalone" / "venv" / "bin" / "python"
+    sidecar = REPO / "dist" / "longform-build.json"
     inputs = [BUILD_SCRIPT, REPO / "scripts" / "standalone-requirements.txt", REPO / "longform.py"]
     inputs += sorted((REPO / "longform_core").glob("*.py"))
     inputs += sorted((REPO / "longform_core" / "resources").glob("*.json"))
     inputs += [REPO / "scripts" / "standalone_sidecars.py"]
     inputs += sorted((REPO / "scripts" / "standalone-licenses").glob("*"))
-    fresh = (exe.is_file() and venv_py.is_file()
-             and all(p.stat().st_mtime_ns <= exe.stat().st_mtime_ns for p in inputs))
-    if not fresh:
-        print("\nbuilding standalone executable via scripts/build-standalone.sh ...")
-        proc = subprocess.run(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
-                              capture_output=True, text=True, timeout=3600)
-        if proc.returncode != 0:
-            pytest.fail("scripts/build-standalone.sh failed:\n"
-                        + (proc.stdout or "") + "\n" + (proc.stderr or ""))
+    inputs += [REPO / ".python-version"]
+    reason = cache_mismatch(exe, venv_py, sidecar, inputs)
+    if reason:
+        print(f"\nrebuilding standalone executable via scripts/build-standalone.sh "
+              f"(cache rejected: {reason}) ...")
+        rebuild_standalone()
     if not exe.is_file():
         pytest.fail(f"build script reported success but no artifact at {exe}")
     if not os.access(exe, os.X_OK):
@@ -355,12 +439,131 @@ def built(tmp_path_factory, net_guard):
     if not venv_py.is_file():
         pytest.fail(f"build venv interpreter missing at {venv_py}; the build script did not "
                     "provision its documented build environment")
+    still_bad = cache_mismatch(exe, venv_py, sidecar, inputs)
+    if still_bad:
+        pytest.fail(f"rebuilt artifact is not usable under the pin: {still_bad}")
     copied_dir = tmp_path_factory.mktemp("copied dir with spaces")
     copied = copied_dir / BINARY_NAME
     shutil.copy2(exe, copied)
     copied.chmod(0o755)
     return types.SimpleNamespace(exe=exe, copied=copied, copied_dir=copied_dir, venv_py=venv_py,
                                  guard_so=net_guard.so)
+
+
+# ---------------------------------------------------------------------------
+# Artifact reuse under the minor pin: synthetic cache contracts (task 1.4)
+# ---------------------------------------------------------------------------
+
+def make_synthetic_cache(tmp_path, *, requested="cpython@3.13", impl="CPython",
+                         version="3.13.15", venv_version="3.13.15",
+                         sidecar="present", pin="cpython@3.13"):
+    """A fake dist/build layout with sidecar metadata and a fake build-venv
+    python, all newer than the freshness inputs."""
+    root = tmp_path / "repo"
+    root.mkdir(exist_ok=True)
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    (root / "dist").mkdir(exist_ok=True)
+    venv_bin = root / "build" / "standalone" / "venv" / "bin"
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    if pin is not None:
+        (root / ".python-version").write_text(pin + "\n", encoding="utf-8")
+    marker = root / "scripts" / "standalone-requirements.txt"
+    marker.write_text("httpx==0.28.1\n", encoding="utf-8")
+    exe = root / "dist" / "longform"
+    exe.write_bytes(b"\x7fELF-fake-standalone")
+    exe.chmod(0o755)
+    sc = root / "dist" / "longform-build.json"
+    if sidecar == "present":
+        sc.write_text(json.dumps({"interpreter": {
+            "requested": requested, "implementation": impl, "version": version,
+        }}), encoding="utf-8")
+    elif sidecar == "legacy":  # pre-policy sidecar without a requested pin
+        sc.write_text(json.dumps({"interpreter": {
+            "implementation": impl, "version": version}}), encoding="utf-8")
+    elif sidecar == "unreadable":
+        sc.write_bytes(b"\x00\xff not json")
+    fake_py = venv_bin / "python"
+    fake_py.write_text(f"#!/usr/bin/env bash\nprintf 'CPython {venv_version}\\n'\nexit 0\n")
+    fake_py.chmod(0o755)
+    return root, exe, fake_py, sc
+
+
+def synthetic_mismatch(root, request=None):
+    return cache_mismatch(root / "dist" / "longform",
+                          root / "build" / "standalone" / "venv" / "bin" / "python",
+                          root / "dist" / "longform-build.json",
+                          [root / "scripts" / "standalone-requirements.txt"],
+                          request=request)
+
+
+@pytest.mark.parametrize("sidecar_version,venv_version",
+                         [("3.13.9", "3.13.15"), ("3.13.15", "3.13.9")])
+def test_cache_reuse_accepts_other_313_patches(tmp_path, sidecar_version, venv_version):
+    """Different 3.13 patches in the recorded artifact and the build venv do
+    not invalidate reuse and never require patch equality."""
+    root, *_ = make_synthetic_cache(tmp_path, version=sidecar_version,
+                                    venv_version=venv_version)
+    assert synthetic_mismatch(root) is None
+
+
+def test_cache_invalidated_by_other_minor_even_when_newer(tmp_path):
+    """An artifact recorded under another actual minor is rejected despite
+    being newer than every build input."""
+    root, *_ = make_synthetic_cache(tmp_path, version="3.12.14")
+    reason = synthetic_mismatch(root)
+    assert reason is not None
+    assert "cpython@3.13" in reason, reason
+    assert "stale" not in reason, reason
+
+
+def test_cache_invalidated_by_other_requested_minor(tmp_path):
+    root, *_ = make_synthetic_cache(tmp_path, requested="cpython@3.12")
+    reason = synthetic_mismatch(root)
+    assert reason is not None and "cpython@3.12" in reason, reason
+
+
+def test_cache_invalidated_by_other_implementation(tmp_path):
+    root, *_ = make_synthetic_cache(tmp_path, impl="PyPy")
+    reason = synthetic_mismatch(root)
+    assert reason is not None and "PyPy" in reason, reason
+
+
+@pytest.mark.parametrize("mode,fragment", [
+    ("absent", "missing"),
+    ("unreadable", "unreadable"),
+    ("legacy", "requested"),
+])
+def test_cache_invalidated_by_missing_or_incomplete_metadata(tmp_path, mode, fragment):
+    root, *_ = make_synthetic_cache(tmp_path, sidecar=mode)
+    reason = synthetic_mismatch(root)
+    assert reason is not None and fragment in reason, reason
+
+
+def test_cache_invalidated_by_wrong_build_venv_minor(tmp_path):
+    root, *_ = make_synthetic_cache(tmp_path, venv_version="3.12.14")
+    reason = synthetic_mismatch(root)
+    assert reason is not None and "3.12" in reason and "cpython@3.13" in reason, reason
+
+
+def test_cache_invalidated_when_pin_missing_or_malformed(tmp_path):
+    root, *_ = make_synthetic_cache(tmp_path, pin=None)
+    reason = synthetic_mismatch(root)
+    assert reason is not None and ".python-version" in reason, reason
+    root, *_ = make_synthetic_cache(tmp_path, pin="cpython@3.13.15")
+    reason = synthetic_mismatch(root)
+    assert reason is not None and ".python-version" in reason, reason
+
+
+def test_rebuild_failure_propagates_without_fallback():
+    """A failed rebuild fails the session instead of accepting the old
+    executable."""
+    class FakeFailure:
+        returncode = 5
+        stdout = ""
+        stderr = "boom"
+
+    with pytest.raises(pytest.fail.Exception, match="build-standalone.sh failed"):
+        rebuild_standalone(runner=lambda *a, **k: FakeFailure())
 
 
 # ---------------------------------------------------------------------------

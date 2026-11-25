@@ -172,7 +172,11 @@ uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests
 
 It runs the same source suite and provisions/builds through the production
 script whenever `dist/longform` is missing or older than the build inputs (the
-frozen tests reuse a freshly built artifact rather than rebuilding). The
+frozen tests reuse a freshly built artifact rather than rebuilding). The pin
+is treated as a build input: cached artifacts or build environments whose
+recorded or actual implementation/minor disagree with `.python-version`, or
+whose metadata is missing or unreadable, are rebuilt through the production
+script — patch differences within 3.13 do not invalidate a valid cache. The
 public `gui` command still accepts only native Wayland; `offscreen` is used
 only inside the test subprocess for widget cases.
 
