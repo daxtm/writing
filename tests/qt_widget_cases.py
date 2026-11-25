@@ -5935,7 +5935,10 @@ def case_setup_wizard_resume(root):
     is a safe interruption, every reopen resumes at the earliest
     incomplete saved step, provisionally saved answers and unchosen
     streamed candidates never complete a step, and a fully set-up project
-    shows Reopen setup and resumes at Write."""
+    shows Reopen setup and resumes at Write. The reopened journey then
+    continues through the Write stage into continuity, reports, revision
+    and a destination-picked export with the one worker and no terminal
+    helper (task 1.8)."""
     import longform_core.gui_window as gw
     import longform_core.planning_operations as planmod
     a = app()
@@ -6076,6 +6079,100 @@ def case_setup_wizard_resume(root):
     win.setup_enter_write_btn.click()
     assert win.current_stage() == "write" and win._scene_sel == "s01"
     assert win._guide_active is False
+
+    # --- the same one worker continues the drafting loop: a paused
+    # single-candidate stream, steered, accepted through the tray
+    fake.responses = None
+    fake.fragments = [("Mara counts the lit windows.",
+                       "\n\nShe ticks off each pane.")]
+    fake.started = 0
+    fake.gate = threading.Event()
+    win.steer_editor.setPlainText("Keep it slow.")
+    win.count_spin.setValue(1)
+    win.generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 1), "draft generation started"
+    assert _pump(a, lambda: "Mara counts" in win.preview.toPlainText()), \
+        "the fragment streams into the provisional preview"
+    fake.gate.set()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((proj / "trees" / "s01.json").read_text())
+    assert t.get("steer") == "Keep it slow.", \
+        "unsaved steering is captured before the provider call"
+    cand = t["nodes"][t["nodes"]["n1"]["id"]]
+    assert t["head"] is None and cand["text"] == \
+        "Mara counts the lit windows.\n\nShe ticks off each pane.", \
+        "the completed candidate is saved as a branch without a head move"
+    win.tray.setCurrentRow(0)
+    win.accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    t = json.loads((proj / "trees" / "s01.json").read_text())
+    head = t["head"]
+    assert head == "n1" and t["nodes"][head]["parent"] is None and \
+        t["nodes"][head]["text"] == "Mara counts the lit windows.\n\n" \
+        "She ticks off each pane.", "Accept moves head to the candidate"
+
+    # --- continuity, reports and revision with the same synthetic
+    # credentials; the export goes through the destination picker
+    fake.responses = [REVIEW_RECORD_S1, REVIEW_CRITIQUE, REVIEW_PASSAGE,
+                      "NO CHANGES"]
+    fake.started = 0
+    fake.gate = None
+    win.close()
+    out = root / "wizard_manuscript.md"
+    win = gw.MainWindow(str(proj), choice=_no_dialogs("wizard write"),
+                        provider_factory=lambda _p: fake,
+                        save_picker=lambda title, default: (str(out), ""))
+    win.show()
+    win.select_item("manuscript", "s01", None)
+    win.select_tool("continuity")
+    state_before = (proj / "state.md").read_text(encoding="utf-8")
+    win.update_state_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "Mara opens the gate and counts the windows." in \
+        win.continuity_preview.toPlainText()
+    assert (proj / "state.md").read_text(encoding="utf-8") == state_before, \
+        "the continuity preview never writes"
+    win.continuity_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "Mara is inside the yard." in \
+        (proj / "state.md").read_text(encoding="utf-8")
+    assert list((proj / "state_history").glob("before_s01_*.md"))
+
+    win.select_tool("reports")
+    win.critique_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    win.report_save_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert (proj / "critiques" / "s01.md").is_file()
+
+    win.select_tool("revision")
+    win.select_item("manuscript", "s01", None)
+    win.revise_btn.click()
+    assert _pump(a, lambda: not win._busy), "first passage settles"
+    assert "Mara counts the lit windows." in win.revise_view.toPlainText()
+    win.revise_accept_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    assert "revised 1 passages" in win.status.text()
+    t = json.loads((proj / "trees" / "s01.json").read_text())
+    n1 = t["nodes"]["n1"]
+    assert n1["history"][-1]["by"] == "revise" and \
+        n1["history"][-1]["text"] == "Mara counts the lit windows.\n\n" \
+        "She ticks off each pane.", "revision keeps the pre-edit history"
+
+    win.export_btn.click()
+    assert _pump(a, lambda: not win._busy)
+    if not out.is_file():
+        raise AssertionError(f"export status: {win.status.text()!r}, "
+                             f"busy={win._busy}, out={out}")
+    assert "Mara pushed the gate open." in out.read_text(encoding="utf-8"), \
+        "the exported manuscript carries the accepted revision"
+    assert str(out) in win.status.text()
+    win.close()
+
+    # a final reopen reads everything back with no re-run
+    win = _win()
+    assert win.resume_setup_btn.text() == "Reopen setup"
+    assert win._ready["cards"]["count"] == 1
     win.close()
 
 
@@ -6117,9 +6214,10 @@ def case_setup_wizard_replacement(root):
         "conflict": "c", "outcome": "o", "beats": ["b"],
         "target_words": 1700, "status": "writing"}])
     _write_json(proj / "trees" / "s01.json", {
-        "head": "n1", "nodes": {"n1": {"id": "n1", "parent": None,
-                                       "text": "Mara counts.",
-                                       "children": []}}})
+        "head": "n1", "counter": 1,
+        "nodes": {"n1": {"id": "n1", "parent": None,
+                         "text": "Mara counts.",
+                         "children": []}}})
     fake = PlanningFake(responses=[])
     fake.parallel = True
     choices = []
