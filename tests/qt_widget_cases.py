@@ -4170,6 +4170,48 @@ def case_review_status_export(root):
         "export pauses on unsaved report edits"
 
 
+def case_review_export_enterable_with_warnings(root):
+    """Review and Export are deliberately enterable on a project without
+    saved scenes: advisory content, no modal gate, no automatic call."""
+    import longform_core.gui_window as gw
+    a = app()
+    import reader_support as rs
+    project = rs.build_project(root / "bare", project_extra={
+        "api_key": "sk-test"})
+    (project / "bible.md").write_text("## Title\nThe Tower\n",
+                                      encoding="utf-8")
+
+    def no_provider(_p):
+        raise AssertionError("entering Review/Export must not call")
+
+    win = gw.MainWindow(str(project), choice=_no_dialogs("enterable"),
+                        provider_factory=no_provider)
+    win.show()
+    try:
+        # Review is enterable; missing continuity facts are advisory.
+        win.select_stage("review")
+        assert win.current_stage() == "review"
+        assert not win._busy, "entering Review starts no operation"
+        # Export is enterable; the saved status stays read-only advice.
+        win.select_stage("export")
+        assert win.current_stage() == "export"
+        assert not win._busy
+        win.select_tool("status")
+        win.status_btn.click()
+        assert _pump(a, lambda: not win._busy), "status settles without scenes"
+        text = win.status_view.toPlainText()
+        assert text.strip(), "advisory status facts are shown, not a gate"
+        # Nothing was written by entering and reading the stages.
+        after = {f.name: f.read_bytes() for f in project.iterdir()
+                 if f.is_file()}
+        assert (after.get("project.json") ==
+                (project / "project.json").read_bytes())
+        win.close()
+    finally:
+        win.deleteLater()
+        a.processEvents()
+
+
 class SettleFake(ReviewChatFake):
     """Review fake whose Stop is observed after the in-flight request
     returns: cooperative Stop never kills a request, only the next
@@ -5164,6 +5206,8 @@ CASES = {
     # top-level window, so this case must not linger before them)
     "case_workflow_stages": case_workflow_stages,
     "case_workflow_readiness": case_workflow_readiness,
+    "case_review_export_enterable_with_warnings":
+        case_review_export_enterable_with_warnings,
 }
 
 
