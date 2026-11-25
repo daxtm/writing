@@ -2,7 +2,7 @@
 
 `scripts/build-standalone.sh` freezes `longform.py` — the full CLI **and** the
 native Qt Widgets GUI — into one copyable executable, `dist/longform`, using
-PyInstaller one-file console mode. It bundles the Python 3.11 interpreter, the
+PyInstaller one-file console mode. It bundles the Python 3.13 interpreter, the
 current CLI and `longform_core`, the httpx dependency closure, certifi's TLS
 certificate data, and the PySide6/Qt GUI runtime with its Wayland platform
 plugins. The source/uv launcher remains fully supported; both entry points run
@@ -13,8 +13,11 @@ files, and the same native-Wayland-only policy.
 
 - Linux x86_64 with glibc **2.34 or newer** (the pinned PySide6 wheels are
   `manylinux_2_34`; musl and other OSes/architectures are not built).
-- `uv`, with a provisionable Python 3.11 (`uv python install 3.11` is run for
-  you if needed).
+- `uv`, with a provisionable Python 3.13 (`uv python install 3.13` is run for
+  you if needed). The build requires CPython **3.12 or newer**: PySide6 6.12.0
+  loses one reference to `None` on every Qt call on 3.11, so long GUI sessions
+  abort with `none_dealloc`; CPython 3.12+ makes `None` immortal (PYSIDE-3424,
+  fixed only in the unreleased shiboken 6.12.1).
 - Network access **for provisioning build dependencies only**; the built
   application never installs or downloads anything.
 - Build dependency versions are fully pinned in

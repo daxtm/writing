@@ -4,7 +4,7 @@
 CLI for writers planning and collaboratively drafting long-form fiction with Featherless.ai: a thin `longform.py` launcher over the `longform_core/` package (ADR-0003).
 
 ## Stack
-Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
+Python 3.12+, uv script runner, PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
 
 ## Checks
 `./scripts/check.sh`: py_compile; CLI `--help` if uv exists; `== standalone`

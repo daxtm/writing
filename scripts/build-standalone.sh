@@ -2,8 +2,14 @@
 # Build the standalone native executable: dist/longform (+ informational sidecars).
 #
 # Supported build host: Linux x86_64, glibc. Build prerequisites: uv (with a
-# provisionable Python 3.11) and network access for provisioning build
+# provisionable Python 3.13) and network access for provisioning build
 # dependencies. The built application never installs or provisions anything.
+#
+# The build interpreter must be CPython >= 3.12: PySide6 6.12.0 on CPython 3.11
+# drops one reference to None on every Qt call, so any long-running GUI aborts
+# with "Fatal Python error: none_dealloc: deallocating None". CPython 3.12+
+# makes None immortal, which neutralises that binding bug; PySide6 6.12.0 has
+# no patch release that fixes it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -24,13 +30,13 @@ if ! { ldd --version 2>&1 | head -1 || true; } | grep -qi "glibc\|GNU libc"; the
 fi
 [ -f "$REQ" ] || err "missing pinned build requirements: $REQ"
 
-echo "== build-standalone: provisioning Python 3.11 + pinned build closure"
+echo "== build-standalone: provisioning Python 3.13 + pinned build closure"
 # Provisioning may use the network; the built application cannot.
-uv venv --clear --python 3.11 "$WORK/venv" 1>&2 || err "could not provision a Python 3.11 build environment (uv venv failed)"
+uv venv --clear --python 3.13 "$WORK/venv" 1>&2 || err "could not provision a Python 3.13 build environment (uv venv failed)"
 PY="$WORK/venv/bin/python"
 uv pip install --python "$PY" -r "$REQ" 1>&2 || err "could not install pinned build requirements from $REQ"
-"$PY" -c 'import sys; assert sys.version_info[:2] == (3, 11), sys.version; import ssl' \
-	|| err "provisioned build Python is unusable"
+"$PY" -c 'import sys; assert sys.version_info[:2] >= (3, 12), sys.version; import ssl' \
+	|| err "provisioned build Python is unusable (CPython >= 3.12 required)"
 
 echo "== build-standalone: freezing longform.py with PyInstaller"
 "$PY" -m PyInstaller \

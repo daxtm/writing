@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = ["httpx>=0.27", "pyside6>=6.12.0,<6.13"]
 # ///
 """longform.py - plan-then-collaborate longform fiction pipeline for Featherless.

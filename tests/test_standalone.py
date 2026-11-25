@@ -1119,7 +1119,11 @@ def test_build_json_records_source_platform_interpreter_deps(built, build_json):
 
     interp = build_json["interpreter"]
     assert interp["implementation"] == "CPython"
-    assert interp["version"].startswith("3.11.")
+    version = tuple(int(part) for part in interp["version"].split(".")[:2])
+    assert version >= (3, 12), (
+        f"build interpreter {interp['version']} is below 3.12: PySide6 6.12.0 drops "
+        "a reference to None on every Qt call there (PYSIDE-3424), so long GUI sessions "
+        "abort with 'none_dealloc: deallocating None'")
 
     deps = build_json["dependencies"]
     for name, version in (("pyinstaller", "6.22.3"), ("pyinstaller-hooks-contrib", "2026.10"),
@@ -1152,6 +1156,39 @@ def test_build_json_records_source_platform_interpreter_deps(built, build_json):
         actual = next((v for k, v in deps.items()
                        if k.lower().replace("_", "-") == name), None)
         assert actual == version, f"{name}: expected {version}, recorded {actual}"
+
+
+NONE_PROBE = textwrap.dedent("""
+    import os
+    import sys
+
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    app = QApplication([])
+    widget = QWidget()
+    before = sys.getrefcount(None)
+    for i in range(50000):
+        widget.setEnabled(i % 2 == 0)
+        widget.clearMask()
+        widget.setToolTip(None)
+    after = sys.getrefcount(None)
+    print(f"None refcount {before} -> {after}")
+    assert after >= before, after
+""")
+
+
+def test_build_python_does_not_drop_none_refcount_under_qt_churn(built):
+    """PYSIDE-3424: PySide6 6.12.0's abi3 wheels assume immortal None. On
+    CPython 3.11 every None-returning Qt call loses a reference and a
+    long-running GUI aborts with 'none_dealloc: deallocating None'; CPython
+    3.12+ makes None immortal. The build interpreter must never leak here."""
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.run([str(built.venv_py), "-c", NONE_PROBE],
+                          capture_output=True, text=True, timeout=120, env=env)
+    assert proc.returncode == 0, (
+        "build interpreter leaks references to None under Qt call churn "
+        f"(PYSIDE-3424); exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}")
 
 
 def test_build_json_records_gui_versions_plugins_and_native_inspection(built, build_json):

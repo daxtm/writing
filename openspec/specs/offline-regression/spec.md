@@ -24,7 +24,7 @@ is separate from offline test execution.
 The command `uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests` SHALL discover and run the regression suite from the repository root without installing the CLI as a package. Model and CLI tests SHALL require neither a display nor GUI imports; widget cases SHALL execute in an isolated subprocess using `QT_QPA_PLATFORM=offscreen`.
 
 #### Scenario: Run the documented test command
-- **WHEN** a maintainer runs the documented command in a checkout with Python 3.11+ and uv available
+- **WHEN** a maintainer runs the documented command in a checkout with Python 3.12+ and uv available
 - **THEN** tests are collected, the passing summary reports a nonzero number of passed tests, and the command exits 0
 - **AND** widget cases actually execute offscreen without requiring a Wayland/X11 session
 
