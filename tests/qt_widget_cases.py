@@ -126,6 +126,12 @@ def case_workflow_stages(root):
             assert not win.generate_btn.isVisible(), \
                 f"Generate must hide outside Write (was visible in {stage})"
             assert not win.count_spin.isVisible()
+        # Every Write tool stays reachable through its semantic route.
+        for tool in gw.STAGE_TOOLS["write"]:
+            win.select_tool(tool)
+            assert win.current_tool() == tool
+            assert win._stage_tools["write"].currentWidget().isVisible(), \
+                f"Write tool {tool} shows its pane"
         # Stop stays global: the same Stop button is shared by every stage.
         assert win.stop_btn.isVisible()
         win.select_stage("plan")
@@ -1022,6 +1028,14 @@ def case_draft_generate_acceptance(root):
                         provider_factory=lambda _p: fake)
     win.show()
     win.select_item("manuscript", "s001", None)
+    assert win.current_stage() == "write", \
+        "draft steering/generation live in the Write stage"
+    assert win.steer_editor.isVisible() and win.generate_btn.isVisible() \
+        and win.count_spin.isVisible(), \
+        "steering, candidate count and Generate are visible in Write"
+    win.select_tool("draft")
+    assert win.tray.isVisible(), "the candidate tray is reachable in Write"
+    win.select_tool("manuscript")
     assert win.generate_btn.isEnabled(), \
         "Generate must be enabled for a writable scene with prerequisites"
 
@@ -1037,6 +1051,8 @@ def case_draft_generate_acceptance(root):
 
     assert _pump(a, lambda: "First chunk." in win.preview.toPlainText()), \
         "streamed deltas reach the provisional preview"
+    assert win.steer_editor.isVisible() and win.generate_btn.isVisible(), \
+        "the Write steering row stays visible while the request streams"
     head_before = saved_tree["head"]
     win.select_item("node", "s001", "n1")
     assert "Mara counts the lit windows." in win.reading.toPlainText(), \
