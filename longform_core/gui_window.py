@@ -16,8 +16,8 @@ from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-    QSpinBox, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget, QLineEdit,
+    QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget, QLineEdit,
 )
 
 from .prompt import tail_trim_chars
@@ -76,6 +76,61 @@ TOOL_TITLES = {
     "continuity": "Continuity", "reports": "Reports", "revision": "Revision",
     "status": "Export & status",
 }
+# Ordered setup guide (gui-project-setup-wizard): presentation keys only.
+# Resume derives from saved artifacts via planning_operations.readiness()
+# (whose `next` uses exactly these keys, with "setup" → "location"); no
+# wizard-owned document exists.
+SETUP_STEPS = ("location", "credentials", "bible", "outline", "scenes",
+               "write")
+SETUP_STEP_TITLES = {
+    "location": "Location, title and defaults",
+    "credentials": "Credentials",
+    "bible": "Story bible answers",
+    "outline": "Outline",
+    "scenes": "Scene cards",
+    "write": "First unfinished scene",
+}
+SETUP_STEP_INSTRUCTIONS = {
+    "location":
+        "Step 1 of 6 — Location, title and defaults. Type a title, press "
+        "Create project and pick the directory: complete bundled defaults "
+        "(project.json with a forced empty api_key, bible.md, state.md, "
+        "scenes.json, summaries.json and the bundled nonsecret "
+        "writer_preset.json) are initialized locally with no provider call. "
+        "Existing files are never replaced; a stopped run keeps what it "
+        "wrote and a retry fills only missing paths.",
+    "credentials":
+        "Step 2 of 6 — Credentials. Paste a masked key and press Use for "
+        "this session (this window only), or Save to this project after "
+        "the plaintext warning; Test connection is the only request. "
+        "Optional for local and manual work — generated planning needs a "
+        "key. The value is never displayed or prefilled.",
+    "bible":
+        "Step 3 of 6 — Story bible answers. Begin answering, fill the "
+        "fixed form and Save answers (bible.md is unchanged), then press "
+        "Accept section to replace only that section. Entirely local: no "
+        "AI bible call exists. Skipped or still-template sections stay "
+        "visibly incomplete without blocking unrelated work.",
+    "outline":
+        "Step 4 of 6 — Outline. Generate outlines and Reroll are provider "
+        "requests that may cost money; every candidate streams into a "
+        "provisional live preview. Choose as outline.md (or Save edited "
+        "outline) is the only way outline.md changes. Back/Next never "
+        "generate, choose or accept, and they never start scene planning.",
+    "scenes":
+        "Step 5 of 6 — Scene cards. Generate cards is a provider request "
+        "that may cost money and streams the raw JSON into a provisional "
+        "preview; edit validated cards, then Accept preview replaces "
+        "scenes.json (previous list backed up, trees kept). Regenerating "
+        "drafted scenes confirms first.",
+    "write":
+        "Step 6 of 6 — Enter Write opens the first saved scene that is "
+        "not marked done with its saved head and steering. It is "
+        "navigation: it never generates, accepts, marks done or updates "
+        "continuity. All scenes done means an explicit sidebar selection "
+        "instead; nothing is reset.",
+}
+
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -212,6 +267,15 @@ class MainWindow(QMainWindow):
         self._scenes_card_row = None
         self._scenes_preview_baseline = None
         self._scenes_force_once = False
+        # Setup guide state (gui-project-setup-wizard): transient window
+        # state only — resume is derived from saved artifacts, never from
+        # a wizard-owned document, and no guide flag is persisted.
+        self._guide_active = False
+        self._guide_step = "location"
+        self._guide_row_guard = False
+        self._guide_dir = None        # location picked on the guide step
+        self._pending_title = None    # carried with the pending Create
+        self._pending_guide_leave = False  # resume-later save settling
         try:
             self._session = dop.session_info(
                 self._root, session=self._availability())
@@ -304,10 +368,13 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         top.setSpacing(6)
         self.create_btn = QPushButton("Create…")
-        self.create_btn.setToolTip("Initialize a project directory with the "
-                                   "CLI init contents (create-missing-only; "
-                                   "existing files are never replaced)")
-        self.create_btn.clicked.connect(self.create_project)
+        self.create_btn.setToolTip("Open the ordered setup guide at the "
+                                   "location step: a title and a picked "
+                                   "directory initialize the CLI init "
+                                   "contents (create-missing-only; existing "
+                                   "files are never replaced). Nothing is "
+                                   "created until Create project is pressed.")
+        self.create_btn.clicked.connect(self.create_guide)
         top.addWidget(self.create_btn)
         self.open_btn = QPushButton("Open…")
         self.open_btn.setToolTip("Open an existing project directory; "
@@ -374,7 +441,19 @@ class MainWindow(QMainWindow):
         plan_tools.addTab(self._build_bible_tab(), TOOL_TITLES["bible"])
         plan_tools.addTab(self._build_outline_tab(), TOOL_TITLES["outline"])
         plan_tools.addTab(self._build_scenes_tab(), TOOL_TITLES["scenes"])
-        plan_l.addWidget(plan_tools, 1)
+        # The plan tools double as the guide's step content: the guide
+        # chrome sits above this stack and a guide step just selects the
+        # matching tool — there is no second copy of any editor (the
+        # location and Write handoff steps have their own guide-only
+        # pages because they are navigation, not planning panes).
+        self._guide_stack = QStackedWidget()
+        self._guide_stack.addWidget(plan_tools)              # 0: tool pane
+        self._guide_stack.addWidget(self._build_guide_location())  # 1
+        self._guide_stack.addWidget(self._build_guide_write())     # 2
+        plan_l.addWidget(self._guide_stack, 1)
+        self._guide_chrome = self._build_guide_chrome()
+        plan_l.addWidget(self._guide_chrome)
+        self._guide_chrome.setVisible(False)
         self.stages.addTab(plan_page, STAGE_TITLES["plan"])
 
         # ---- Write: manuscript/branches/draft tools + scene-labelled
@@ -466,9 +545,20 @@ class MainWindow(QMainWindow):
         self.plan_next_btn.setToolTip("Open the recommended next Plan/Write "
                                       "tool; never starts an operation")
         self.plan_next_btn.clicked.connect(self._plan_next)
+        self.resume_setup_btn = QPushButton("Resume setup")
+        self.resume_setup_btn.setToolTip("Open the ordered setup guide at "
+                                         "the earliest incomplete saved "
+                                         "step; navigation never "
+                                         "initializes, generates, chooses "
+                                         "or accepts. A complete setup "
+                                         "reopens the guide for review "
+                                         "without regenerating anything.")
+        self.resume_setup_btn.clicked.connect(
+            lambda: self._enter_setup_guide())
         row = QHBoxLayout()
         row.addWidget(QLabel("Recommended next step:"))
         row.addWidget(self.plan_next_btn)
+        row.addWidget(self.resume_setup_btn)
         row.addStretch(1)
         l.addLayout(row)
         self.plan_overview = QPlainTextEdit()
@@ -479,6 +569,388 @@ class MainWindow(QMainWindow):
             "nothing and makes no provider call.")
         l.addWidget(self.plan_overview, 1)
         return box
+
+    # ------------------------------------------------------- setup guide
+
+    def _build_guide_chrome(self):
+        """Setup guide chrome: step list, heading/instructions and the
+        navigation buttons. Back/Next/Save and resume later/Advanced
+        planning never generate, choose, accept, discard or initialize."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.setup_step_label = QLabel("")
+        self.setup_step_label.setWordWrap(True)
+        self.setup_step_label.setAccessibleName("Setup guide step")
+        l.addWidget(self.setup_step_label)
+        self.setup_step_list = QListWidget()
+        self.setup_step_list.setAccessibleName("Setup guide steps")
+        self.setup_step_list.setMaximumHeight(104)
+        self.setup_step_list.setToolTip(
+            "The ordered setup steps; selecting one only moves the guide — "
+            "no action runs and no saved work changes")
+        for key in SETUP_STEPS:
+            self.setup_step_list.addItem(
+                QListWidgetItem(SETUP_STEP_TITLES[key]))
+        self.setup_step_list.currentRowChanged.connect(self._on_guide_step_row)
+        l.addWidget(self.setup_step_list)
+        btns = QHBoxLayout()
+        self.setup_back_btn = QPushButton("&Back")
+        self.setup_back_btn.setToolTip("Move to the previous step; a pure "
+                                       "navigation action that never "
+                                       "generates, chooses, accepts or "
+                                       "discards anything")
+        self.setup_back_btn.clicked.connect(self.setup_back)
+        self.setup_next_btn = QPushButton("&Next")
+        self.setup_next_btn.setToolTip("Move to the next step and explain "
+                                       "what it is still missing; never an "
+                                       "implicit Generate, Choose, Accept "
+                                       "or Discard")
+        self.setup_next_btn.clicked.connect(self.setup_next)
+        self.setup_resume_later_btn = QPushButton("Save and resume later")
+        self.resume_later_mnemonic = "S and resume la&ter"
+        self.setup_resume_later_btn.setText(self.resume_later_mnemonic)
+        self.setup_resume_later_btn.setToolTip(
+            "Offer to save dirty forms, wait for a successful save, then "
+            "return to Plan. Saved answers and edits are never an implicit "
+            "Accept, and no provider action runs.")
+        self.setup_resume_later_btn.clicked.connect(self.setup_resume_later)
+        self.setup_advanced_btn = QPushButton("A&dvanced planning")
+        self.setup_advanced_btn.setToolTip("Leave the guide for the "
+                                           "ordinary Plan tools; every "
+                                           "manual/advanced path stays "
+                                           "reachable and nothing changes")
+        self.setup_advanced_btn.clicked.connect(self._leave_guide)
+        for b in (self.setup_back_btn, self.setup_next_btn,
+                  self.setup_resume_later_btn, self.setup_advanced_btn):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        return box
+
+    def _build_guide_location(self):
+        """Guide location step: title, bundled-defaults summary and the
+        explicit Create project action (the directory picker opens from
+        that action); an existing valid project shows identity guidance."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.setup_identity_label = QLabel("")
+        self.setup_identity_label.setWordWrap(True)
+        l.addWidget(self.setup_identity_label)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Title"))
+        self.setup_title_edit = QLineEdit()
+        self.setup_title_edit.setPlaceholderText(
+            "Project title (optional; Untitled by default; used only when "
+            "project.json is newly created)")
+        self.setup_title_edit.setAccessibleName("New project title")
+        row.addWidget(self.setup_title_edit, 1)
+        l.addLayout(row)
+        self.setup_defaults_label = QLabel(
+            "Create project initializes, with no provider call and no "
+            "preset download: project.json (supported nonsecret defaults, "
+            "forced empty api_key, FEATHERLESS_API_KEY environment name), "
+            "bible.md, state.md, scenes.json, summaries.json and the "
+            "bundled nonsecret writer_preset.json. Existing files are "
+            "never replaced. A directory picker opens when you press "
+            "Create project.")
+        self.setup_defaults_label.setWordWrap(True)
+        l.addWidget(self.setup_defaults_label)
+        btns = QHBoxLayout()
+        self.setup_create_btn = QPushButton("&Create project")
+        self.setup_create_btn.setToolTip(
+            "Initialize the picked directory with the complete bundled "
+            "defaults (create-missing-only; a name collision or a stopped "
+            "run reports partial paths and a retry fills only the missing "
+            "ones). No provider call runs.")
+        self.setup_create_btn.clicked.connect(self.create_project)
+        btns.addWidget(self.setup_create_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        l.addStretch(1)
+        return box
+
+    def _build_guide_write(self):
+        """Guide Write handoff: read-only saved-facts summary and the
+        explicit Enter Write navigation action."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.setup_write_label = QLabel("")
+        self.setup_write_label.setWordWrap(True)
+        l.addWidget(self.setup_write_label)
+        self.setup_enter_write_btn = QPushButton("Enter &Write")
+        self.setup_enter_write_btn.setToolTip(
+            "Select the first saved scene that is not marked done and open "
+            "the Write stage with its saved head and steering. Navigation "
+            "only: no generation, acceptance, mark-done or continuity "
+            "update runs.")
+        self.setup_enter_write_btn.clicked.connect(self.setup_enter_write)
+        btns = QHBoxLayout()
+        btns.addWidget(self.setup_enter_write_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        self.setup_write_hint = QLabel(
+            "All scenes done, or no valid saved cards? The status line "
+            "explains the deliberate manual selection; nothing is ever "
+            "reset or generated on this step.")
+        self.setup_write_hint.setWordWrap(True)
+        l.addWidget(self.setup_write_hint)
+        l.addStretch(1)
+        return box
+
+    def _setup_resume_step(self):
+        """Earliest incomplete guide step from the saved-artifact readiness
+        facts (the shared source of truth; no wizard-state document)."""
+        r = self._ready or {}
+        nxt = r.get("next", "setup")
+        return "location" if nxt == "setup" else nxt
+
+    def _enter_setup_guide(self, step=None):
+        """Open the ordered setup guide (Create, or Plan's Resume/Reopen
+        setup). Entering is view-only: no initialization, provider request
+        or automatic content acceptance ever runs here."""
+        if step is None:
+            step = self._setup_resume_step()
+        if step not in SETUP_STEPS:
+            step = "location"
+        self._guide_active = True
+        self._guide_step = step
+        self.select_stage("plan")
+        self._guide_chrome.setVisible(True)
+        self._apply_guide_step()
+
+    def _leave_guide(self):
+        """Advanced planning / resume later: hide the guide chrome and
+        return to the ordinary Plan tools. Everything stays as it is."""
+        self._guide_active = False
+        self._guide_chrome.setVisible(False)
+        self._guide_stack.setCurrentIndex(0)
+        self.select_stage("plan")
+        self._wire_tab_order()
+
+    def _guide_step_row(self, step):
+        return SETUP_STEPS.index(step) if step in SETUP_STEPS else 0
+
+    def _on_guide_step_row(self, row):
+        if not self._guide_active or self._guide_row_guard:
+            return
+        if 0 <= row < len(SETUP_STEPS):
+            self._guide_step = SETUP_STEPS[row]
+            self._apply_guide_step()
+
+    def _apply_guide_step(self):
+        """Show one step: its instructions plus the existing pane (or the
+        guide-only location/Write pages). Step changes are navigation."""
+        step = self._guide_step
+        idx = SETUP_STEPS.index(step)
+        self._guide_row_guard = True
+        try:
+            self.setup_step_list.setCurrentRow(idx)
+        finally:
+            self._guide_row_guard = False
+        self.setup_step_label.setText(self._guide_step_text(step))
+        if step == "location":
+            self._guide_stack.setCurrentIndex(1)
+            self._update_guide_location()
+        elif step == "write":
+            self._guide_stack.setCurrentIndex(2)
+            self._update_guide_write()
+        else:
+            self._guide_stack.setCurrentIndex(0)
+            self.select_tool({"credentials": "setup"}.get(step, step))
+        self.setup_back_btn.setEnabled(idx > 0)
+        self.setup_next_btn.setEnabled(idx < len(SETUP_STEPS) - 1)
+        self._wire_tab_order()
+
+    def _downstream_note(self):
+        """Plain saved-facts note about downstream work when saved planning
+        is replaced: existing scene cards and draft trees stay unchanged
+        (they are not regenerated, deleted or re-synchronized)."""
+        base = plan.canonical_root(self._root)
+        scenes = None
+        try:
+            sp = base / "scenes.json"
+            if sp.is_file():
+                scenes = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — a malformed list still counts
+            scenes = None
+        cards = len(scenes) if isinstance(scenes, list) else 0
+        trees = 0
+        try:
+            td = base / "trees"
+            if td.is_dir():
+                trees = sum(1 for _ in td.glob("*.json"))
+        except OSError:
+            trees = 0
+        if not cards and not trees:
+            return None
+        bits = []
+        if cards:
+            bits.append(f"{cards} saved scene card(s)")
+        if trees:
+            bits.append(f"{trees} saved tree file(s)")
+        return ("existing " + " and ".join(bits) + " stay unchanged: "
+                "they are not regenerated or deleted")
+
+    def _guide_step_text(self, step):
+        """Step instructions plus the current saved-facts state."""
+        base = SETUP_STEP_INSTRUCTIONS[step]
+        extra = []
+        r = self._ready or {}
+        if step == "location":
+            if r.get("exists") and r.get("config_ok"):
+                extra.append(
+                    f"This directory already has a project (title "
+                    f"{r.get('title') or '(untitled)'}); Create fills only "
+                    "missing files and never replaces existing "
+                    "title/settings.")
+        elif step == "credentials":
+            if not r.get("creds_ok"):
+                extra.append("No effective credential yet; local tools "
+                             "work without one.")
+        elif step == "bible":
+            b = r.get("bible") or {}
+            if b.get("filled"):
+                extra.append(f"{b['filled']} of {b['sections']} saved "
+                             "section(s) accepted.")
+            if b.get("placeholders"):
+                extra.append("still template: "
+                             + ", ".join(b["placeholders"][:4])
+                             + ("…" if len(b["placeholders"]) > 4 else ""))
+        elif step == "outline":
+            o = r.get("outline") or {}
+            extra.append("saved working outline: "
+                         + ("yes" if o.get("ok") else
+                            "no (candidates in outlines/ do not count "
+                            "until one is chosen)"))
+            note = self._downstream_note()
+            if note:
+                extra.append("replacing it does not update downstream "
+                             "work: " + note)
+        elif step == "scenes":
+            c = r.get("cards") or {}
+            extra.append(f"{c.get('count', 0)} card(s) saved, "
+                         f"{c.get('done', 0)} done")
+        elif step == "write":
+            w = r.get("write") or {}
+            if w.get("scenes"):
+                extra.append(f"first unfinished scene: "
+                             f"{w.get('next_scene') or '(none)'} "
+                             f"({w['scenes'] - w.get('done', 0)} of "
+                             f"{w['scenes']} unfinished)")
+        return base + (" " + " ".join(extra) if extra else "")
+
+    def _update_guide_location(self):
+        r = self._ready or {}
+        if r.get("exists") and r.get("config_ok"):
+            self.setup_identity_label.setText(
+                f"Existing project: title {r.get('title') or '(untitled)'}"
+                + ("; its title and settings are preserved by Create "
+                   "(the typed title does not overwrite them)" if
+                   r.get("setup_ok") else
+                   "; setup is incomplete — Create fills only the missing "
+                   "paths and never resets existing content"))
+        else:
+            self.setup_identity_label.setText(
+                "No valid project.json here yet; Create initializes this "
+                "directory with the complete bundled defaults.")
+
+    def _update_guide_write(self):
+        r = self._ready or {}
+        cards = r.get("cards") or {}
+        w = r.get("write") or {}
+        if not cards.get("ok"):
+            self.setup_write_label.setText(
+                "No valid saved scene cards yet; complete the Scene cards "
+                "step (Accept preview) first.")
+        elif cards.get("done", 0) >= cards.get("count", 0):
+            self.setup_write_label.setText(
+                f"All {cards['count']} saved scene(s) are marked done; "
+                "select a scene in the sidebar to reopen it explicitly. "
+                "Enter Write does not reset any status.")
+        else:
+            self.setup_write_label.setText(
+                f"First unfinished scene: {w.get('next_scene') or '(none)'} "
+                f"({cards['count'] - cards['done']} of {cards['count']} "
+                "unfinished). Enter Write selects it and opens the saved "
+                "head and steering — no generation.")
+
+    def setup_back(self):
+        """Back: pure navigation; editors and saved state are untouched."""
+        i = SETUP_STEPS.index(self._guide_step)
+        if i > 0:
+            self._guide_step = SETUP_STEPS[i - 1]
+            self._apply_guide_step()
+
+    def setup_next(self):
+        """Next: navigation plus an explanation of what is missing; never
+        an implicit Generate, Choose, Accept or Discard."""
+        i = SETUP_STEPS.index(self._guide_step)
+        if i < len(SETUP_STEPS) - 1:
+            self._guide_step = SETUP_STEPS[i + 1]
+            self._apply_guide_step()
+
+    def setup_resume_later(self):
+        """Save and resume later: offer to save dirty forms, wait for the
+        successful async save, then return to Plan. Cancel/failed saves
+        keep the guide on the current step; no acceptance runs."""
+        if self._busy:
+            self._status("An operation is running; wait for it to settle.",
+                         error=True)
+            return
+        if self._planning_dirty():
+            pick = self._choice(
+                "Unsaved planning input",
+                "Save your answers and edits before leaving the guide? "
+                "(Save waits for the write to settle; Discard reloads the "
+                "saved state; Cancel keeps the guide open.)",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self._save_planning_dirty():
+                    return   # refused/stale: the step stays selected
+                self._pending_guide_leave = True
+                return
+            if pick == "Discard":
+                self._discard_planning_dirty()
+            else:
+                return
+        self._leave_guide()
+        self._status("Setup guide closed; saved progress resumes from the "
+                     "saved artifacts (Plan → Resume setup).")
+
+    def setup_enter_write(self):
+        """Guide handoff: select the first saved non-done scene from the
+        saved cards and open Write. No generation, acceptance, mark-done,
+        head move or continuity update ever runs here."""
+        if self._busy:
+            self._status("An operation is running; wait for it to settle.",
+                         error=True)
+            return
+        r = self._ready or {}
+        cards = r.get("cards") or {}
+        w = r.get("write") or {}
+        if not cards.get("ok"):
+            self._status("No valid saved scene cards yet; plan scenes in "
+                         "the guide (or the Scene plan tool) first.",
+                         error=True)
+            return
+        if cards.get("done", 0) >= cards.get("count", 0):
+            self._status("Every saved scene is marked done; select a scene "
+                         "in the sidebar to reopen it explicitly. Nothing "
+                         "was reset.")
+            return
+        scene = w.get("next_scene")
+        if not scene:
+            self._status("No unfinished scene found in the saved cards.",
+                         error=True)
+            return
+        self._leave_guide()
+        self.select_stage("write")
+        self.select_item("manuscript", scene, None)
+        self._status(f"Write opened at {scene} from its saved card, saved "
+                     "head and steering; nothing was generated.")
 
     def _build_steering_box(self):
         """Scene-labelled multiline steering with Save/Clear, candidate
@@ -592,6 +1064,23 @@ class MainWindow(QMainWindow):
         self.plan_next_btn.setText(self._PLAN_NEXT_LABELS.get(
             r["next"], "Go"))
         self._plan_next_route = (r["next"],)
+        self.resume_setup_btn.setText(
+            "Reopen setup" if self._setup_complete(r) else "Resume setup")
+        # guide chrome stays current with saved facts whenever it is visible
+        if getattr(self, "_guide_active", False) and \
+                hasattr(self, "setup_step_label"):
+            self.setup_step_label.setText(
+                self._guide_step_text(self._guide_step))
+            if self._guide_step == "location":
+                self._update_guide_location()
+            elif self._guide_step == "write":
+                self._update_guide_write()
+
+    def _setup_complete(self, r):
+        """Saved-facts completeness for the Resume/Reopen label; no key is
+        required (local tools work without credentials)."""
+        return bool(r.get("setup_ok") and r["bible"]["ok"]
+                    and r["outline"]["ok"] and r["cards"]["ok"])
 
     def _plan_summary_text(self, r):
         if not r["exists"]:
@@ -3957,16 +4446,28 @@ class MainWindow(QMainWindow):
         kind, target = action
         self._pending_root = target
         if kind == "create":
+            title = self._pending_title
+            self._pending_title = None
+
             def fn(sink, token):
-                return plan.init_project(target, token=token, events=sink)
+                return plan.init_project(target, token=token, events=sink,
+                                         title=title)
             self._dispatch(fn, kind="init")
         else:
             def fn(sink, token):
                 return plan.project_overview(target)
             self._dispatch(fn, kind="open")
 
+    def create_guide(self):
+        """Create… opens the ordered setup guide at the location step.
+        Nothing is picked, initialized or created until Create project is
+        pressed on that step."""
+        self._enter_setup_guide("location")
+
     def create_project(self):
-        """Desktop Create: pick a location, initialize create-missing-only."""
+        """Guide Create project: pick a location, initialize
+        create-missing-only; the typed title is carried for a newly created
+        project.json only (an existing one keeps its identity)."""
         if self._busy:
             self._status("An operation is running; Create is disabled until "
                          "it settles.", error=True)
@@ -3977,6 +4478,10 @@ class MainWindow(QMainWindow):
             self._status("No location picked; nothing was created.")
             return
         target = plan.canonical_root(picked)
+        self._guide_dir = picked
+        title = (self.setup_title_edit.text().strip()
+                 if hasattr(self, "setup_title_edit") else "")
+        self._pending_title = title or None
         self._pending_action = ("create", target)
         state = self._resolve_dirty()
         if state == "cancel":
@@ -3987,9 +4492,12 @@ class MainWindow(QMainWindow):
             return   # the save settles first; settlement continues the Create
         self._pending_action = None
         self._pending_root = target
+        title = self._pending_title
+        self._pending_title = None
 
         def fn(sink, token):
-            return plan.init_project(target, token=token, events=sink)
+            return plan.init_project(target, token=token, events=sink,
+                                     title=title)
 
         self._dispatch(fn, kind="init")
 
@@ -4078,6 +4586,7 @@ class MainWindow(QMainWindow):
         self._settling = False
         self._cont = None
         self._cont_editing = None
+        self._pending_title = None    # a new root never inherits a carried title
         self._bind_steering(None)
         self.refresh(force=True)
         self._autoselect()
@@ -4341,7 +4850,25 @@ class MainWindow(QMainWindow):
             stage = "plan"
         tw = self._stage_tools.get(stage)
         entry = tw if tw is not None else self._stage_pages[stage]
-        w(self.stages, entry)
+        if self._guide_active and self._guide_chrome.isVisible():
+            # the guide chrome sits between the stage selector and the tool
+            # chain; the step's own content follows the chrome buttons
+            w(self.stages, self.setup_step_list)
+            w(self.setup_step_list, self.setup_back_btn)
+            w(self.setup_back_btn, self.setup_next_btn)
+            w(self.setup_next_btn, self.setup_resume_later_btn)
+            w(self.setup_resume_later_btn, self.setup_advanced_btn)
+            if self._guide_step == "location":
+                w(self.setup_advanced_btn, self.setup_title_edit)
+                w(self.setup_title_edit, self.setup_create_btn)
+                w(self.setup_create_btn, entry)
+            elif self._guide_step == "write":
+                w(self.setup_advanced_btn, self.setup_enter_write_btn)
+                w(self.setup_enter_write_btn, entry)
+            else:
+                w(self.setup_advanced_btn, entry)
+        else:
+            w(self.stages, entry)
         # every tool chain ends at the shared reading/steering action row
         for other in STAGE_ORDER:
             otw = self._stage_tools.get(other)
@@ -5077,6 +5604,7 @@ class MainWindow(QMainWindow):
         self._update_steering_ui()
         self._pending_action = None   # a failed save never continues a
         self._pending_root = None     # deferred transition
+        self._pending_title = None    # a failed init never carries a title
         self._fail_running_previews()
         if getattr(value, "collision", False) and \
                 self._op_kind in ("import", "scenes_generate",
@@ -5239,6 +5767,12 @@ class MainWindow(QMainWindow):
                     else:
                         msg += "; writer_preset.json imported"
                 self._status(msg)
+                if self._guide_active:
+                    self.refresh(force=True)
+                    self._guide_step = "credentials"
+                    self._apply_guide_step()
+                    self._status(msg + "; guide continues at Credentials")
+                return
             else:
                 self.refresh(force=True)
                 self._status("initialized " + root.name)

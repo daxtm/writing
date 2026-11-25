@@ -1737,11 +1737,13 @@ def case_planning_journey(root):
     # -- Create through the directory picker; nothing without confirmation.
     picks["dir"].append(None)   # a later cancelled pick creates nothing
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert not (missing / "project.json").exists(), \
         "a cancelled directory picker creates nothing"
 
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     import longform_core.config as cfgmod
     import longform_core.defaults as dflmod
@@ -1928,6 +1930,7 @@ def case_planning_create_open(root):
         sorted(str(p) for p in root.rglob("*"))
     dir_picks.append(None)
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert "nothing was created" in win.status.text().lower()
     dir_picks.append(None)
@@ -1939,6 +1942,7 @@ def case_planning_create_open(root):
     # Create with the same root while a partial project is open
     dir_picks.append(str(missing))
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert (missing / "project.json").exists() and (missing / "trees").is_dir()
     assert "initialized" in win.status.text().lower()
@@ -1954,6 +1958,7 @@ def case_planning_create_open(root):
     (missing / "bible.md").unlink()
     dir_picks.append(str(missing))
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert json.loads((missing / "project.json").read_text())["title"] == "Kept"
     assert (missing / "bible.md").exists(), "only missing files are filled"
@@ -2041,6 +2046,7 @@ def case_planning_create_open(root):
     (coll / "writer_preset.json").mkdir()   # collision, not a regular file
     dir_picks[:] = [str(coll)]
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert "not a regular file" in win.status.text()
     assert "created before the error" in win.status.text(), \
@@ -2050,6 +2056,7 @@ def case_planning_create_open(root):
     (coll / "writer_preset.json").rmdir()
     dir_picks[:] = [str(coll)]
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert win._root == coll, "retry after correction binds the new project"
     assert "writer_preset.json" in win.status.text()
@@ -4667,6 +4674,7 @@ def case_planning_deferred_create(root):
     choices.append("Cancel")
     dir_picks.append(str(dest))
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert not dest.exists(), "a cancelled resolution creates nothing"
     assert win._root == old
     assert json.loads((old / "project.json").read_text())["title"] == \
@@ -4676,6 +4684,7 @@ def case_planning_deferred_create(root):
     choices.append("Save")
     dir_picks.append(str(dest))
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert json.loads((old / "project.json").read_text())["title"] == \
         "Dirty Old", "the save completed before the initialization"
@@ -4716,6 +4725,7 @@ def case_planning_deferred_create(root):
     choices.append("Save")
     dir_picks.append(str(dest2))
     win2.create_btn.click()
+    win2.setup_create_btn.click()
     assert _pump(a, lambda: not win2._busy)
     assert not dest2.exists(), "a stale save never continues the deferred Create"
     assert win2._root == old2, "the current project remains selected"
@@ -4754,6 +4764,7 @@ def case_planning_deferred_create(root):
         choices.append("Save")
         dir_picks.append(str(dest3))
         win3.create_btn.click()
+        win3.setup_create_btn.click()
         assert _pump(a, lambda: not win3._busy)
         assert win3._root == old3, "a stopped init never binds the new project"
         assert (dest3 / "project.json").is_file(), \
@@ -4766,6 +4777,7 @@ def case_planning_deferred_create(root):
         planmod.init_project = real_init
         dir_picks.append(str(dest3))
         win3.create_btn.click()
+        win3.setup_create_btn.click()
         assert _pump(a, lambda: not win3._busy)
         assert win3._root == dest3, "retry after the Stop binds the new project"
         assert (dest3 / "writer_preset.json").read_bytes() == \
@@ -4833,6 +4845,7 @@ def case_credentials_session(root):
                         provider_factory=lambda _p: fake)
     win.show()
     win.create_btn.click()
+    win.setup_create_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert (fresh / "project.json").is_file()
     assert json.loads((fresh / "project.json").read_text())["api_key"] == ""
