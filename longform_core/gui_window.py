@@ -39,11 +39,43 @@ def pre_start_guidance():
 
 REFRESH_MS = 2000
 
-# Tabs
-MANUSCRIPT, BRANCHES, DRAFT, SCENE, CONTEXT, LORE, NOTES = 0, 1, 2, 3, 4, 5, 6
-SETUP, BIBLE = 7, 8
-OUTLINE, SCENES = 9, 10
-CONTINUITY, REVIEW, REVISION, STATUS = 11, 12, 13, 14
+# Four primary stages (semantic routes; never numeric tab walls).
+STAGE_ORDER = ("plan", "write", "review", "export")
+STAGE_TITLES = {"plan": "Plan", "write": "Write", "review": "Review",
+                "export": "Export"}
+STAGE_PURPOSE = {
+    "plan": "Plan — set up the project, answer the story bible, save the "
+            "outline and the scene cards. Inputs: this directory, a writer "
+            "preset and (for generated planning) provider credentials. "
+            "Output: project.json, bible.md, outline.md, scenes.json.",
+    "write": "Write — draft the selected scene: saved steering, candidate "
+             "generation and acceptance, manual passages, branches, lore "
+             "and notes. Input: accepted scene cards. Output: "
+             "trees/<scene>.json.",
+    "review": "Review — continuity (state/summaries), compression, "
+              "critique/check reports and passage revision for saved "
+              "scenes. Input: saved prose and summaries. Output: "
+              "state.md, summaries.json, critiques/, checks/.",
+    "export": "Export — pick a destination and export the manuscript; the "
+              "full saved status stays read-only. Output: the picked "
+              "manuscript file.",
+}
+# Stage-local secondary tools (labelled panels, not equal-priority tabs).
+STAGE_TOOLS = {
+    "plan": ("overview", "setup", "bible", "outline", "scenes"),
+    "write": ("manuscript", "branches", "draft", "scene", "context",
+              "lore", "notes"),
+    "review": ("continuity", "reports", "revision"),
+    "export": ("status",),
+}
+TOOL_TITLES = {
+    "overview": "Overview", "setup": "Project settings", "bible": "Bible",
+    "outline": "Outline", "scenes": "Scene plan",
+    "manuscript": "Manuscript", "branches": "Branches", "draft": "Draft",
+    "scene": "Scene", "context": "Context", "lore": "Lore", "notes": "Notes",
+    "continuity": "Continuity", "reports": "Reports", "revision": "Revision",
+    "status": "Export & status",
+}
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -193,6 +225,9 @@ class MainWindow(QMainWindow):
         self._wire_tab_order()
         self.refresh(force=True)
         self._autoselect()
+        # Plan is the initial page for a project without scene cards yet; a
+        # planned project opens Write (readiness is refined on refresh).
+        self.select_stage("write" if self._card_ids() else "plan")
         self._start_timer()
 
     # ------------------------------------------------------------------ UI
@@ -291,6 +326,13 @@ class MainWindow(QMainWindow):
         self.prose_size.valueChanged.connect(self._apply_prose_size)
         top.addWidget(self.prose_size)
         top.addStretch(1)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setToolTip("Cooperatively stop the running operation "
+                                 "at the next request/chunk/save boundary; "
+                                 "completed writes stay saved")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop)
+        top.addWidget(self.stop_btn)
         root.addLayout(top)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -303,33 +345,134 @@ class MainWindow(QMainWindow):
         right = QWidget()
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(0, 0, 0, 0)
-        self.tabs = QTabWidget()
+        self.stages = QTabWidget()
+        self._stage_pages = {}    # stage key -> page widget
+        self._stage_tools = {}    # stage key -> tool QTabWidget (None for a
+                                  # single-page stage)
+        self.stage_purpose = {}   # stage key -> purpose/next-action label
         self.reading = QPlainTextEdit()
         self.reading.setReadOnly(True)
         self.metadata = QPlainTextEdit()
         self.metadata.setReadOnly(True)
-        self.tabs.addTab(self.reading, "Manuscript")
+
+        # ---- Plan: overview + settings/credentials/preset, bible, outline,
+        # scene plan.
+        plan_page = QWidget()
+        plan_l = QVBoxLayout(plan_page)
+        plan_l.setContentsMargins(0, 0, 0, 0)
+        self._stage_pages["plan"] = plan_page
+        self.stage_purpose["plan"] = QLabel(STAGE_PURPOSE["plan"])
+        self.stage_purpose["plan"].setWordWrap(True)
+        plan_l.addWidget(self.stage_purpose["plan"])
+        plan_tools = QTabWidget()
+        self._stage_tools["plan"] = plan_tools
+        plan_tools.addTab(self._build_plan_overview(),
+                          TOOL_TITLES["overview"])
+        plan_tools.addTab(self._build_setup_tab(), TOOL_TITLES["setup"])
+        plan_tools.addTab(self._build_bible_tab(), TOOL_TITLES["bible"])
+        plan_tools.addTab(self._build_outline_tab(), TOOL_TITLES["outline"])
+        plan_tools.addTab(self._build_scenes_tab(), TOOL_TITLES["scenes"])
+        plan_l.addWidget(plan_tools, 1)
+        self.stages.addTab(plan_page, STAGE_TITLES["plan"])
+
+        # ---- Write: manuscript/branches/draft tools + scene-labelled
+        # steering, candidate count and Generate.
+        write_page = QWidget()
+        write_l = QVBoxLayout(write_page)
+        write_l.setContentsMargins(0, 0, 0, 0)
+        self._stage_pages["write"] = write_page
+        self.stage_purpose["write"] = QLabel(STAGE_PURPOSE["write"])
+        self.stage_purpose["write"].setWordWrap(True)
+        write_l.addWidget(self.stage_purpose["write"])
+        write_tools = QTabWidget()
+        self._stage_tools["write"] = write_tools
+        write_tools.addTab(self.reading, TOOL_TITLES["manuscript"])
         branch_widget = QWidget()
         branch_l = QVBoxLayout(branch_widget)
         branch_l.setContentsMargins(0, 0, 0, 0)
         branch_l.addLayout(self._build_branches_controls())
         branch_l.addWidget(self.metadata, 1)
-        self.tabs.addTab(branch_widget, "Branches")
-        self.tabs.addTab(self._build_draft_tab(), "Draft")
-        self.tabs.addTab(self._build_scene_tab(), "Scene")
-        self.tabs.addTab(self._build_context_tab(), "Context")
-        self.tabs.addTab(self._build_lore_tab(), "Lore")
-        self.tabs.addTab(self._build_notes_tab(), "Notes")
-        self.tabs.addTab(self._build_setup_tab(), "Setup")
-        self.tabs.addTab(self._build_bible_tab(), "Bible")
-        self.tabs.addTab(self._build_outline_tab(), "Outline")
-        self.tabs.addTab(self._build_scenes_tab(), "Scenes")
-        self.tabs.addTab(self._build_continuity_tab(), "Continuity")
-        self.tabs.addTab(self._build_review_tab(), "Review")
-        self.tabs.addTab(self._build_revision_tab(), "Revision")
-        self.tabs.addTab(self._build_status_tab(), "Status")
-        right_l.addWidget(self.tabs, 1)
+        write_tools.addTab(branch_widget, TOOL_TITLES["branches"])
+        write_tools.addTab(self._build_draft_tab(), TOOL_TITLES["draft"])
+        write_tools.addTab(self._build_scene_tab(), TOOL_TITLES["scene"])
+        write_tools.addTab(self._build_context_tab(), TOOL_TITLES["context"])
+        write_tools.addTab(self._build_lore_tab(), TOOL_TITLES["lore"])
+        write_tools.addTab(self._build_notes_tab(), TOOL_TITLES["notes"])
+        write_l.addWidget(write_tools, 1)
+        write_l.addWidget(self._build_steering_box())
+        self.stages.addTab(write_page, STAGE_TITLES["write"])
 
+        # ---- Review: continuity, reports, revision.
+        review_page = QWidget()
+        review_l = QVBoxLayout(review_page)
+        review_l.setContentsMargins(0, 0, 0, 0)
+        self._stage_pages["review"] = review_page
+        self.stage_purpose["review"] = QLabel(STAGE_PURPOSE["review"])
+        self.stage_purpose["review"].setWordWrap(True)
+        review_l.addWidget(self.stage_purpose["review"])
+        review_tools = QTabWidget()
+        self._stage_tools["review"] = review_tools
+        review_tools.addTab(self._build_continuity_tab(),
+                            TOOL_TITLES["continuity"])
+        review_tools.addTab(self._build_review_tab(), TOOL_TITLES["reports"])
+        review_tools.addTab(self._build_revision_tab(),
+                            TOOL_TITLES["revision"])
+        review_l.addWidget(review_tools, 1)
+        self.stages.addTab(review_page, STAGE_TITLES["review"])
+
+        # ---- Export: destination-picked export and read-only full status.
+        export_page = QWidget()
+        export_l = QVBoxLayout(export_page)
+        export_l.setContentsMargins(0, 0, 0, 0)
+        self._stage_pages["export"] = export_page
+        self.stage_purpose["export"] = QLabel(STAGE_PURPOSE["export"])
+        self.stage_purpose["export"].setWordWrap(True)
+        export_l.addWidget(self.stage_purpose["export"])
+        self._stage_tools["export"] = None   # one labelled page, no tool wall
+        export_l.addWidget(self._build_status_tab(), 1)
+        self.stages.addTab(export_page, STAGE_TITLES["export"])
+
+        right_l.addWidget(self.stages, 1)
+        self.stages.currentChanged.connect(self._on_stage_changed)
+        split.addWidget(right)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 3)
+        root.addWidget(split, 1)
+
+        self.status = QLabel("")
+        self.statusBar().addWidget(self.status, 1)
+        self.select_stage("plan")
+
+    def _build_plan_overview(self):
+        """Read-only project overview (saved-artifact readiness); the Plan
+        stage's focused default. Filled by refresh; never writes or calls."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.plan_summary = QLabel("")
+        self.plan_summary.setWordWrap(True)
+        l.addWidget(self.plan_summary)
+        self.plan_next_btn = QPushButton("Go")
+        self.plan_next_btn.setToolTip("Open the recommended next Plan/Write "
+                                      "tool; never starts an operation")
+        self.plan_next_btn.clicked.connect(self._plan_next)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Recommended next step:"))
+        row.addWidget(self.plan_next_btn)
+        row.addStretch(1)
+        l.addLayout(row)
+        self.plan_overview = QPlainTextEdit()
+        self.plan_overview.setReadOnly(True)
+        self.plan_overview.setPlaceholderText(
+            "Project identity, saved planning progress, credential source "
+            "and invalid-source warnings appear here; viewing writes "
+            "nothing and makes no provider call.")
+        l.addWidget(self.plan_overview, 1)
+        return box
+
+    def _build_steering_box(self):
+        """Scene-labelled multiline steering with Save/Clear, candidate
+        count and Generate — visible only inside the Write stage."""
         steer_box = QGroupBox("Steering")
         steer_l = QVBoxLayout(steer_box)
         self.steer_label = QLabel("Steering")
@@ -358,22 +501,66 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.count_spin)
         self.generate_btn = QPushButton("Generate")
         self.generate_btn.clicked.connect(self.generate)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop)
         btns.addWidget(self.generate_btn)
-        btns.addWidget(self.stop_btn)
         steer_l.addLayout(btns)
         self.generate_note = QLabel("")
         steer_l.addWidget(self.generate_note)
-        right_l.addWidget(steer_box)
-        split.addWidget(right)
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 3)
-        root.addWidget(split, 1)
+        return steer_box
 
-        self.status = QLabel("")
-        self.statusBar().addWidget(self.status, 1)
+    # ------------------------------------------------- stage/tool routes
+
+    def current_stage(self):
+        """Semantic key of the selected primary stage."""
+        i = self.stages.currentIndex()
+        return STAGE_ORDER[i] if 0 <= i < len(STAGE_ORDER) else None
+
+    def current_tool(self):
+        """Semantic key of the selected stage-local tool panel."""
+        stage = self.current_stage()
+        if stage is None:
+            return None
+        tools = STAGE_TOOLS[stage]
+        tw = self._stage_tools.get(stage)
+        if tw is None:
+            return tools[0]
+        i = tw.currentIndex()
+        return tools[i] if 0 <= i < len(tools) else None
+
+    def route(self):
+        """(stage, tool) semantic route of the current selection."""
+        return (self.current_stage(), self.current_tool())
+
+    def select_stage(self, stage):
+        """Select one primary stage by its semantic key."""
+        if stage not in STAGE_ORDER:
+            raise ValueError(f"unknown stage: {stage!r}")
+        self.stages.setCurrentIndex(STAGE_ORDER.index(stage))
+
+    def select_tool(self, tool):
+        """Select a stage-local tool panel by its semantic key; selects the
+        owning stage first."""
+        for stage, tools in STAGE_TOOLS.items():
+            if tool in tools:
+                self.select_stage(stage)
+                tw = self._stage_tools.get(stage)
+                if tw is not None:
+                    tw.setCurrentIndex(tools.index(tool))
+                return
+        raise KeyError(f"unknown tool route: {tool!r}")
+
+    def _on_stage_changed(self, _index=None):
+        """A stage change is view-only: it never dispatches, saves or
+        accepts. Rewire the stage-local focus chain."""
+        self._wire_tab_order()
+
+    def _plan_next(self):
+        """Plan's primary next action: open the recommended tool route.
+        Never starts an operation, save or acceptance."""
+        target = getattr(self, "_plan_next_route", ("setup",))
+        if target[0] == "write":
+            self.select_stage("write")
+        else:
+            self.select_tool(target[0])
 
     def show_help(self):
         """Draft action help in the reading pane (CLI ?); no terminal."""
@@ -4060,11 +4247,22 @@ class MainWindow(QMainWindow):
         return (path or "", flt)
 
     def _wire_tab_order(self):
-        """Visible, predictable keyboard order: sidebar → reading → editor →
-        actions → refresh/size."""
+        """Visible, predictable keyboard order: sidebar → stage selector →
+        stage-local tool chain → reading → editor → actions → refresh/size."""
         w = QWidget.setTabOrder
-        w(self.sidebar, self.tabs)
-        w(self.tabs, self.reading)
+        w(self.sidebar, self.stages)
+        stage = self.current_stage()
+        if stage is None:
+            stage = "plan"
+        tw = self._stage_tools.get(stage)
+        entry = tw if tw is not None else self._stage_pages[stage]
+        w(self.stages, entry)
+        # every tool chain ends at the shared reading/steering action row
+        for other in STAGE_ORDER:
+            otw = self._stage_tools.get(other)
+            if otw is not None and other != stage:
+                w(otw, entry)
+        w(entry, self.reading)
         w(self.reading, self.metadata)
         w(self.metadata, self.notes_list)
         w(self.notes_list, self.notes_view)
@@ -4072,7 +4270,8 @@ class MainWindow(QMainWindow):
         w(self.steer_editor, self.save_btn)
         w(self.save_btn, self.clear_btn)
         w(self.clear_btn, self.generate_btn)
-        w(self.generate_btn, self.refresh_btn)
+        w(self.generate_btn, self.stop_btn)
+        w(self.stop_btn, self.refresh_btn)
         w(self.refresh_btn, self.prose_size)
 
     def _start_timer(self):
@@ -5824,6 +6023,12 @@ class MainWindow(QMainWindow):
                 self._set_editor_text(state.text or "")
 
     # --------------------------------------------------------------- close
+
+    def showEvent(self, ev):
+        """Showing the window rebuilds Qt's focus chain; re-apply the
+        stage-aware order (idempotent, never moves focus)."""
+        super().showEvent(ev)
+        self._wire_tab_order()
 
     def closeEvent(self, ev):
         if self._busy:

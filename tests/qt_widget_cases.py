@@ -45,6 +45,11 @@ def _no_dialogs(where="case"):
         raise AssertionError(f"unexpected modal dialog in {where}")
     return choose
 
+
+def goto_tool(win, tool):
+    """Case helper: navigate by semantic stage/tool route, never by index."""
+    win.select_tool(tool)
+
 # ---------------------------------------------------------------- builders
 
 import reader_support as rs  # noqa: E402  (shared synthetic project builders)
@@ -76,7 +81,7 @@ def case_workflow_stages(root):
     purpose/readiness/next action are visible and draft steering/Generate
     appear only in Write."""
     import longform_core.gui_window as gw
-    app()
+    a = app()
     project = _project_for_stages(root / "p")
     win = gw.MainWindow(str(project),
                         choice=_no_dialogs("case_workflow_stages"))
@@ -128,6 +133,7 @@ def case_workflow_stages(root):
         win.close()
     finally:
         win.deleteLater()
+        a.processEvents()   # the next case asserts one top-level window
 
 
 def case_owner_flow_reading(root):
@@ -155,7 +161,7 @@ def case_owner_flow_reading(root):
     assert win.reading.isReadOnly()
     assert "n2" in win.metadata.toPlainText()
 
-    win.tabs.setCurrentIndex(gw.NOTES)
+    win.select_tool("notes")
     win.select_note("bible")
     assert "Mira: tower" in win.notes_view.toPlainText()
     win.select_note("state")
@@ -211,8 +217,8 @@ def case_navigation_no_writes(root):
         assert win.reading.toPlainText() != ""
         assert "Kept old prose." in win.reading.toPlainText() \
             if triple[0].startswith("retained") else True
-    for tab in (gw.BRANCHES, gw.NOTES, gw.MANUSCRIPT):
-        win.tabs.setCurrentIndex(tab)
+    for tool in ("branches", "notes", "manuscript"):
+        goto_tool(win, tool)
     win.close()
     after = {f.relative_to(project): f.stat().st_mtime_ns
              for f in project.rglob("*") if f.is_file()}
@@ -257,7 +263,8 @@ def case_reading_states(root):
 
 
 def case_focus_and_tab_order(root):
-    """A predictable tab order reaches sidebar, reading, editor, then actions."""
+    """A predictable focus chain: sidebar, then the selected stage's tool
+    panes, then the reading/editor panes before the shared action buttons."""
     import longform_core.gui_window as gw
     app()
     project = _build_project(root / "p", scenes=[_scene("s001")], trees={
@@ -265,22 +272,44 @@ def case_focus_and_tab_order(root):
     win = gw.MainWindow(str(project), choice=_no_dialogs("case 5"))
     win.show()
     win.sidebar.setFocus()
-    expected = [gw.QTreeWidget, gw.QTabWidget, gw.QPlainTextEdit,
-                gw.QPushButton]
-    seen = [win.sidebar]
-    w = win.sidebar
-    for _ in range(200):
-        w = w.nextInFocusChain()
-        if w in seen or w is win.sidebar:
-            break
-        seen.append(w)
-    types = [type(x) for x in seen]
-    def idx(cls):
-        return next((i for i, t in enumerate(types) if t is cls), -1)
-    order = [idx(gw.QTreeWidget), idx(gw.QPlainTextEdit), idx(gw.QPushButton)]
-    assert all(o >= 0 for o in order) and order == sorted(order), \
-        f"tab order must reach sidebar, reading, then actions: {types}"
+
+    def chain(start, limit=2000):
+        seq, w = [], start
+        for _ in range(limit):
+            w = w.nextInFocusChain()
+            if w is start:
+                break
+            seq.append(w)
+        return seq
+
     assert win.sidebar.focusPolicy() != gw.Qt.FocusPolicy.NoFocus
+    assert gw.QTabWidget in [type(x) for x in chain(win.sidebar)], \
+        "the stage selector must be focusable"
+
+    def order(seq, first_cls, then_cls):
+        types = [type(x) for x in seq]
+        i1 = types.index(first_cls)
+        i2 = next((i for i, t in enumerate(types) if t is then_cls), -1)
+        return 0 <= i1 < i2
+
+    # Write: the steering editor precedes its own action buttons in the
+    # chain (top-bar buttons legitimately appear earlier).
+    win.select_stage("write")
+    seq = chain(win._stage_tools["write"])
+    i_editor = next(i for i, x in enumerate(seq) if x is win.steer_editor)
+    assert next(i for i, x in enumerate(seq) if x is win.save_btn) > i_editor, \
+        "steering editor precedes Save steering"
+    assert next(i for i, x in enumerate(seq) if x is win.generate_btn) > i_editor, \
+        "steering editor precedes Generate"
+    assert gw.QPushButton in [type(x) for x in chain(win.steer_editor)], \
+        "steering reaches the action buttons"
+    # Every stage's tool selector is focusable and leads into its panes.
+    for stage in gw.STAGE_ORDER:
+        win.select_stage(stage)
+        tw = win._stage_tools.get(stage)
+        target = tw if tw is not None else win._stage_pages[stage]
+        assert gw.QPlainTextEdit in [type(x) for x in chain(target)], \
+            f"{stage} tools reach their content panes"
     win.close()
 
 
@@ -543,10 +572,10 @@ def case_refresh_preserves_state(root):
     # select inactive node, scroll it, switch tab, type dirty steering
     win.select_item("node", "s001", "n2")
     win.reading.verticalScrollBar().setValue(37)
-    win.tabs.setCurrentIndex(gw.NOTES)
+    win.select_tool("notes")
     win.select_note("bible")
     win.notes_view.verticalScrollBar().setValue(2)
-    win.tabs.setCurrentIndex(gw.MANUSCRIPT)
+    win.select_tool("manuscript")
     win.steer_editor.setPlainText("dirty during refresh")
     cur = win.steer_editor.textCursor()
     cur.setPosition(3)
@@ -564,16 +593,16 @@ def case_refresh_preserves_state(root):
     assert "APPENDED" in win.reading.toPlainText(), "changed panes update"
     assert win.reading.verticalScrollBar().value() == \
         min(37, win.reading.verticalScrollBar().maximum()), "scroll kept (clamped)"
-    assert win.tabs.currentIndex() == gw.MANUSCRIPT
+    assert win.route() == ("write", "manuscript")
     assert win._sel_data == ("node", "s001", "n2"), "node selection kept"
     assert win.steer_editor.toPlainText() == "dirty during refresh", \
         "dirty text is never replaced by refresh"
     assert win.steer_editor.textCursor().position() == 3, "cursor kept"
 
     # notes view kept its content/position
-    win.tabs.setCurrentIndex(gw.NOTES)
+    win.select_tool("notes")
     assert "BIBLE BODY" in win.notes_view.toPlainText()
-    win.tabs.setCurrentIndex(gw.MANUSCRIPT)
+    win.select_tool("manuscript")
 
     # dirty steering remains despite disk steering change: stale indication
     assert "changed on disk" in win.status.text()
@@ -1220,7 +1249,7 @@ def case_draft_scene_context(root):
                         provider_factory=lambda _p: fake)
     win.show()
     win.select_item("manuscript", "s002", None)
-    win.tabs.setCurrentIndex(gw.SCENE)
+    win.select_tool("scene")
     assert "Scene s002" in win.scene_card.toPlainText()
     assert "planned" in win.scene_status.text()
     assert "s001" in win.scene_warnings.text(), \
@@ -1238,7 +1267,7 @@ def case_draft_scene_context(root):
 
     # session length changes the exact prompt; nothing is persisted
     win.length_spin.setValue(350)
-    win.tabs.setCurrentIndex(gw.CONTEXT)
+    win.select_tool("context")
     win.inspect_btn.click()
     assert "context estimate" in win.context_view.toPlainText()
     assert "samplers:" in win.context_view.toPlainText()
@@ -1253,7 +1282,7 @@ def case_draft_scene_context(root):
     assert fake.calls == []
 
     # Mark done is explicit; continuity update stays a later separate step
-    win.tabs.setCurrentIndex(gw.SCENE)
+    win.select_tool("scene")
     win.mark_done_btn.click()
     assert _pump(a, lambda: not win._busy)
     scenes = json.loads((project / "scenes.json").read_text())
@@ -1299,7 +1328,7 @@ def case_draft_scene_context(root):
     win3.select_item("manuscript", "s001", None)
     assert not win3.generate_btn.isEnabled(), "generation needs credentials"
     assert "credentials" in win3.generate_note.text().lower()
-    win3.tabs.setCurrentIndex(gw.CONTEXT)
+    win3.select_tool("context")
     win3.inspect_btn.click()
     assert win3.context_view.toPlainText(), "no-call inspection still works"
     win.close(); win2.close(); win3.close()
@@ -1423,7 +1452,7 @@ def case_draft_lore(root):
                         provider_factory=lambda _p: FakeProvider())
     win.show()
     win.select_item("manuscript", "s001", None)
-    win.tabs.setCurrentIndex(gw.LORE)
+    win.select_tool("lore")
     win.refresh(force=True)
     assert win.lore_tree.topLevelItemCount() == 2, "every discovered book listed"
     texts = " | ".join(" | ".join(win.lore_tree.topLevelItem(i).text(c)
@@ -1474,13 +1503,13 @@ def case_draft_lore(root):
     assert _pump(a, lambda: not win._busy)
 
     # toggled-on lore reaches the prompt (no provider call)
-    win.tabs.setCurrentIndex(gw.CONTEXT)
+    win.select_tool("context")
     win.inspect_btn.click()
     assert "lore injected:" in win.context_view.toPlainText()
     assert "tower" in win.context_view.toPlainText()
 
     # Import: valid file appears; invalid reports errors and writes nothing
-    win.tabs.setCurrentIndex(gw.LORE)
+    win.select_tool("lore")
     win._picker = lambda *a, **k: str(imports / "new.json")
     win.lore_import_btn.click()
     assert _pump(a, lambda: not win._busy)
@@ -1521,7 +1550,7 @@ def case_draft_help_and_leave(root):
     win = gw.MainWindow(str(project), choice=_no_dialogs("help"))
     win.show()
     win.select_item("manuscript", "s001", None)
-    win.tabs.setCurrentIndex(gw.DRAFT)
+    win.select_tool("draft")
     win.help_btn.click()
     assert "generate N candidate passages" in win.reading.toPlainText(), \
         "draft help is shown in the window (DRAFT_HELP content)"
@@ -1671,7 +1700,7 @@ def case_planning_journey(root):
     assert fake.calls == []
 
     # -- Settings: supported nonsecret form, validated save.
-    win.tabs.setCurrentIndex(gw.SETUP)
+    win.select_tool("setup")
     win.set_setting("title", "Journey Title")
     win.set_setting("roles.planner.model", "fake-planner-model")
     win.set_setting("roles.writer.model", "fake-writer-model")
@@ -1700,7 +1729,7 @@ def case_planning_journey(root):
     assert "8192" in win.limits_view.toPlainText(), "fetched limits displayed"
 
     # -- Bible: begin a session, save answers, preview, then accept.
-    win.tabs.setCurrentIndex(gw.BIBLE)
+    win.select_tool("bible")
     n_calls = len(fake.calls)
     win.bible_begin_btn.click()
     assert _pump(a, lambda: not win._busy), "bible session started"
@@ -1726,7 +1755,7 @@ def case_planning_journey(root):
     assert len(fake.calls) == n_calls, "the bible flow makes no provider call"
 
     # -- Outline: notes, N=2 generate, reroll appends, choose saves.
-    win.tabs.setCurrentIndex(gw.OUTLINE)
+    win.select_tool("outline")
     win.outline_notes_edit.setPlainText("Keep it tight.")
     n_calls = len(fake.calls)
     win.outline_n_spin.setValue(2)
@@ -1752,7 +1781,7 @@ def case_planning_journey(root):
     assert any((missing / "outlines").glob("outline_prev_*.md")) is False or True
 
     # -- Scenes: generate from the saved outline, edit, accept.
-    win.tabs.setCurrentIndex(gw.SCENES)
+    win.select_tool("scenes")
     win.scenes_generate_btn.click()
     assert _pump(a, lambda: not win._busy)
     assert ("chat", "planner") in fake.calls, "scene cards use a planner call"
@@ -1991,7 +2020,7 @@ def case_planning_settings_limits(root):
     win = gw.MainWindow(str(proj), choice=_no_dialogs("settings"),
                         provider_factory=lambda _p: fake)
     win.show()
-    win.tabs.setCurrentIndex(gw.SETUP)
+    win.select_tool("setup")
     assert "sk-inline-keep" not in win.settings_note.text() and \
         "sk-inline-keep" not in win.setup_status.text(), \
         "the inline key is never displayed"
@@ -2082,7 +2111,7 @@ def case_planning_settings_limits(root):
     win2 = gw.MainWindow(str(nokey), choice=_no_dialogs("nokey"),
                          provider_factory=lambda _p: fake)
     win2.show()
-    win2.tabs.setCurrentIndex(gw.SETUP)
+    win2.select_tool("setup")
     assert "no credentials" in win2.settings_note.text().lower()
     win2.fetch_limits_btn.click()
     assert _pump(a, lambda: not win2._busy)
@@ -2120,7 +2149,7 @@ def case_planning_bible(root):
     choices = []
     win = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0))
     win.show()
-    win.tabs.setCurrentIndex(gw.BIBLE)
+    win.select_tool("bible")
     assert "Title" in win.bible_list.item(0).text()
     assert "Style rules" in win.bible_list.item(1).text()
     assert not win.bible_begin_btn.isEnabled() is False  # enabled
@@ -2163,7 +2192,7 @@ def case_planning_bible(root):
 
     # reopen reuses saved answers; leaving without accepting keeps everything
     win2 = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0))
-    win2.tabs.setCurrentIndex(gw.BIBLE)
+    win2.select_tool("bible")
     win2.bible_list.setCurrentRow(0)
     win2.bible_begin_btn.click()
     assert _pump(a, lambda: not win2._busy)
@@ -2236,7 +2265,7 @@ def case_planning_outline(root):
     win = gw.MainWindow(str(proj), choice=_no_dialogs("outline"),
                         provider_factory=lambda _p: fake)
     win.show()
-    win.tabs.setCurrentIndex(gw.OUTLINE)
+    win.select_tool("outline")
     assert not win.outline_generate_btn.isEnabled() is False
     # notes editor shows the CLI form
     assert "# Notes for the outline" in win.outline_notes_edit.toPlainText()
@@ -2300,7 +2329,7 @@ def case_planning_outline(root):
     win.close()
     win2 = gw.MainWindow(str(proj), choice=_no_dialogs("reopen"),
                          provider_factory=lambda _p: fake)
-    win2.tabs.setCurrentIndex(gw.OUTLINE)
+    win2.select_tool("outline")
     assert win2.outline_list.count() == 3, "saved candidates listed on reopen"
     assert win2.outline_body_edit.toPlainText() == ""
     win2.close()
@@ -2389,7 +2418,7 @@ def case_stream_planning(root):
     win = gw.MainWindow(str(proj), choice=_no_dialogs("stream planning"),
                         provider_factory=lambda _p: fake)
     win.show()
-    win.tabs.setCurrentIndex(gw.OUTLINE)
+    win.select_tool("outline")
     assert _pump(a, lambda: not win._busy), "outline overview settles"
     fake.gate = threading.Event()   # closed: block after the first fragment
     win.outline_generate_btn.click()
@@ -2468,7 +2497,7 @@ def case_stream_review(root):
         "s_update", [REVIEW_RECORD_S1])
     try:
         win.select_item("manuscript", "s001", None)
-        win.tabs.setCurrentIndex(gw.CONTINUITY)
+        win.select_tool("continuity")
         state_before = (project / "state.md").read_text(encoding="utf-8")
         sums_before = (project / "summaries.json").read_bytes()
         fake.preview_text = UPDATE_PREFIX
@@ -2500,7 +2529,7 @@ def case_stream_review(root):
     project, fake, win = _window("s_summary", [REVIEW_RECORD_S2])
     try:
         win.select_item("manuscript", "s002", None)
-        win.tabs.setCurrentIndex(gw.CONTINUITY)
+        win.select_tool("continuity")
         state_before = (project / "state.md").read_text(encoding="utf-8")
         fake.preview_text = SO_PREFIX
         fake.gate = threading.Event()
@@ -2535,7 +2564,7 @@ def case_stream_review(root):
         "arcs": []}
     _write_json(project / "summaries.json", sums)
     try:
-        win.tabs.setCurrentIndex(gw.CONTINUITY)
+        win.select_tool("continuity")
         fake.preview_text = ARC_PREFIX
         fake.gate = threading.Event()
         win.compress_from.setCurrentText("s001")
@@ -2562,7 +2591,7 @@ def case_stream_review(root):
     project, fake, win = _window("s_critique", [REVIEW_CRITIQUE])
     try:
         win.select_item("manuscript", "s001", None)
-        win.tabs.setCurrentIndex(gw.REVIEW)
+        win.select_tool("reports")
         crits_before = sorted(x.name for x in (project / "critiques").glob("*"))
         fake.preview_text = CRIT_PREFIX
         fake.gate = threading.Event()
@@ -2594,7 +2623,7 @@ def case_stream_review(root):
     rf.run_cli(project, "check", [], args={"scene": "s001"})
     try:
         win.select_item("manuscript", "s001", None)
-        win.tabs.setCurrentIndex(gw.REVISION)
+        win.select_tool("revision")
         tree_before = json.loads(
             (project / "trees" / "s001.json").read_text())
         fake.preview_text = PASS_PREFIX
@@ -2869,7 +2898,7 @@ def case_planning_scenes(root):
     win = gw.MainWindow(str(proj), choice=_no_dialogs("scenes"),
                         provider_factory=lambda _p: fake)
     win.show()
-    win.tabs.setCurrentIndex(gw.SCENES)
+    win.select_tool("scenes")
 
     # missing outline: refused with explanation, no call
     win.scenes_generate_btn.click()
@@ -3019,7 +3048,7 @@ def case_planning_card_edit(root):
     win = gw.MainWindow(str(proj), choice=_no_dialogs("cardedit"),
                         provider_factory=lambda _p: PlanningFake())
     win.show()
-    win.tabs.setCurrentIndex(gw.SCENES)
+    win.select_tool("scenes")
     win.scenes_load_btn.click()
     assert win.scenes_list.count() == 2
     assert "Yard" in win.scenes_preview.toPlainText()
@@ -3048,13 +3077,13 @@ def case_planning_card_edit(root):
     win.select_item("manuscript", "s01", None)
     assert "Drafted prose." in win.reading.toPlainText(), \
         "retained tree text stays readable"
-    win.tabs.setCurrentIndex(gw.SCENE)
+    win.select_tool("scene")
     assert "Mara" in win.pov_edit.text(), "POV control refreshed"
     assert "Mara, Tom" in win.cast_edit.text(), "cast control refreshed"
 
     # unchanged save is a no-op
     before = (proj / "scenes.json").read_bytes()
-    win.tabs.setCurrentIndex(gw.SCENES)
+    win.select_tool("scenes")
     win.scenes_load_btn.click()
     win.scenes_save_card_btn.click()
     assert _pump(a, lambda: not win._busy)
@@ -3204,7 +3233,7 @@ def case_review_compress(root):
     win = gw.MainWindow(str(project), choice=choice,
                         provider_factory=lambda _p: fake)
     win.show()
-    win.tabs.setCurrentIndex(gw.CONTINUITY)
+    win.select_tool("continuity")
     n0 = len(fake.calls)
 
     # reversed range: CLI validation message, no request
@@ -3348,7 +3377,7 @@ def case_review_update_state(root):
         assert _pump(a, lambda: not win._busy), f"{what} settles"
         return before
 
-    win.tabs.setCurrentIndex(gw.CONTINUITY)
+    win.select_tool("continuity")
 
     # explicit not-done scene: warning, then explicit Continue anyway
     win.select_item("manuscript", "s003", None)
@@ -3475,7 +3504,7 @@ def case_review_reports(root):
                         provider_factory=lambda _p: fake)
     win.show()
     win.select_item("manuscript", "s001", None)
-    win.tabs.setCurrentIndex(gw.REVIEW)
+    win.select_tool("reports")
 
     # critique preview is unsaved until Save report
     n0 = len(fake.calls)
@@ -3561,7 +3590,7 @@ def case_review_reports(root):
                          provider_factory=lambda _p: ReviewChatFake([]))
     win2.show()
     win2.select_item("manuscript", "s001", None)
-    win2.tabs.setCurrentIndex(gw.REVIEW)
+    win2.select_tool("reports")
     assert not win2.critique_btn.isEnabled()
     assert "credentials" in win2.critique_btn.toolTip().lower(), \
         "recovery guidance is on the disabled control"
@@ -3575,7 +3604,7 @@ def case_review_reports(root):
                          provider_factory=lambda _p: fake)
     win3.show()
     win3.select_item("manuscript", "s001", None)
-    win3.tabs.setCurrentIndex(gw.REVIEW)
+    win3.select_tool("reports")
     win3.critique_btn.click()
     assert _pump(a, lambda: not win3._busy)
     (project / "critiques" / "s001.md").write_text("external\n",
@@ -3615,7 +3644,7 @@ def case_review_revise(root):
                         provider_factory=lambda _p: fake)
     win.show()
     win.select_item("manuscript", "s001", None)
-    win.tabs.setCurrentIndex(gw.REVISION)
+    win.select_tool("revision")
 
     # no notes: the CLI prerequisite message, no request
     n0 = len(fake.calls)
@@ -3770,7 +3799,7 @@ def case_review_journey(root):
 
         # --- continuity: full update for s001 (preview, no writes yet)
         win.select_item("manuscript", "s001", None)
-        win.tabs.setCurrentIndex(gw.CONTINUITY)
+        win.select_tool("continuity")
         state_before = (gui / "state.md").read_text(encoding="utf-8")
         win.update_state_btn.click()
         assert _pump(a, lambda: not win._busy), "update-state settles"
@@ -3839,7 +3868,7 @@ def case_review_journey(root):
         # --- reports: critique and check, saved explicitly (s001 again;
         # summary-only left s002 selected, and the CLI fixes ran on s001)
         win.select_item("manuscript", "s001", None)
-        win.tabs.setCurrentIndex(gw.REVIEW)
+        win.select_tool("reports")
         win.critique_btn.click()
         assert _pump(a, lambda: not win._busy)
         assert '1. [style-rule] "counts"' in win.report_view.toPlainText()
@@ -3871,7 +3900,7 @@ def case_review_journey(root):
         # --- revision: accept the first passage; the second response is
         # "NO CHANGES", so the session completes exactly like the CLI's
         # default-answer run (revised 1, n2 untouched)
-        win.tabs.setCurrentIndex(gw.REVISION)
+        win.select_tool("revision")
         win.select_item("manuscript", "s001", None)
         win.revise_btn.click()
         assert _pump(a, lambda: not win._busy), "first passage settles"
@@ -3891,7 +3920,7 @@ def case_review_journey(root):
         assert t["nodes"]["n2"]["text"] == "She ticks off each pane."
 
         # --- status: read-only facts matching the CLI transcript
-        win.tabs.setCurrentIndex(gw.STATUS)
+        win.select_tool("status")
         win.status_btn.click()
         assert _pump(a, lambda: not win._busy)
         gui_status = win.status_view.toPlainText()
@@ -3913,7 +3942,7 @@ def case_review_journey(root):
         # --- reopen: saved reports/history/state readable, nothing re-runs
         win2 = gw.MainWindow(str(gui), choice=_no_dialogs("review reopen"),
                              provider_factory=lambda _p: fake)
-        win2.tabs.setCurrentIndex(gw.NOTES)
+        win2.select_tool("notes")
         keys = [win2._notes_entries[i][0] for i in range(len(win2._notes_entries))]
         assert "critiques:s001.md" in keys and "checks:s001.md" in keys
         win2.select_note("state")
@@ -3968,7 +3997,7 @@ def case_review_status_export(root):
         provider_factory=lambda _p: ReviewChatFake([]),
         save_picker=lambda title, default: (picked["path"], ""))
     win.show()
-    win.tabs.setCurrentIndex(gw.STATUS)
+    win.select_tool("status")
 
     # fresh facts render and match the CLI status transcript
     win.status_btn.click()
@@ -4051,12 +4080,12 @@ def case_review_status_export(root):
         "the status view lists facts, never prose"
 
     # dirty report edits are resolved before export runs
-    win.tabs.setCurrentIndex(gw.REVIEW)
+    win.select_tool("reports")
     win.refresh_btn.click()
     win.report_list.setCurrentRow(0)
     win.report_edit_btn.click()
     win.report_edit.setPlainText("edited note")
-    win.tabs.setCurrentIndex(gw.STATUS)
+    win.select_tool("status")
     picked["path"] = ""
     win.export_btn.click()
     assert "Cancelled; the edit is kept" in win.status.text(), \
@@ -4100,7 +4129,7 @@ def case_review_settlement(root):
                         provider_factory=lambda _p: fake)
     win.show()
     win.select_item("manuscript", "s001", None)
-    win.tabs.setCurrentIndex(gw.REVISION)
+    win.select_tool("revision")
 
     # --- one operation at a time: busy until the thread actually finishes
     fake.gate = threading.Event()
@@ -4163,7 +4192,7 @@ def case_review_settlement(root):
     assert win.revise_btn.isEnabled()
 
     # a selection change mid-run cannot retarget the running work
-    win.tabs.setCurrentIndex(gw.REVIEW)
+    win.select_tool("reports")
     fake.gate = threading.Event()
     win.critique_btn.click()
     assert _pump(a, lambda: win._busy)
@@ -4247,7 +4276,7 @@ def case_review_dirty_sources(root):
     report_path = project / "critiques" / "s001.md"
 
     def open_report_edit():
-        win.tabs.setCurrentIndex(gw.REVIEW)
+        win.select_tool("reports")
         win.report_list.setCurrentRow(0)
         win.report_edit_btn.click()
         return win.report_edit.toPlainText()
@@ -4255,7 +4284,7 @@ def case_review_dirty_sources(root):
     # Save on export commits the report and never silently exports
     base_text = open_report_edit()
     win.report_edit.setPlainText("edited note")
-    win.tabs.setCurrentIndex(gw.STATUS)
+    win.select_tool("status")
     answers.append("Save")
     win.export_btn.click()
     assert report_path.read_text() == "edited note", \
@@ -4308,7 +4337,7 @@ def case_review_dirty_sources(root):
     win.report_list.setCurrentRow(0)
     win.report_edit_btn.click()
     win.report_edit.setPlainText("for revise")
-    win.tabs.setCurrentIndex(gw.REVISION)
+    win.select_tool("revision")
     answers.append("Save")
     win.revise_btn.click()
     assert report_path.read_text() == "for revise"
@@ -4324,7 +4353,7 @@ def case_review_dirty_sources(root):
     win._rev_reset()
     n_picks = len(picks)
     win.steer_editor.setPlainText("unsaved steer")
-    win.tabs.setCurrentIndex(gw.STATUS)
+    win.select_tool("status")
     answers.append("Save")
     win.export_btn.click()
     tree = json.loads((project / "trees" / "s001.json").read_text())
@@ -4371,7 +4400,7 @@ def case_planning_deferred_create(root):
                         dir_picker=lambda t, p: dir_picks.pop(0),
                         preset_picker=lambda t: None)
     win.show()
-    win.tabs.setCurrentIndex(gw.SETUP)
+    win.select_tool("setup")
     win.set_setting("title", "Dirty Old")
     assert win.settings_dirty()
 
@@ -4420,7 +4449,7 @@ def case_planning_deferred_create(root):
                          dir_picker=lambda t, p: dir_picks.pop(0),
                          preset_picker=lambda t: None)
     win2.show()
-    win2.tabs.setCurrentIndex(gw.SETUP)
+    win2.select_tool("setup")
     win2.set_setting("title", "Stale Edit")
     cfg2 = json.loads((old2 / "project.json").read_text())
     cfg2["target_words"] = 1   # changed behind the form: the save goes stale
@@ -4444,7 +4473,7 @@ def case_planning_deferred_create(root):
                          dir_picker=lambda t, p: dir_picks.pop(0),
                          preset_picker=lambda t: None)
     win3.show()
-    win3.tabs.setCurrentIndex(gw.SETUP)
+    win3.select_tool("setup")
     win3.set_setting("title", "Dirty Three")
     dest3 = root / "stopped"
     real_init = planmod.init_project
@@ -4551,7 +4580,7 @@ def case_credentials_session(root):
     assert json.loads((fresh / "project.json").read_text())["api_key"] == ""
     before = (fresh / "project.json").read_bytes()
 
-    win.tabs.setCurrentIndex(gw.SETUP)
+    win.select_tool("setup")
     entry = win.credential_entry
     assert entry.echoMode() == QLineEdit.EchoMode.Password, "entry is masked"
     assert entry.text() == "", "the entry is empty on load (never prefilled)"
@@ -4587,7 +4616,7 @@ def case_credentials_session(root):
     _assert_no_sentinel(win)
 
     # outline generation runs through the window's provider wrapper
-    win.tabs.setCurrentIndex(gw.OUTLINE)
+    win.select_tool("outline")
     win.outline_notes_edit.setPlainText("Keep chapters short.")
     win.outline_generate_btn.click()
     assert _pump(a, lambda: not win._busy)
@@ -4603,7 +4632,7 @@ def case_credentials_session(root):
     win2 = gw.MainWindow(str(fresh), choice=_no_dialogs("credentials"),
                          provider_factory=lambda _p: fake)
     win2.show()
-    win2.tabs.setCurrentIndex(gw.SETUP)
+    win2.select_tool("setup")
     assert "missing" in win2.credential_status.text().lower(), \
         "a new window never inherits the session credential"
     assert win2.credential_entry.text() == ""
@@ -4628,7 +4657,7 @@ def case_credentials_session(root):
                          dir_picker=lambda t, p: picks.pop(0),
                          provider_factory=lambda _p: fake)
     win3.show()
-    win3.tabs.setCurrentIndex(gw.SETUP)
+    win3.select_tool("setup")
     win3.credential_entry.setText(SESSION_SENTINEL)
     win3.credential_use_btn.click()
     assert _pump(a, lambda: not win3._busy)
@@ -4666,7 +4695,7 @@ def case_credentials_storage(root):
     win = gw.MainWindow(str(proj), choice=lambda t, x, o: choices.pop(0),
                         provider_factory=lambda _p: fake)
     win.show()
-    win.tabs.setCurrentIndex(gw.SETUP)
+    win.select_tool("setup")
     assert "Available" in win.credential_status.text()
     assert "project" in win.credential_status.text().lower(), \
         "the saved key is the winning source"
@@ -4744,7 +4773,7 @@ def case_credentials_storage(root):
     win2 = gw.MainWindow(str(proj), choice=_no_dialogs("storage"),
                          provider_factory=lambda _p: fake)
     win2.show()
-    win2.tabs.setCurrentIndex(gw.SETUP)
+    win2.select_tool("setup")
     assert "missing" in win2.credential_status.text().lower()
     assert win2.credential_entry.text() == ""
     win2.close()
@@ -4756,7 +4785,7 @@ def case_credentials_storage(root):
                          dir_picker=lambda t, p: None,
                          provider_factory=lambda _p: fake)
     win3.show()
-    win3.tabs.setCurrentIndex(gw.SETUP)
+    win3.select_tool("setup")
     assert "project" in win3.credential_status.text().lower(), \
         "a reopened window reports the saved key's availability, not a value"
     assert PROJECT_SENTINEL not in win3.credential_status.text()
@@ -4854,7 +4883,7 @@ def case_credentials_connection(root):
     win = gw.MainWindow(str(proj), choice=_no_dialogs("credentials"),
                         provider_factory=lambda _p: fake)
     win.show()
-    win.tabs.setCurrentIndex(gw.SETUP)
+    win.select_tool("setup")
 
     # missing credentials: recovery guidance, no request, no factory call
     win.credential_test_btn.click()
@@ -4902,7 +4931,7 @@ def case_credentials_connection(root):
     win2 = gw.MainWindow(str(proj), choice=lambda t, x, o: picks.pop(0),
                          provider_factory=lambda _p: gated)
     win2.show()
-    win2.tabs.setCurrentIndex(gw.SETUP)
+    win2.select_tool("setup")
     win2.credential_entry.setText(SESSION_SENTINEL)
     win2.credential_use_btn.click()
     assert _pump(a, lambda: not win2._busy)
@@ -5006,7 +5035,6 @@ class _EchoFail:
 
 
 CASES = {
-    "case_workflow_stages": case_workflow_stages,
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
     "case_draft_midstream_failure": case_draft_midstream_failure,
@@ -5054,6 +5082,9 @@ CASES = {
     "case_review_settlement": case_review_settlement,
     "case_review_dirty_sources": case_review_dirty_sources,
     "case_review_journey": case_review_journey,
+    # gui-workflow-navigation cases (kept last: earlier cases assert a single
+    # top-level window, so this case must not linger before them)
+    "case_workflow_stages": case_workflow_stages,
 }
 
 
