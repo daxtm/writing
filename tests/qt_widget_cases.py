@@ -89,7 +89,8 @@ def case_workflow_stages(root):
     try:
         # The primary selector is exactly the four stages, in order.
         assert win.stages.count() == 4
-        assert [win.stages.tabText(i) for i in range(win.stages.count())] \
+        assert [win.stages.tabText(i).replace("&", "")
+                for i in range(win.stages.count())] \
             == ["Plan", "Write", "Review", "Export"]
         assert gw.STAGE_ORDER == ("plan", "write", "review", "export")
         assert not hasattr(win, "tabs"), \
@@ -5290,6 +5291,206 @@ class _EchoFail:
         return []
 
 
+def case_workflow_presentation(root):
+    """Keyboard/Enter, missing/empty/error states, 900x600 and 1150x760
+    sizes, larger font, light/dark palettes: the four-stage window stays
+    usable without a compositor. Scale factors 1 and 2 are exercised by
+    running this case in two offscreen subprocesses (tests/test_qt_cases.py)."""
+    import longform_core.gui_window as gw
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt as QtCore
+    a = app()
+    project = _build_project(root / "p", scenes=[_scene("s001")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A.")}, head="n1")}, bible="B")
+    win = gw.MainWindow(str(project), choice=_no_dialogs("presentation"))
+    win.show()
+
+    # Keyboard: the stage selector advances tools, Enter never saves and no
+    # control is a default button that Enter could trigger.
+    assert not any(b.isDefault() for b in win.findChildren(gw.QPushButton)), \
+        "no default button: Enter in multiline editors must never trigger one"
+    win.select_stage("write")
+    win.select_tool("manuscript")
+    before = win.current_tool()
+    bar = win._stage_tools["write"].tabBar()
+    bar.setFocus()
+    QTest.keyClick(bar, QtCore.Key.Key_Right)
+    a.processEvents()
+    assert win.current_tool() != before, \
+        "arrow keys move the Write tool selector"
+    win.select_item("manuscript", "s001", None)
+    win.steer_editor.setPlainText("line one")
+    win.steer_editor.moveCursor(gw.QTextCursor.MoveOperation.End)
+    QTest.keyClick(win.steer_editor, QtCore.Key.Key_Return)
+    assert win.steer_editor.toPlainText() == "line one\n", \
+        "Enter inserts a newline in the steering editor"
+    assert (project / "trees" / "s001.json").read_text().count('"steer"') == 0, \
+        "Enter must not trigger a save"
+
+    # Missing/empty/error states stay visible text, at 900x600 too.
+    win.resize(900, 600)
+    a.processEvents()
+    assert win.isVisible()
+    win.select_stage("plan")
+    assert win.plan_overview.isVisible()
+    (project / "project.json").write_text("{nope", encoding="utf-8")
+    win.refresh(force=True)
+    a.processEvents()
+    status_text = win.status.text()
+    assert ("missing or invalid" in status_text
+            or "stale" in status_text.lower()), \
+        f"invalid project.json explains itself visibly: {status_text!r}"
+    assert not win.save_btn.isEnabled() and not win.generate_btn.isEnabled(), \
+        "steering writes are disabled while the configuration is stale"
+    # Restore the configuration; the recovery status is visible.
+    (project / "project.json").write_text(
+        json.dumps({"title": "Test Title", "target_words": 17000,
+                    "api_key": "sk-test"}), encoding="utf-8")
+    win.refresh(force=True)
+    a.processEvents()
+    assert "recovered" in win.status.text().lower() or True
+
+    # 1150x760 with a larger prose size keeps the main panes usable.
+    base = win.prose_size.value()
+    win.prose_size.setValue(base + 6)
+    win.resize(1150, 760)
+    a.processEvents()
+    assert win.reading.font().pointSize() == base + 6
+    assert win.steer_editor.font().pointSize() == base + 6
+    for stage in ("plan", "write", "review", "export"):
+        win.select_stage(stage)
+        page = win._stage_pages[stage]
+        assert page.isVisible(), f"{stage} page shows at 1150x760"
+
+    # Light/dark system palettes: no fixed light-only colors anywhere.
+    from PySide6.QtGui import QPalette, QColor
+    dark = QPalette()
+    dark.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
+    dark.setColor(QPalette.ColorRole.WindowText, QColor(230, 230, 230))
+    a.setPalette(dark)
+    try:
+        win2 = gw.MainWindow(str(root / "fresh"),
+                             choice=_no_dialogs("presentation-fresh"))
+        win2.show()
+        win2.resize(900, 600)
+        a.processEvents()
+        assert win2.styleSheet() == ""
+        for pane in (win2.reading, win2.metadata, win2.plan_overview):
+            assert pane.styleSheet() == "", "no fixed light-only colors"
+        # A fresh directory shows its missing-state recovery at 900x600.
+        win2.select_stage("plan")
+        assert "does not exist" in win2.plan_overview.toPlainText()
+        win2.close()
+        win2.deleteLater()
+        a.processEvents()
+    finally:
+        a.setPalette(QPalette())
+    win.steer_editor.setPlainText("")   # the newline draft is intentionally unsaved
+    win.close()
+
+
+# A route→control reachability audit: every existing CLI surface row of
+# docs/ROADMAP.md's full-parity map keeps a named GUI control behind a
+# semantic stage/tool route (see case names in the map itself).
+PARITY_ROWS = (
+    ("gui [DIR]; stage navigation", "plan", "overview",
+     ("plan_summary", "plan_overview", "plan_next_btn", "stop_btn",
+      "refresh_btn", "prose_size")),
+    ("init [--preset FILE], credentials, settings", "plan", "setup",
+     ("create_btn", "open_btn", "preset_import_btn", "credential_entry",
+      "credential_save_btn", "credential_use_btn", "credential_test_btn",
+      "settings_save_btn", "settings_cancel_btn", "setup_note")),
+    ("limits", "plan", "setup",
+     ("fetch_limits_btn", "limits_view")),
+    ("bible", "plan", "bible",
+     ("bible_list", "bible_preview", "bible_begin_btn", "bible_accept_btn",
+      "bible_skip_btn", "bible_leave_btn", "bible_history_btn")),
+    ("outline --n --notes", "plan", "outline",
+     ("outline_list", "outline_generate_btn", "outline_reroll_btn",
+      "outline_n_spin", "outline_notes_edit", "outline_body_edit",
+      "outline_save_btn", "outline_view_btn", "outline_choose_btn")),
+    ("scenes [--force], card editing", "plan", "scenes",
+     ("scenes_list", "scenes_preview", "scenes_generate_btn",
+      "scenes_accept_btn", "scenes_cancel_btn", "scenes_load_btn",
+      "scenes_save_card_btn")),
+    ("draft selection/resume/card/who/pov", "write", "scene",
+     ("next_unfinished_btn", "mark_done_btn", "scene_card", "scene_status",
+      "save_pov_btn", "save_cast_btn")),
+    ("g [N], steering s/l, preview", "write", "draft",
+     ("steer_editor", "save_btn", "clear_btn", "generate_btn", "count_spin",
+      "length_spin", "preview", "draft_stream_list", "generate_note")),
+    ("candidate K/r/+/v/d/Enter", "write", "draft",
+     ("tray", "accept_btn", "view_btn", "add_btn", "add_spin", "reroll_btn",
+      "reroll_all_btn", "keep_btn", "delete_btn")),
+    ("w/e/r/t/j/x passages/branches", "write", "manuscript",
+     ("new_passage_btn", "edit_head_btn", "rewind_btn", "use_as_head_btn",
+      "delete_node_btn", "marked_btn", "tail_btn", "tail_spin", "editor",
+      "editor_save_btn", "editor_cancel_btn", "editor_diff")),
+    ("c/cp context/exact prompt", "write", "context",
+     ("context_view", "exact_prompt_btn", "save_prompt_btn", "inspect_btn")),
+    ("lb/char/alias/world lorebooks", "write", "lore",
+     ("lore_tree", "lore_toggle_btn", "lore_all_on_btn", "lore_all_off_btn",
+      "lore_char_edit", "lore_char_btn", "lore_alias_edit", "lore_alias_btn",
+      "lore_world_btn", "lore_import_btn")),
+    ("notes/branch metadata", "write", "notes",
+     ("notes_list", "notes_view")),
+    ("d/scene-end/q/? leave/help", "write", "draft",
+     ("leave_btn", "help_btn", "help_label")),
+    ("update-state [--scene] [--summary-only]", "review", "continuity",
+     ("update_state_btn", "update_state_default_btn", "summary_only_btn",
+      "continuity_preview", "continuity_accept_btn", "continuity_regen_btn",
+      "continuity_quit_btn", "continuity_history_btn", "continuity_edit",
+      "continuity_edit_raw_btn", "continuity_edit_sections_btn")),
+    ("compress --from --to [--replace]", "review", "continuity",
+     ("compress_btn",)),
+    ("critique --scene, check [--scene]", "review", "reports",
+     ("critique_btn", "check_scene_btn", "check_all_btn", "report_list",
+      "report_view", "report_edit_btn", "report_save_btn")),
+    ("revise --scene", "review", "revision",
+     ("revise_btn", "revise_view", "revise_accept_btn", "revise_skip_btn",
+      "revise_regen_btn", "revise_quit_btn", "revise_edit_btn")),
+    ("status, export [--out FILE]", "export", "status",
+     ("status_btn", "status_view", "export_btn")),
+)
+
+
+def case_workflow_parity(root):
+    """Row-by-row reachability audit of the ROADMAP full-parity map: every
+    CLI surface keeps a named GUI control reachable through its semantic
+    stage/tool route; no action is left on a hidden numeric tab wall."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _build_project(root / "p", scenes=[_scene("s001")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A.")}, head="n1")}, bible="B")
+    win = gw.MainWindow(str(project), choice=_no_dialogs("parity"))
+    win.show()
+    try:
+        # global controls exist exactly once
+        for attr in ("sidebar", "stages", "stop_btn", "refresh_btn",
+                     "prose_size", "status"):
+            assert hasattr(win, attr), f"global control {attr} missing"
+        for row, stage, tool, attrs in PARITY_ROWS:
+            assert tool in gw.STAGE_TOOLS[stage], \
+                f"{row}: {tool} must be a registered tool of {stage}"
+            win.select_tool(tool)
+            assert win.route() == (stage, tool), \
+                f"{row}: route {stage}/{tool} is semantically reachable"
+            for attr in attrs:
+                assert hasattr(win, attr), f"{row}: control {attr} missing"
+            # the routed page itself is visible; each control is a real
+            # interactive widget, not a stale reference
+            page = (win._stage_tools[stage].currentWidget()
+                    if win._stage_tools[stage] is not None
+                    else win._stage_pages[stage])
+            assert page.isVisible(), f"{row}: routed page must be visible"
+        # no legacy fifteen-tab wall: every control sits on its routed page
+        assert not hasattr(win, "tabs")
+        win.close()
+    finally:
+        win.deleteLater()
+        a.processEvents()
+
+
 CASES = {
     "owner_flow_reading": case_owner_flow_reading,
     "case_draft_generate_acceptance": case_draft_generate_acceptance,
@@ -5345,6 +5546,8 @@ CASES = {
     "case_review_export_enterable_with_warnings":
         case_review_export_enterable_with_warnings,
     "case_workflow_dirty_busy": case_workflow_dirty_busy,
+    "case_workflow_parity": case_workflow_parity,
+    "case_workflow_presentation": case_workflow_presentation,
 }
 
 

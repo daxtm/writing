@@ -303,26 +303,34 @@ shipping is authorized; no more speculative changes.
 
 ## Full-parity coverage map — no CLI command or draft action left behind
 
-| Existing CLI surface | Required GUI control(s) | Implementing change |
-|---|---|---|
-| `gui [DIR]` | Native Wayland project window, reading/notes, refresh/navigation, font size; no-argument launch opens it in the current directory | Existing shell; retained throughout |
-| `draft [--scene ID]`, resume/default next unfinished | Select scene / Next unfinished / reopen done scene, resume head, status/prerequisite warnings | `gui-drafting-workspace` |
-| `g [N]` / `gN`, default writer.swipes | Generate, count, streaming/completion progress, Stop | `gui-drafting-workspace` |
-| Candidate `K`, `r K…` / `r all`, `+ N`, `v K`, `d K`, Enter | Accept, Reroll selected/all, Add N, View, Delete leaf, Keep branches/Discard preview | `gui-drafting-workspace` |
-| `s TEXT` / `s -` / `se`, `l N`, `who`, `pov` | Multiline steering Save/Clear/capture, passage length/token cap, cast/POV forms | `gui-drafting-workspace` |
-| `w`, `e`, `r`, `t`, `j ID`, `x ID` | New passage, Edit head/diff/history, Rewind, full branch tree/metadata, Jump/Use as head, Delete leaf | `gui-drafting-workspace` |
-| `v`, `v ID`, `tail [N]`, `card`, `c`, `cp` | Marked manuscript, full node viewer, Tail N, scene card, context/budget/sampler/injected-lore panel, exact prompt preview/Save last_prompt.txt | `gui-drafting-workspace` |
-| `lb`, `lb N…`, `lb all on/off`, `char NAME`, `alias A,B`, `world`; lorebook/card files | Lore list, individual/multi/all toggles, character name/aliases/world, JSON/PNG import picker | `gui-drafting-workspace` |
-| `d`, scene-end confirmation, `q`, `?` / `h` / `help` | Mark done/decline end suggestion, Leave draft, action help; dirty-editor Save/Discard/Cancel | `gui-drafting-workspace` |
-| `init [--preset FILE]`, project configuration | Create/Open directory, preset picker, models/roles/settings forms | `gui-project-planning` |
-| `limits`, `bible` | Fetch/display limits, section question/answer/edit/accept/skip/quit forms/history | `gui-project-planning` |
-| `outline --n --notes`, candidate selection/new notes/reroll/view/quit | Count/notes editor, Generate/Reroll, candidate viewer/selection, Cancel | `gui-project-planning` |
-| `scenes [--force]`, view/regenerate/accept/quit | Scene cards list/editor/validation, Generate/Regenerate, Accept/Replace confirmation, Cancel | `gui-project-planning` |
-| `update-state [--scene] [--summary-only]`, invalid raw edit/retry, warnings | Scene/summary-only selection, diff/raw editor, Accept/Edit/Regenerate/Cancel, warning confirmation | `gui-continuity-review-export` |
-| `compress --from --to [--replace]` | Range/overlap validation, Replace confirmation, preview/Edit/Accept/Regenerate/Cancel | `gui-continuity-review-export` |
-| `critique --scene`, `check [--scene]` | Critique, Check scene/all, report viewer/editable review notes | `gui-continuity-review-export` |
-| `revise --scene` | Per-passage diff, Accept/Skip/Edit/Regenerate/Quit, saved revision history | `gui-continuity-review-export` |
-| `status`, `export [--out FILE]` | Project status, Export with destination picker | `gui-continuity-review-export` |
+| Existing CLI surface | Required GUI control(s) | Workflow route | Case | Implementing change |
+|---|---|---|---|---|
+| `gui [DIR]` | Native Wayland project window, reading/notes, refresh/navigation, font size; no-argument launch opens it in the current directory | window: Plan/Write/Review/Export stages, sidebar, refresh/prose size (global) | `case_workflow_stages`, `case_owner_flow_reading` | Existing shell; retained throughout |
+| `draft [--scene ID]`, resume/default next unfinished | Select scene / Next unfinished / reopen done scene, resume head, status/prerequisite warnings | Write → scene | `case_draft_scene_context`, `case_workflow_stages` | `gui-drafting-workspace` |
+| `g [N]` / `gN`, default writer.swipes | Generate, count, streaming/completion progress, Stop | Write → draft (Stop global) | `case_draft_generate_acceptance`, `case_stream_draft_candidates` | `gui-drafting-workspace` |
+| Candidate `K`, `r K…` / `r all`, `+ N`, `v K`, `d K`, Enter | Accept, Reroll selected/all, Add N, View, Delete leaf, Keep branches/Discard preview | Write → draft (tray) | `case_draft_candidate_tray` | `gui-drafting-workspace` |
+| `s TEXT` / `s -` / `se`, `l N`, `who`, `pov` | Multiline steering Save/Clear/capture, passage length/token cap, cast/POV forms | Write → draft (steering), scene | `case_owner_flow_steering`, `case_workflow_dirty_busy` | `gui-drafting-workspace` |
+| `w`, `e`, `r`, `t`, `j ID`, `x ID` | New passage, Edit head/diff/history, Rewind, full branch tree/metadata, Jump/Use as head, Delete leaf | Write → manuscript/branches | `case_draft_edit_and_branches` | `gui-drafting-workspace` |
+| `v`, `v ID`, `tail [N]`, `card`, `c`, `cp` | Marked manuscript, full node viewer, Tail N, scene card, context/budget/sampler/injected-lore panel, exact prompt preview/Save last_prompt.txt | Write → manuscript (marked/tail), context, scene | `case_draft_scene_context` | `gui-drafting-workspace` |
+| `lb`, `lb N…`, `lb all on/off`, `char NAME`, `alias A,B`, `world`; lorebook/card files | Lore list, individual/multi/all toggles, character name/aliases/world, JSON/PNG import picker | Write → lore | `case_draft_lore` | `gui-drafting-workspace` |
+| `d`, scene-end confirmation, `q`, `?` / `h` / `help` | Mark done/decline end suggestion, Leave draft, action help; dirty-editor Save/Discard/Cancel | Write → draft, scene | `case_draft_help_and_leave`, `case_workflow_dirty_busy` | `gui-drafting-workspace` |
+| `init [--preset FILE]`, project configuration | Create/Open directory, preset picker, models/roles/settings forms | Plan → setup | `case_planning_create_open`, `case_planning_deferred_create` | `gui-project-planning` |
+| `limits`, `bible` | Fetch/display limits, section question/answer/edit/accept/skip/quit forms/history | Plan → setup (limits), bible | `case_planning_settings_limits`, `case_planning_bible` | `gui-project-planning` |
+| `outline --n --notes`, candidate selection/new notes/reroll/view/quit | Count/notes editor, Generate/Reroll, candidate viewer/selection, Cancel | Plan → outline | `case_planning_outline` | `gui-project-planning` |
+| `scenes [--force]`, view/regenerate/accept/quit | Scene cards list/editor/validation, Generate/Regenerate, Accept/Replace confirmation, Cancel | Plan → scenes | `case_planning_scenes`, `case_planning_card_edit` | `gui-project-planning` |
+| `update-state [--scene] [--summary-only]`, invalid raw edit/retry, warnings | Scene/summary-only selection, diff/raw editor, Accept/Edit/Regenerate/Cancel, warning confirmation | Review → continuity | `case_review_update_state`, `case_review_dirty_sources` | `gui-continuity-review-export` |
+| `compress --from --to [--replace]` | Range/overlap validation, Replace confirmation, preview/Edit/Accept/Regenerate/Cancel | Review → continuity | `case_review_compress` | `gui-continuity-review-export` |
+| `critique --scene`, `check [--scene]` | Critique, Check scene/all, report viewer/editable review notes | Review → reports | `case_review_reports` | `gui-continuity-review-export` |
+| `revise --scene` | Per-passage diff, Accept/Skip/Edit/Regenerate/Quit, saved revision history | Review → revision | `case_review_revise`, `case_review_settlement` | `gui-continuity-review-export` |
+| `status`, `export [--out FILE]` | Project status, Export with destination picker | Export → status | `case_review_status_export`, `case_review_export_enterable_with_warnings` | `gui-continuity-review-export` |
+
+Every route column names the actual stage → tool path after
+`gui-workflow-navigation`; `case_workflow_parity` audits each row's named
+controls through those routes, `case_workflow_readiness` covers the Plan
+overview/next-action facts and `case_workflow_presentation` covers keyboard,
+window sizes, font, palette and offscreen scale 1/2. The end-to-end journeys
+(`case_planning_journey`, `case_review_journey`, `case_owner_flow_reading`)
+still cover Create → planning → draft → review → export across stages.
 
 The sequence is drafting workspace -> setup/planning -> continuity/review/export.
 Do not tick future work based on its proposal. Every row of the map is now

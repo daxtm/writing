@@ -41,8 +41,8 @@ REFRESH_MS = 2000
 
 # Four primary stages (semantic routes; never numeric tab walls).
 STAGE_ORDER = ("plan", "write", "review", "export")
-STAGE_TITLES = {"plan": "Plan", "write": "Write", "review": "Review",
-                "export": "Export"}
+STAGE_TITLES = {"plan": "&Plan", "write": "&Write", "review": "&Review",
+                "export": "&Export"}
 STAGE_PURPOSE = {
     "plan": "Plan — set up the project, answer the story bible, save the "
             "outline and the scene cards. Inputs: this directory, a writer "
@@ -435,6 +435,14 @@ class MainWindow(QMainWindow):
         self.stages.addTab(export_page, STAGE_TITLES["export"])
 
         right_l.addWidget(self.stages, 1)
+        # Accessible names and mnemonics: stage titles carry unique Alt
+        # mnemonics (&Plan/&Write/&Review/&Export); each tool selector is
+        # named after its stage so screen readers announce the route.
+        self.stages.tabBar().setAccessibleName("Writing stages")
+        for stage, tw in self._stage_tools.items():
+            if tw is not None:
+                tw.tabBar().setAccessibleName(
+                    f"{STAGE_TITLES[stage].replace('&', '')} tools")
         self.stages.currentChanged.connect(self._on_stage_changed)
         split.addWidget(right)
         split.setStretchFactor(0, 1)
@@ -487,7 +495,8 @@ class MainWindow(QMainWindow):
         steer_l.addWidget(self.steer_editor, 1)
         btns = QHBoxLayout()
         self.save_btn = QPushButton("Save steering")
-        self.save_btn.setDefault(True)
+        # never a default button: Enter in the multiline steering editor
+        # inserts a newline and must not trigger a save
         self.save_btn.clicked.connect(self.save_steering)
         self.clear_btn = QPushButton("Clear saved")
         self.clear_btn.clicked.connect(self.clear_steering)
