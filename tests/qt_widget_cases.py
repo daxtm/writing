@@ -5648,6 +5648,8 @@ def case_setup_wizard_journey(root):
     win.refresh(force=True)   # reload panes: the bible accept invalidated
                               # the outline pane's captured baseline
     win.outline_notes_edit.setPlainText("Keep chapters short.")
+    assert "may cost money" in win.setup_step_label.text(), \
+        "the outline step labels generation and reroll as paid actions"
     fake.gate = threading.Event()
     win.outline_generate_btn.click()
     try:
@@ -5658,11 +5660,37 @@ def case_setup_wizard_journey(root):
         assert win._busy
         assert not list((missing / "outlines").glob("candidate_*.md")), \
             "no candidate file exists before completion"
+        # completed-only selection: nothing is chosen while streaming
+        n_calls = len(fake.calls)
+        win.outline_list.setCurrentRow(0)
+        win.outline_choose_btn.click()
+        assert len(fake.calls) == n_calls, \
+            "an in-flight candidate is never chosen"
+        assert not (missing / "outline.md").exists()
     finally:
         fake.gate.set()
         assert _pump(a, lambda: not win._busy), "the worker settles on release"
-    assert len(win._outline_candidates) == 2
+    first_two = list(win._outline_candidates)
+    assert len(first_two) == 2
     assert not (missing / "outline.md").exists()
+
+    # Reroll same notes appends without deleting earlier candidates and is
+    # itself a paused paid request
+    assert "Reroll" in win.setup_step_label.text()
+    fake.started = 0
+    fake.gate = threading.Event()
+    win.outline_reroll_btn.click()
+    try:
+        assert _pump(a, lambda: fake.started >= 2), "reroll started"
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "reroll settles on release"
+    assert win._outline_candidates[:2] == first_two, \
+        "earlier candidates are retained"
+    assert len(win._outline_candidates) == 4
+    assert len(list((missing / "outlines").glob("candidate_*.md"))) == 4
+    assert not (missing / "outline.md").exists()
+
     n_calls = len(fake.calls)
     win.outline_list.setCurrentRow(0)
     chosen = (win._outline_overview or {})["candidates"][0]
@@ -5674,6 +5702,17 @@ def case_setup_wizard_journey(root):
         "choosing saves that candidate without the notes comment"
     assert "BODY" in (missing / "outline.md").read_text()
     assert len(fake.calls) == n_calls, "choosing a saved candidate is local"
+
+    # Next from outline is pure navigation: no implicit Choose and no
+    # implicit scene generation
+    n_calls = len(fake.calls)
+    outline_bytes = (missing / "outline.md").read_bytes()
+    win.setup_next_btn.click()
+    assert win._guide_step == "scenes"
+    assert not win._busy
+    assert len(fake.calls) == n_calls, "Next starts no scene generation"
+    assert (missing / "outline.md").read_bytes() == outline_bytes
+    assert not json.loads((missing / "scenes.json").read_text())
 
     # Scene cards: explicit Generate from the saved outline, then Accept;
     # the preview alone never replaces scenes.json
