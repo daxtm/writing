@@ -40,14 +40,15 @@ paid pipeline, key synchronization, installer or shipping authorization is added
 This section supersedes the earlier instruction to stop planning after GUI
 milestone 3, and its credential-name-only/completion-based-progress limitations.
 The implemented milestone/history sections below remain baseline evidence,
-not acceptance of this extension. No OpenSpec change directories are created
-for these roadmap items; select one for build before writing its artifacts.
+not acceptance of this extension. Its five OpenSpec changes are implemented on
+`feat/guided-workflow` (unshipped), each with checked tasks and evidence; real
+Wayland acceptance remains PENDING as recorded below.
 
 ### Milestone 1 — Walking skeleton: initialized project to live outline
 
-- [ ] project-defaults-full-init — Fix shared CLI/GUI init to create every initial file/directory plus a usable bundled writer preset, using the owner's sanitized project defaults; cover immediate and deferred GUI Create paths and copied-executable resource loading.
-- [ ] gui-api-key-setup — Extend existing Setup/settings and shared provider construction with masked session-key entry and explicit local-project Save/Replace/Clear, missing/available status and an explicit Test connection action; never copy credentials into defaults.
-- [ ] gui-generated-text-streaming — Extend existing Api callbacks, candidate batching, shared operations and the one worker so every generated answer streams into its owning preview, including planner, writer, summarizer, critic and editor calls and every candidate.
+- [x] project-defaults-full-init — Fix shared CLI/GUI init to create every initial file/directory plus a usable bundled writer preset, using the owner's sanitized project defaults; cover immediate and deferred GUI Create paths and copied-executable resource loading. Implemented on `feat/guided-workflow`; unshipped.
+- [x] gui-api-key-setup — Extend existing Setup/settings and shared provider construction with masked session-key entry and explicit local-project Save/Replace/Clear, missing/available status and an explicit Test connection action; never copy credentials into defaults. Implemented; real Wayland credential-entry acceptance PENDING.
+- [x] gui-generated-text-streaming — Extend existing Api callbacks, candidate batching, shared operations and the one worker so every generated answer streams into its owning preview, including planner, writer, summarizer, critic and editor calls and every candidate. Implemented; real Wayland live-preview acceptance PENDING.
 
 **Observable slice:** launch
 `QT_QPA_PLATFORM=wayland uv run --script longform.py gui /path/to/new-project`,
@@ -110,8 +111,8 @@ Milestone 1 forces [ADR-0010](adr/0010-sanitized-new-project-defaults.md),
 
 ### Milestone 2 — Guided setup and a coherent writing workspace
 
-- [ ] gui-workflow-navigation — Rework the existing Qt window into Plan → Write → Review → Export navigation with a project overview, plain-language readiness/next actions, focused stage layouts and context-only generation/steering controls; retain every existing advanced action through secondary panels and update the parity map.
-- [ ] gui-project-setup-wizard — Compose shared init/settings/bible/outline/scenes operations into a back/next, save-and-resume wizard: location/title and defaults → credentials → bible questions → generate/choose outline → generate/edit/accept scene cards → enter the first unfinished scene, with streaming previews, explicit paid actions and acceptance.
+- [x] gui-workflow-navigation — Rework the existing Qt window into Plan → Write → Review → Export navigation with a project overview, plain-language readiness/next actions, focused stage layouts and context-only generation/steering controls; retain every existing advanced action through secondary panels and update the parity map. Implemented; real Wayland navigation/presentation acceptance PENDING.
+- [x] gui-project-setup-wizard — Compose shared init/settings/bible/outline/scenes operations into a back/next, save-and-resume wizard: location/title and defaults → credentials → bible questions → generate/choose outline → generate/edit/accept scene cards → enter the first unfinished scene, with streaming previews, explicit paid actions and acceptance. Implemented; real Wayland setup-to-export acceptance PENDING.
 
 The wizard launches after successful new-project Create and can be reopened
 for incomplete projects. It uses saved project artifacts/answer histories to
@@ -154,26 +155,18 @@ storage with an unsaved-session alternative.
 ## Planning baseline and completion bar
 
 The owner's completion bar is **every feature the CLI/TUI has, start to finish,
-must exist in the GUI**. No individual change below completes the workspace.
-Completion requires the entire three-change remaining sequence, command/action
-parity tests, the from-empty-project through export demo and separate real
-Wayland acceptance. This plan does not authorize shipping.
+must exist in the GUI**. The full guided-workflow sequence is implemented on
+`feat/guided-workflow` (unshipped): project defaults, credentials, streaming,
+staged navigation and the setup wizard, on top of the reader shell, draft loop,
+planning and continuity/review/export. Command/action parity, the
+from-empty-project through export journeys and the standalone build pass in
+`scripts/check.sh`. Completion still requires the separate real Wayland
+acceptance described above; this plan does not authorize shipping.
 
-The Qt reading/steering shell is implemented but unshipped on
-`feat/gui-wayland-shell`; it integrates the reader snapshots and ADR-0004/0005.
-Do not confuse that branch with `origin/main`. Its existing
-`openspec/changes/gui-wayland-shell/` records the shell, not working generation.
-The complete draft loop is implemented on this branch (real drafting Wayland
-acceptance remains pending). Milestone 2 is now implemented on this branch:
-`openspec/changes/gui-project-planning/` has its eight tasks landed
-(Create/Open through saved scene cards, offline parity and offscreen journey
-coverage; real Wayland Create-to-scene acceptance recorded as PENDING in
-`openspec/changes/gui-project-planning/evidence.md`). Milestone 3
-(`gui-continuity-review-export`) is now selected/proposed in
-`openspec/changes/gui-continuity-review-export/`, with eight unchecked test-first
-tasks. It is not implemented; this proposal does not authorize shipping.
-Stop planning after this final change: after implementation, audit the full
-parity matrix below before any whole-workspace completion claim.
+Do not confuse `feat/guided-workflow` with `origin/main`. The implementation
+evidence and the full-parity audit are in the respective
+`openspec/changes/*/evidence.md` files; real Wayland acceptance for every
+milestone remains PENDING there.
 
 The existing `cmd_*` commands already implement the rules. Fix/extract those
 boundaries, keeping CLI adapters and reusing `Project`, `Tree`, `Lore`, prompt/
@@ -332,12 +325,13 @@ window sizes, font, palette and offscreen scale 1/2. The end-to-end journeys
 (`case_planning_journey`, `case_review_journey`, `case_owner_flow_reading`)
 still cover Create → planning → draft → review → export across stages.
 
-The sequence is drafting workspace -> setup/planning -> continuity/review/export.
-Do not tick future work based on its proposal. Every row of the map is now
-implemented through GUI controls with offline parity coverage (audited row by
-row in `openspec/changes/gui-continuity-review-export/evidence.md`), but the
-finish line still requires separate native Wayland acceptance for all three
-milestones; no offscreen result or shell smoke establishes it.
+The sequence is drafting workspace -> setup/planning -> continuity/review/export
+-> guided workflow (defaults, credentials, streaming, navigation, wizard).
+Every row of the map is now implemented through staged GUI controls with
+offline parity coverage (audited row by row in the changes' `evidence.md`
+files), and all guided-workflow tasks are checked. The finish line still
+requires separate native Wayland acceptance for every milestone; no offscreen
+result or shell smoke establishes it.
 
 ## Delivery rules for every GUI change
 
