@@ -1092,6 +1092,150 @@ def test_build_script_fails_without_uv(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Builder interpreter policy: fake provisioning contracts (task 1.3, ADR-0013)
+# ---------------------------------------------------------------------------
+
+def make_fake_build_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy(BUILD_SCRIPT, repo / "scripts" / "build-standalone.sh")
+    (repo / ".python-version").write_text("cpython@3.13\n", encoding="utf-8")
+    (repo / "scripts" / "standalone-requirements.txt").write_text(
+        "httpx==0.28.1\n", encoding="utf-8")
+    return repo
+
+
+def make_fake_provisioner(tmp_path):
+    d = tmp_path / "fake-provisioner"
+    d.mkdir()
+    template = d / "fake-python"
+    template.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        if [[ "$1" == "-c" && "$2" == *python_implementation* ]]; then
+          echo "${FAKE_VENV_IMPL:-CPython} ${FAKE_VENV_VERSION:-3.13.15}"
+          exit ${FAKE_VENV_PY_EXIT:-0}
+        fi
+        exit 0
+    """), encoding="utf-8")
+    template.chmod(0o755)
+    uv = d / "uv"
+    uv.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        echo "uv $*" >> "$FAKE_LOG"
+        case "$*" in
+          *"python install"*) exit ${FAKE_INSTALL_EXIT:-0} ;;
+          *"pip install"*) exit ${FAKE_PIP_EXIT:-0} ;;
+          *"venv"*)
+            target="${*: -1}"
+            mkdir -p "$target/bin"
+            cp "$FAKE_VENV_PYTHON_TEMPLATE" "$target/bin/python"
+            chmod +x "$target/bin/python"
+            exit ${FAKE_VENV_EXIT:-0} ;;
+          *) exit ${FAKE_UV_EXIT:-0} ;;
+        esac
+    """), encoding="utf-8")
+    uv.chmod(0o755)
+    return d
+
+
+def run_fake_build(repo, tmp_path, extra_env=None):
+    prov = make_fake_provisioner(tmp_path)
+    env = {
+        "PATH": os.pathsep.join([str(prov), "/usr/bin", "/bin"]),
+        "HOME": str(tmp_path),
+        "FAKE_LOG": str(repo / "log"),
+        "FAKE_VENV_PYTHON_TEMPLATE": str(prov / "fake-python"),
+    }
+    env.update(extra_env or {})
+    return subprocess.run(["bash", str(repo / "scripts" / "build-standalone.sh")],
+                          cwd=str(repo), capture_output=True, text=True, env=env,
+                          timeout=300)
+
+
+def fake_build_log(repo):
+    log = repo / "log"
+    if not log.is_file():
+        return []
+    return log.read_text(encoding="utf-8").splitlines()
+
+
+def test_build_script_provisions_latest_313_patch_automatically(tmp_path):
+    """The builder requests the pinned minor with --upgrade and selects it
+    explicitly for its cleared venv; no patch value appears in any request."""
+    repo = make_fake_build_repo(tmp_path)
+    r = run_fake_build(repo, tmp_path, {"FAKE_PIP_EXIT": "4"})
+    lines = fake_build_log(repo)
+    assert lines[0] == "uv python install --upgrade cpython@3.13"
+    assert r.returncode != 0  # stopped at the fake pinned dependency install
+    assert "could not install pinned build requirements" in r.stderr
+    venv_line = next(l for l in lines if l.startswith("uv venv"))
+    assert "--python cpython@3.13" in venv_line
+    assert "--managed-python" in venv_line
+    assert "--clear" in venv_line
+    assert "3.13.15" not in venv_line, "no patch value may be baked into a request"
+
+
+def test_build_script_explicit_requests_despite_host_env(tmp_path):
+    """Another Python first on PATH resolution or a conflicting UV_PYTHON must
+    not change the selected implementation/minor."""
+    repo = make_fake_build_repo(tmp_path)
+    r = run_fake_build(repo, tmp_path,
+                       {"FAKE_PIP_EXIT": "4", "UV_PYTHON": "3.12"})
+    lines = fake_build_log(repo)
+    assert lines[0] == "uv python install --upgrade cpython@3.13"
+    venv_line = next(l for l in lines if l.startswith("uv venv"))
+    assert "--python cpython@3.13" in venv_line
+    pip_line = next(l for l in lines if l.startswith("uv pip install"))
+    assert "--python " in pip_line, pip_line
+
+
+@pytest.mark.parametrize("impl,version", [("PyPy", "3.13.5"), ("CPython", "3.12.14"),
+                                          ("CPython", "3.14.10")])
+def test_build_script_rejects_wrong_interpreter_before_dependencies(tmp_path, impl, version):
+    """A provisioned interpreter of the wrong implementation or minor fails
+    before pip or PyInstaller can run; the diagnostic names the request and
+    the actual interpreter."""
+    repo = make_fake_build_repo(tmp_path)
+    r = run_fake_build(repo, tmp_path,
+                       {"FAKE_VENV_IMPL": impl, "FAKE_VENV_VERSION": version})
+    assert r.returncode != 0
+    lines = fake_build_log(repo)
+    assert not any(l.startswith("uv pip install") for l in lines), lines
+    assert not any("PyInstaller" in l for l in lines), lines
+    blob = r.stdout + r.stderr
+    assert impl in blob and version in blob
+    assert "cpython@3.13" in blob
+
+
+def test_build_script_provisioning_failure_propagates(tmp_path):
+    repo = make_fake_build_repo(tmp_path)
+    r = run_fake_build(repo, tmp_path, {"FAKE_INSTALL_EXIT": "1"})
+    assert r.returncode != 0
+    assert fake_build_log(repo) == ["uv python install --upgrade cpython@3.13"]
+    assert "cpython@3.13" in (r.stdout + r.stderr)
+
+
+@pytest.mark.parametrize("pin", ["", "3.13", "cpython@3.13.15", "cpython@3.12",
+                                 "pypy@3.13", "cpython@3.13\n3.13"])
+def test_build_script_rejects_missing_or_malformed_pins(tmp_path, pin):
+    repo = make_fake_build_repo(tmp_path)
+    (repo / ".python-version").write_text(pin, encoding="utf-8")
+    r = run_fake_build(repo, tmp_path)
+    assert r.returncode != 0
+    assert ".python-version" in (r.stdout + r.stderr)
+    assert fake_build_log(repo) == [], "no provisioning may run on an invalid pin"
+
+
+def test_build_script_missing_pin_fails(tmp_path):
+    repo = make_fake_build_repo(tmp_path)
+    (repo / ".python-version").unlink()
+    r = run_fake_build(repo, tmp_path)
+    assert r.returncode != 0
+    assert ".python-version" in (r.stdout + r.stderr)
+    assert fake_build_log(repo) == []
+
+
+# ---------------------------------------------------------------------------
 # Sidecars: build identity and third-party notices (tasks 1.3)
 # ---------------------------------------------------------------------------
 
@@ -1118,12 +1262,18 @@ def test_build_json_records_source_platform_interpreter_deps(built, build_json):
     assert re.search(r"\d+\.\d+", plat["glibc"])
 
     interp = build_json["interpreter"]
+    assert interp["requested"] == "cpython@3.13", \
+        "the sidecar must record the reviewed minor request"
     assert interp["implementation"] == "CPython"
     version = tuple(int(part) for part in interp["version"].split(".")[:2])
     assert version >= (3, 12), (
         f"build interpreter {interp['version']} is below 3.12: PySide6 6.12.0 drops "
         "a reference to None on every Qt call there (PYSIDE-3424), so long GUI sessions "
         "abort with 'none_dealloc: deallocating None'")
+    assert version == (3, 13), \
+        f"build interpreter {interp['version']} disagrees with the requested cpython@3.13"
+    # the full actual version is recorded; the patch is observed, never asserted
+    assert re.fullmatch(r"3\.13\.\d+", interp["version"]), interp["version"]
 
     deps = build_json["dependencies"]
     for name, version in (("pyinstaller", "6.22.3"), ("pyinstaller-hooks-contrib", "2026.10"),

@@ -273,6 +273,24 @@ def bundled_resource_entries(root, archive_names):
     return entries
 
 
+def requested_python_pin(root):
+    """The reviewed interpreter request from the authoritative .python-version
+    (ADR-0013). The sidecar records the request as made, while implementation
+    and version keep describing the actual build interpreter."""
+    pin_file = Path(root) / ".python-version"
+    try:
+        requested = pin_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        raise SidecarError(
+            f"missing unreadable interpreter pin: {pin_file} "
+            "(the build must record the requested CPython minor)")
+    if not re.fullmatch(r"cpython@\d+\.\d+", requested):
+        raise SidecarError(
+            f"invalid interpreter pin in {pin_file}: {requested!r} "
+            "(expected cpython@<major>.<minor>; patches are never pinned)")
+    return requested
+
+
 def build_documents(exe, root, license_dir):
     from PySide6 import __version__ as pyside_version
     from PySide6.QtCore import qVersion
@@ -324,7 +342,8 @@ def build_documents(exe, root, license_dir):
             "dirty_summary": dirty_status,
         },
         "platform": {"os": platform.system(), "arch": platform.machine(), "glibc": glibc_line},
-        "interpreter": {"implementation": platform.python_implementation(),
+        "interpreter": {"requested": requested_python_pin(root),
+                        "implementation": platform.python_implementation(),
                         "version": platform.python_version()},
         "dependencies": deps,
         "pyinstaller": {"version": pyinstaller_version, "mode": "onefile console",

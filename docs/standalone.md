@@ -13,11 +13,16 @@ files, and the same native-Wayland-only policy.
 
 - Linux x86_64 with glibc **2.34 or newer** (the pinned PySide6 wheels are
   `manylinux_2_34`; musl and other OSes/architectures are not built).
-- `uv`, with a provisionable Python 3.13 (`uv python install 3.13` is run for
-  you if needed). The build requires CPython **3.12 or newer**: PySide6 6.12.0
-  loses one reference to `None` on every Qt call on 3.11, so long GUI sessions
-  abort with `none_dealloc`; CPython 3.12+ makes `None` immortal (PYSIDE-3424,
-  fixed only in the unreleased shiboken 6.12.1).
+- `uv`. The build validates the authoritative `.python-version` pin and
+  provisions the latest available managed CPython 3.13 patch itself
+  (`uv python install --upgrade cpython@3.13`), then explicitly selects it for
+  the cleared build venv (ADR-0013). The build requires CPython **3.13.x**:
+  PySide6 6.12.0 loses one reference to `None` on every Qt call on 3.11, so
+  long GUI sessions abort with `none_dealloc`; CPython 3.12+ makes `None`
+  immortal (PYSIDE-3424, fixed only in the unreleased shiboken 6.12.1). The
+  reviewed policy holds the minor at 3.13 — patch updates are automatic, and
+  only a minor bump is a reviewed pin/mirror change. Another minor or
+  implementation fails the build before any dependency is installed.
 - Network access **for provisioning build dependencies only**; the built
   application never installs or downloads anything.
 - Build dependency versions are fully pinned in
@@ -38,13 +43,17 @@ files, and the same native-Wayland-only policy.
 ./scripts/build-standalone.sh
 ```
 
-The script diagnoses missing uv, unsupported OS/architecture/libc, and an
-unusable build Python, and exits nonzero on any error. It prints the artifact
+The script diagnoses missing uv, unsupported OS/architecture/libc, a missing,
+malformed or patch-specific interpreter pin, an unprovisionable requested
+minor, and a provisioned interpreter of the wrong implementation or minor,
+and exits nonzero on any error — wrong interpreters are rejected before pip or
+PyInstaller run, with no fallback. It prints the artifact
 path on success. Generated spec/work files live under `build/standalone/` and
 the executable under `dist/`; both are git-ignored. The build runs from the
 repository root resolved from the script location. Build output is not
-guaranteed to be bit-identical between runs; the interpreter patch version is
-recorded in `dist/longform-build.json`. The current Qt 6.12.0 build produces an
+guaranteed to be bit-identical between runs; the requested minor and the
+actual interpreter implementation and full patch version are recorded in
+`dist/longform-build.json`. The current Qt 6.12.0 build produces an
 executable of roughly 85 MB (212 MiB unpacked).
 
 ## Copy, run, distribute
@@ -86,7 +95,9 @@ as for any Qt Wayland application.
 Two files are generated beside the executable for distribution purposes:
 
 - `dist/longform-build.json`: the source revision and dirty state, OS,
-  architecture, glibc, interpreter and resolved dependency versions, PySide6,
+  architecture, glibc, the requested interpreter pin (`cpython@3.13`), the
+  actual build interpreter implementation and full version, the resolved
+  dependency versions, PySide6,
   Shiboken and Qt versions, the actual bundled plugin inventory, per-file `ldd`
   inspection of the Qt/Wayland libraries and plugins (bundled versus remaining
   host dependencies), native shared-library requirements of the executable
