@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from longform_core import draft_operations as dop
-from longform_core.api import Api
+from longform_core.api import Api, HttpErr
 from longform_core.cancel import Cancelled, CancellationToken
 
 from tests.test_draft_parity import BATCH_A, build  # shared synthetic project
@@ -278,3 +278,123 @@ def test_repeated_stop_is_safe_and_shortfall_reported(tmp_path):
     assert {"type": "shortfall", "got": 1, "wanted": 3} in events
     t = tree_of(root)
     assert t["head"] == "n1", "generation never moves the head"
+
+
+class PausedBatchProvider:
+    """Two-slot batch: slot 0 completes quietly, slot 1 streams one preview
+    fragment and blocks on the shared gate; the token check lands after the
+    gate, so Stop cannot fabricate a completion for the paused candidate."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.gate = threading.Event()
+        self.started = 0
+
+    def complete(self, role, prompt, params, extra=None, stream_cb=None,
+                 meta=None, token=None, preview_events=None, **kw):
+        i = self.started
+        self.started += 1
+        if i == 0:
+            return "DONE ONE. ", "stop", {}
+        if preview_events is not None:
+            preview_events({"type": "preview_start", "attempt_id": 1})
+            preview_events({"type": "preview_delta", "attempt_id": 1,
+                            "text": "FRAG "})
+        if self.gate is not None and not self.gate.wait(10):
+            raise AssertionError("gate never opened")
+        if token is not None:
+            token.check()
+        if self.fail:
+            raise HttpErr(500, "boom")
+        return "NEVER. ", "stop", {}
+
+    def many(self, fn, n, token=None, on_event=None, indexed=None):
+        import concurrent.futures as cf
+        results, cancelled = [], False
+        with cf.ThreadPoolExecutor(max_workers=max(1, n)) as ex:
+            futs = [ex.submit(indexed(i) if indexed is not None else fn)
+                    for i in range(n)]
+            for i, fut in enumerate(futs):
+                try:
+                    results.append(fut.result())
+                except Cancelled:
+                    cancelled = True
+                except Exception as e:  # noqa: BLE001 (mirrors Api.many)
+                    if on_event:
+                        on_event({"type": "candidate_failed", "k": i + 1,
+                                  "n": n,
+                                  "msg": f"candidate {i + 1}/{n} failed: "
+                                         f"{type(e).__name__}: {e}"})
+        if cancelled:
+            raise Cancelled("stopped")
+        return results
+
+
+def test_stop_paused_batch_keeps_committed_work_and_saves_no_fragment(tmp_path):
+    """Task 1.7: Stop while one candidate is paused after provisional text
+    keeps the previously committed complete work, saves no fragment, and the
+    paused candidate's preview never gains a fabricated completion."""
+    root = build(tmp_path / "p")
+    seed = dop.generate_candidates(root, "s001", count=1, steer="",
+                                   provider_factory=lambda p: GatedProvider())
+    assert seed.saved == ["n2"], "a complete candidate from an earlier batch"
+    prov = PausedBatchProvider()
+    evs = []
+    token = CancellationToken()
+    result = {}
+
+    def run():
+        try:
+            dop.generate_candidates(root, "s001", count=2, steer="",
+                                    provider_factory=lambda p: prov,
+                                    token=token, events=evs.append,
+                                    preview_events=lambda i: (
+                                        lambda e: evs.append(e)))
+        except Cancelled as e:
+            result["err"] = e
+
+    th = threading.Thread(target=run)
+    th.start()
+    deadline = time.time() + 10
+    while prov.started < 2 and time.time() < deadline:
+        time.sleep(0.005)
+    token.cancel()              # Stop while the second candidate is paused
+    prov.gate.set()
+    th.join(10)
+    assert isinstance(result.get("err"), Cancelled), "Stop is a distinct result"
+    t = tree_of(root)
+    assert set(t["nodes"]) == {"n1", "n2"} and t["head"] == "n1", \
+        "committed complete work survives; no fragment node is saved"
+    frag = [e for e in evs if e.get("type", "").startswith("preview_")]
+    assert any(e.get("text") == "FRAG " for e in frag), \
+        "the provisional fragment streamed before Stop"
+    assert not any(e["type"] == "preview_complete" for e in frag), \
+        "a stopped candidate never completes"
+    assert frag[-1]["type"] == "preview_delta", \
+        "the paused candidate's stream stops at its last delta"
+
+
+def test_failed_batch_with_previews_reports_and_keeps_complete_candidate(tmp_path):
+    """A paused candidate that fails after provisional text: the complete
+    candidate is saved, the failure is reported, no fragment is saved or
+    completed, and head/committed files are unchanged."""
+    root = build(tmp_path / "p")
+    prov = PausedBatchProvider(fail=True)
+    prov.gate = None          # the failing candidate fails after its fragment
+    evs = []
+    res = dop.generate_candidates(root, "s001", count=2, steer="",
+                                  provider_factory=lambda p: prov,
+                                  events=evs.append,
+                                  preview_events=lambda i: (
+                                      lambda e: evs.append(e)))
+    assert res.saved == ["n2"] and res.shortfall == 1
+    assert {"type": "candidate_failed", "k": 2, "n": 2} in \
+        [{k: e.get(k) for k in ("type", "k", "n")} for e in evs], \
+        "the failed candidate is reported on the events channel"
+    frag = [e for e in evs if e.get("type", "").startswith("preview_")]
+    assert any(e.get("text") == "FRAG " for e in frag)
+    assert not any(e["type"] == "preview_complete"
+                   for e in frag), "a failed candidate never completes"
+    t = tree_of(root)
+    assert set(t["nodes"]) == {"n1", "n2"} and t["head"] == "n1", \
+        "the complete candidate is saved with existing semantics; no fragment"

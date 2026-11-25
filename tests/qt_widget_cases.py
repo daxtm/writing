@@ -618,8 +618,10 @@ class FakeProvider:
         self.calls = []
         self.started = 0
         self.gate = None          # threading.Event: block between chunks when set
+        self.start_gate = None    # threading.Event: hold before any fragment
         self.fail_after = None    # raise after this many chunks were delivered
         self.fail_on = set()      # call indexes (0-based) that raise
+        self.fail_stream_on = set()  # fragments-mode indexes that fail late
         self.parallel = False     # many() runs slots concurrently (indexed mode)
 
     def complete(self, role, prompt, params, extra=None, stream_cb=None,
@@ -628,10 +630,11 @@ class FakeProvider:
         self.calls.append({"role": role, "prompt": prompt, "params": params,
                            "extra": extra, "meta": meta})
         self.started += 1
+        idx = self.started - 1
         if token is not None:
             token.check()
         if _stream is None and self.fragments is not None:
-            _stream = self.fragments[self.started - 1]
+            _stream = self.fragments[idx]
         if _stream is not None:
             # paused-stream mode (gui-generated-text-streaming): deliver the
             # first fragment, block on the shared gate, then finish.
@@ -639,6 +642,9 @@ class FakeProvider:
             sub = preview_events
             if sub:
                 sub({"type": "preview_start", "attempt_id": 1})
+            if sub and self.start_gate is not None and \
+                    not self.start_gate.wait(30):
+                raise AssertionError("start gate never opened")
             if token is not None:
                 token.check()
             if sub:
@@ -649,6 +655,8 @@ class FakeProvider:
                 token.check()
             if sub:
                 sub({"type": "preview_delta", "attempt_id": 1, "text": rest})
+            if self.fail_stream_on and idx in self.fail_stream_on:
+                raise RuntimeError("fake provider failed after the fragment")
             if sub:
                 sub({"type": "preview_complete", "attempt_id": 1})
             return first + rest, "stop", {}
@@ -782,6 +790,9 @@ class PlanningFake(FakeProvider):
                 sub({"type": "preview_start", "attempt_id": 1})
             if token is not None:
                 token.check()
+            if sub and self.start_gate is not None and \
+                    not self.start_gate.wait(30):
+                raise AssertionError("start gate never opened")
             if sub:
                 sub({"type": "preview_delta", "attempt_id": 1, "text": first})
             if self.gate is not None and not self.gate.wait(30):
@@ -790,6 +801,8 @@ class PlanningFake(FakeProvider):
                 token.check()
             if sub:
                 sub({"type": "preview_delta", "attempt_id": 1, "text": rest})
+            if self.fail_stream_on and (self.started - 1) in self.fail_stream_on:
+                raise RuntimeError("fake provider failed after the fragment")
             if sub:
                 sub({"type": "preview_complete", "attempt_id": 1})
             return first + rest, "stop", {}
@@ -2247,9 +2260,11 @@ def case_stream_draft_candidates(root):
     win.generate_btn.click()
     try:
         assert _pump(a, lambda: fake.started >= 2), "both candidates started"
-        assert _pump(a, lambda: win.draft_stream_list.count() == 2), \
-            "two labelled live candidate rows"
-        assert "streaming" in win.draft_stream_list.item(0).text().lower()
+        assert _pump(a, lambda: win.draft_stream_list.count() == 2 and
+                     all("streaming" in win.draft_stream_list.item(x)
+                         .text().lower()
+                         for x in range(win.draft_stream_list.count()))), \
+            "two labelled live candidate rows, both streaming"
         win.draft_stream_list.setCurrentRow(0)
         assert _pump(a, lambda: "BATCH ONE text." in win.preview.toPlainText()), \
             "candidate 1's fragment is visible while the gate is closed"
@@ -2312,9 +2327,11 @@ def case_stream_planning(root):
     win.outline_generate_btn.click()
     try:
         assert _pump(a, lambda: fake.started >= 2), "both candidates started"
-        assert _pump(a, lambda: win.outline_stream_list.count() == 2), \
-            "two labelled live candidate rows"
-        assert "streaming" in win.outline_stream_list.item(0).text().lower()
+        assert _pump(a, lambda: win.outline_stream_list.count() == 2 and
+                     all("streaming" in win.outline_stream_list.item(x)
+                         .text().lower()
+                         for x in range(win.outline_stream_list.count()))), \
+            "two labelled live candidate rows, both streaming"
         win.outline_stream_list.setCurrentRow(0)
         assert _pump(a, lambda: "ONE BODY" in win.outline_stream.toPlainText()), \
             "candidate 1's fragment is visible while the gate is closed"
@@ -2554,6 +2571,197 @@ def case_stream_review(root):
     assert t["head"] == "n2"
     win.close()
 
+
+
+def case_stream_retry_stop(root):
+    """Paused reroll-all batches (task 1.7): waiting/streaming/complete/failed
+    labels per candidate, responsive reading, late-signal and retired-attempt
+    immunity, repeated Stop, stale-write refusal, retained committed work and
+    no fragment acceptance. Gates are always released in finally."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(
+        root,
+        scenes=[_scene("s001", title="Yard", pov="Mara", characters=["Mara"]),
+                _scene("s002", title="Panes")],
+        trees={
+            "s001": _tree({"n1": _node("n1", None,
+                                       "Mara counts the lit windows.")},
+                          head="n1"),
+            "s002": _tree({"n1": _node("n1", None, "Mara closes the gate.")},
+                          head="n1")})
+    fake = FakeProvider(fragments=[("ONE.", " tail one."),
+                                   ("TWO.", " tail two.")])
+    fake.parallel = True
+    answers = []
+    win = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.count_spin.setValue(2)
+    win.generate_btn.click()
+    assert _pump(a, lambda: not win._busy), "the committed batch settles"
+    committed = json.loads((project / "trees" / "s001.json").read_text())
+    assert set(committed["nodes"]) == {"n1", "n2", "n3"}
+
+    def _labels():
+        return [win.draft_stream_list.item(x).text()
+                for x in range(win.draft_stream_list.count())]
+
+    # --- paused batch: waiting labels pre-fragment, streaming labels with
+    #     fragments, candidate 2 fails after its fragment, 1 completes
+    fake.started = 0
+    fake.fragments = [("R1.", " tail r1."), ("R2.", " tail r2.")]
+    fake.fail_stream_on = {1}
+    fake.start_gate = threading.Event()
+    fake.gate = threading.Event()
+    try:
+        win.reroll_all_btn.click()
+        assert _pump(a, lambda: win._busy and fake.started >= 2), \
+            "both reroll slots started on the worker"
+        assert _pump(a, lambda: win.draft_stream_list.count() == 2), \
+            "two labelled live candidate rows"
+        assert all("waiting" in lb.lower() for lb in _labels()), _labels()
+        assert "(Waiting for answer" in win.preview.toPlainText()
+        assert "Waiting for answer" in win.status.text()
+        assert win._busy, "the worker holds while the start gate is closed"
+
+        # reading another scene stays responsive and never retargets the run
+        win.select_item("manuscript", "s002", None)
+        assert _pump(a, lambda: "Mara closes the gate." in
+                     win.reading.toPlainText()), "reading stays responsive"
+        assert win._busy and win.draft_stream_list.count() == 2, \
+            "reading another scene does not retarget or reset the previews"
+        win.select_item("manuscript", "s001", None)
+
+        fake.start_gate.set()
+        assert _pump(a, lambda: all("streaming" in lb.lower()
+                                    for lb in _labels()))
+        assert _pump(a, lambda: "R1" in win.preview.toPlainText()), \
+            "candidate 1's fragment is visible while the gate is closed"
+        win.draft_stream_list.setCurrentRow(1)
+        assert _pump(a, lambda: "R2" in win.preview.toPlainText()), \
+            "candidate 2's fragment is visible while the gate is closed"
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "the batch settles on release"
+    fake.start_gate = None
+    fake.gate = None
+    fake.fail_stream_on = set()
+    labels = [lb.split(" — ")[1] for lb in _labels()]
+    assert sorted(labels) == ["complete", "failed"], _labels()
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    done = [nid for nid in t["nodes"] if "R1" in t["nodes"][nid]["text"]]
+    assert len(done) == 1 and set(t["nodes"]) == set(committed["nodes"]) \
+        | set(done), "only the completed candidate is saved; no fragment node"
+    assert t["head"] == "n1", "no implicit acceptance"
+
+    # late/retired/settled events can never change a current preview
+    pane = win.preview.toPlainText()
+    win._on_worker_event(win._op_id + 7,
+                         {"type": "preview_delta", "candidate_id": 1,
+                          "attempt_id": 9, "text": "LATE"})
+    win._on_worker_event(win._op_id,
+                         {"type": "preview_delta", "candidate_id": 1,
+                          "attempt_id": 0, "text": "RETIRED"})
+    win._on_worker_event(win._op_id,
+                         {"type": "preview_delta", "candidate_id": 1,
+                          "attempt_id": 1, "text": "SETTLED"})
+    win._flush_preview_pane()
+    assert win.preview.toPlainText() == pane, "old events are ignored"
+    assert sorted(lb.split(" — ")[1] for lb in _labels()) == \
+        ["complete", "failed"], "a failed preview stays labelled failed"
+
+    # the tray offers only completed answers; the failed slot keeps its old
+    # saved node and the failed fragment is never accepted or saved
+    assert win._batch and win._batch["saved"] == [done[0], "n3"], \
+        "the completed reroll replaces its slot; the failed slot keeps its text"
+    assert "R2" not in " ".join(t["nodes"][nid]["text"]
+                                for nid in win._batch["saved"])
+
+    # --- repeated Stop while paused: committed work survives, nothing saved
+    before = json.loads((project / "trees" / "s001.json").read_text())
+    fake.started = 0
+    fake.fragments = [("S1.", " tail s1."), ("S2.", " tail s2.")]
+    fake.start_gate = threading.Event()
+    fake.gate = threading.Event()
+    try:
+        win.reroll_all_btn.click()
+        assert _pump(a, lambda: win._busy and fake.started >= 2)
+        fake.start_gate.set()
+        assert _pump(a, lambda: "S1" in win.preview.toPlainText())
+        win.stop_btn.click()
+        win.stop_btn.click()
+        assert "Stopping" in win.status.text()
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "the stopped batch settles"
+    fake.start_gate = None
+    fake.gate = None
+    assert "stopped" in win.status.text().lower() or \
+        "not saved" in win.status.text().lower(), win.status.text()
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert set(t["nodes"]) == set(before["nodes"]), \
+        "committed complete work survives; no fragment node is saved"
+    assert not any("S1" in n["text"] or "S2" in n["text"]
+                   for n in t["nodes"].values()), "no fragment was saved"
+
+    # --- a completing paused batch against an external change: stale refusal
+    fake.started = 0
+    fake.fragments = [("T1.", " tail t1."), ("T2.", " tail t2.")]
+    fake.start_gate = threading.Event()
+    fake.gate = threading.Event()
+    try:
+        win.reroll_all_btn.click()
+        assert _pump(a, lambda: win._busy and fake.started >= 2)
+        fake.start_gate.set()
+        assert _pump(a, lambda: "T1" in win.preview.toPlainText())
+        t = json.loads((project / "trees" / "s001.json").read_text())
+        t["nodes"]["n7"] = {"id": "n7", "parent": "n1", "text": "external",
+                            "created": "x", "history": [], "sep": "\n\n"}
+        _write_json(project / "trees" / "s001.json", t)
+    finally:
+        fake.gate.set()
+        assert _pump(a, lambda: not win._busy), "the paused batch settles"
+    fake.start_gate = None
+    fake.gate = None
+    assert "reload" in win.status.text().lower(), \
+        "the stale save is refused with the existing recovery guidance"
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert "n7" in t["nodes"], "the external change survives"
+    assert not any("T1" in n["text"] or "T2" in n["text"]
+                   for n in t["nodes"].values()), "no fragment is committed"
+
+    # --- close while streaming: Keep open keeps the job; Stop and wait closes
+    fake.started = 0
+    fake.fragments = [("U1.", " tail u1."), ("U2.", " tail u2.")]
+    fake.start_gate = threading.Event()
+    fake.gate = threading.Event()
+    try:
+        win.reroll_all_btn.click()
+        assert _pump(a, lambda: win._busy and fake.started >= 2)
+        fake.start_gate.set()
+        assert _pump(a, lambda: "U1" in win.preview.toPlainText())
+        answers.append("Keep open")
+        win.close()
+        assert win.isVisible(), "Keep open keeps the window and the job"
+        assert win._busy, "Keep open cancels nothing"
+        # Stop and wait: the cooperative Stop is requested, the paused
+        # candidates settle at their next boundary, then the close completes
+        answers.append("Stop and wait")
+        win.stop_btn.click()
+        fake.gate.set()
+        win.close()
+        assert _pump(a, lambda: not win._busy), "Stop and wait settles"
+    finally:
+        fake.gate.set()
+    assert _pump(a, lambda: not win.isVisible()), \
+        "the window closes only after settlement"
+    t = json.loads((project / "trees" / "s001.json").read_text())
+    assert "n7" in t["nodes"] and \
+        not any("U1" in n["text"] or "U2" in n["text"]
+                for n in t["nodes"].values()), \
+        "the stopped batch saved nothing new"
 
 
 def case_planning_scenes(root):
@@ -4766,6 +4974,7 @@ CASES = {
     "case_stream_planning": case_stream_planning,
     "case_stream_draft_candidates": case_stream_draft_candidates,
     "case_stream_review": case_stream_review,
+    "case_stream_retry_stop": case_stream_retry_stop,
     "case_planning_scenes": case_planning_scenes,
     "case_planning_card_edit": case_planning_card_edit,
     "case_review_update_state": case_review_update_state,

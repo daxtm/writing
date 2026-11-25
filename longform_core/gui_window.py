@@ -170,6 +170,7 @@ class MainWindow(QMainWindow):
         self._op_previews = {}   # (candidate_id, attempt_id) -> {text,status}
         self._op_preview_latest = {}   # candidate_id -> latest attempt seen
         self._op_preview_row = None   # selected live-preview candidate
+        self._preview_dirty = False   # a delta flush is pending this loop turn
         self._outline_notes_loaded = None
         self._outline_body_loaded = None
         self._scenes_overview = None
@@ -4463,16 +4464,10 @@ class MainWindow(QMainWindow):
             self.preview.setPlainText("")
             self._status("Streaming… (provisional preview; nothing is saved yet)")
         elif kind in ("candidate_done", "candidate_failed"):
+            # candidate_failed's k is a completion-order index (Api.many),
+            # never a preview slot; previews are marked nonaccepting at
+            # settlement instead (see _on_worker_done).
             self._status(payload.get("msg", ""))
-            if kind == "candidate_failed":
-                try:
-                    k = int(payload.get("k", 0))
-                except (TypeError, ValueError):
-                    k = 0
-                st = self._op_previews.get((k, self._op_preview_latest.get(k)))
-                if st is not None and st["status"] != "complete":
-                    st["status"] = "failed"
-                    self._refresh_preview_pane()
         elif kind in dop.PREVIEW_TYPES:
             self._on_preview_event(payload)
         elif kind == "progress":
@@ -4498,6 +4493,9 @@ class MainWindow(QMainWindow):
         kind = payload.get("type")
         if self._op_preview_latest.get(cand, 0) > attempt:
             return   # a retired attempt cannot revive its preview
+        if kind == "preview_start":
+            self._status("Waiting for answer… (provisional preview; "
+                         "nothing is saved yet)")
         st = self._op_previews.setdefault(
             (cand, attempt), {"text": "", "status": "waiting"})
         if kind == "preview_start":
@@ -4515,6 +4513,22 @@ class MainWindow(QMainWindow):
             st["status"] = "complete"
         else:
             return
+        if kind == "preview_delta":
+            # Coalesce adjacent deltas: the pane repaints once per GUI
+            # event-loop turn while the request stays blocked on the wire.
+            self._schedule_preview_flush()
+        else:
+            self._refresh_preview_pane()
+
+    def _schedule_preview_flush(self):
+        """Flush coalesced preview deltas on this event-loop turn."""
+        if self._preview_dirty:
+            return
+        self._preview_dirty = True
+        QTimer.singleShot(0, self._flush_preview_pane)
+
+    def _flush_preview_pane(self):
+        self._preview_dirty = False
         self._refresh_preview_pane()
 
     def _preview_target(self):
@@ -4573,7 +4587,7 @@ class MainWindow(QMainWindow):
                 bar.setValue(bar.maximum())
         elif target == "review":
             st = self._candidate_states().get(1)
-            if st is None or not st["text"]:
+            if st is None:
                 return
             if self._op_kind in ("continuity_generate", "compress_generate"):
                 widget = self.continuity_preview
@@ -4581,6 +4595,10 @@ class MainWindow(QMainWindow):
                 widget = self.revise_view
             else:
                 widget = self.report_view
+            if not st["text"]:
+                if st["status"] in ("waiting", "streaming"):
+                    widget.setPlainText("(Waiting for answer…)")
+                return
             widget.setPlainText(st["text"])
             bar = widget.verticalScrollBar()
             bar.setValue(bar.maximum())
@@ -4624,6 +4642,7 @@ class MainWindow(QMainWindow):
         self._op_previews = {}
         self._op_preview_latest = {}
         self._op_preview_row = None
+        self._preview_dirty = False
         if "outline" in targets:
             self.outline_stream_list.blockSignals(True)
             self.outline_stream_list.clear()
@@ -4675,6 +4694,17 @@ class MainWindow(QMainWindow):
             self._settling = False
         if self._op_id != settled:
             return  # a chained operation already owns the gate
+        # A settled operation's previews are final: any answer that never
+        # completed is failed/aborted and cannot be accepted (candidate_failed
+        # carries only a completion-order k, so per-slot labelling happens
+        # here, not per event).
+        changed = False
+        for st in self._op_previews.values():
+            if st["status"] not in ("complete", "failed"):
+                st["status"] = "failed"
+                changed = True
+        if changed:
+            self._refresh_preview_pane()
         self._update_steering_ui()
 
     def _on_thread_finished(self, thread):
