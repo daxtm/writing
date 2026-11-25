@@ -4531,6 +4531,12 @@ class MainWindow(QMainWindow):
                     return
             self._bind_steering(scene_id)
         self._sel_data = data
+        # Keep the visible selection on the newly bound scene: a Save during
+        # the switch refreshes the snapshot mid-handler, and the rebuild
+        # restores the sidebar by the still-old selection identity.
+        item = self._find_item(data)
+        if item is not None and self.sidebar.currentItem() is not item:
+            self.sidebar.setCurrentItem(item)
         self._missing_node = None
         self._view_override = None   # selection navigation clears view-only text
         self._update_panes()

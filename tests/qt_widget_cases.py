@@ -4170,6 +4170,142 @@ def case_review_status_export(root):
         "export pauses on unsaved report edits"
 
 
+def case_workflow_dirty_busy(root):
+    """Dirty Save/Discard/Cancel and failed saves across stage switches;
+    live previews continue while browsing other stages; Stop stays global;
+    close during busy; selection retention; no second operation before the
+    worker actually finishes."""
+    import longform_core.gui_window as gw
+    a = app()
+    project = _draft_project(root, scenes=[
+        _scene("s001", title="Yard", pov="Mara", characters=["Mara"]),
+        _scene("s002", title="Next", pov="Mara", characters=["Mara"]),
+    ], trees={
+        "s001": _tree({"n1": _node("n1", None, "Mara counts the lit windows.")},
+                      head="n1"),
+        "s002": _tree({"n1": _node("n1", None, "Later.")}, head="n1"),
+    })
+    fake = FakeProvider()
+    answers = []
+    win = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0),
+                        provider_factory=lambda _p: fake)
+    win.show()
+    win.select_item("manuscript", "s001", None)
+    win.steer_editor.setPlainText("dirty across stages")
+
+    # A stage switch is not destructive: the hidden editor keeps its dirty
+    # text and no modal dialog appears.
+    win.select_stage("plan")
+    assert win.dirty(), "dirty steering survives the stage switch"
+    assert win.current_stage() == "plan"
+    win.select_stage("write")
+    assert win.steer_editor.toPlainText() == "dirty across stages", \
+        "hidden editor state is preserved across stages"
+
+    # Save choice on a destructive scene switch persists the steering.
+    answers.append("Save")
+    win.select_item("manuscript", "s002", None)
+    assert json.loads((project / "trees" / "s001.json").read_text())["steer"] \
+        == "dirty across stages", "scene switch resolves dirty steering first"
+    win.select_item("manuscript", "s001", None)
+
+    # Cancel keeps the scene selection and the dirty text; Discard writes none.
+    win.steer_editor.setPlainText("cancel keeps me")
+    answers.append("Cancel")
+    win.select_item("manuscript", "s002", None)
+    assert win._sel_data[1] == "s001", "Cancel keeps the original scene"
+    assert win.dirty()
+    win.select_item("manuscript", "s001", None)
+    win.steer_editor.setPlainText("discard me")
+    answers.append("Discard")
+    win.select_item("manuscript", "s002", None)
+    got = json.loads((project / "trees" / "s001.json").read_text())
+    assert got["steer"] == "dirty across stages", "Discard writes nothing"
+    win.select_item("manuscript", "s001", None)
+
+    # A failed Save during a scene switch behaves like Cancel plus an error.
+    (project / "trees" / "s001.json").rename(project / "trees" / "keep.json")
+    (project / "trees" / "s001.json").symlink_to(project / "trees" / "keep.json")
+    win.steer_editor.setPlainText("switch with failing save")
+    answers.append("Save")
+    win.select_item("manuscript", "s002", None)
+    assert win._sel_data[1] == "s001", "failed Save keeps the original scene"
+    assert "not saved" in win.status.text()
+    assert win.dirty()
+    answers.append("Discard")   # closing without saving
+    win.close()
+
+    # A stale Save during a scene switch cancels the route and keeps edits:
+    # the saved steering changed on disk since editing began. Repair the
+    # symlinked source first so the scene has readable prerequisites again.
+    (project / "trees" / "s001.json").unlink()
+    (project / "trees" / "keep.json").rename(project / "trees" / "s001.json")
+    win3 = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0),
+                         provider_factory=lambda _p: fake)
+    win3.show()
+    win3.select_item("manuscript", "s001", None)
+    # an external writer changes the saved steering after the bind
+    keep = json.loads((project / "trees" / "s001.json").read_text())
+    keep["steer"] = "externally changed"
+    (project / "trees" / "s001.json").write_text(json.dumps(keep),
+                                                 encoding="utf-8")
+    win3.steer_editor.setPlainText("my newer edit")
+    answers.append("Save")            # route Save hits the stale dialog
+    answers.append("Keep editing")    # stale dialog: keep edits, cancel route
+    win3.select_item("manuscript", "s002", None)
+    assert win3._sel_data[1] == "s001", "stale Save cancels the route"
+    assert "saved steering changed" in win3.status.text()
+    assert win3.dirty(), "stale Save keeps the local edits"
+    answers.append("Discard")
+    win3.close()
+
+    # ---- live previews during other-stage browsing, global Stop, close
+    win2 = gw.MainWindow(str(project), choice=lambda t, x, o: answers.pop(0),
+                         provider_factory=lambda _p: fake)
+    win2.show()
+    win2.select_item("manuscript", "s001", None)
+    win2.count_spin.setValue(1)
+    fake.gate = threading.Event()
+    win2.generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 1)
+    assert fake.started == 1
+    # browsing another stage neither stops nor starts an operation
+    win2.select_stage("plan")
+    assert win2._busy and fake.started == 1, \
+        "stage change alone makes no call and cancels nothing"
+    assert win2.stop_btn.isVisible() and win2.stop_btn.isEnabled(), \
+        "Stop stays global and reachable while browsing Plan"
+    win2.generate_btn.click()   # ignored: no second operation before finish
+    assert fake.started == 1, "a busy worker refuses a second operation"
+    win2.select_stage("write")
+    win2.select_tool("draft")
+    assert _pump(a, lambda: "First chunk." in win2.preview.toPlainText()), \
+        "the live preview keeps streaming while stages were browsed"
+    fake.gate.set()
+    assert _pump(a, lambda: not win2._busy)
+
+    # selection survives the stage round-trip
+    win2.select_item("node", "s001", "n1")
+    win2.select_stage("plan")
+    win2.select_stage("write")
+    assert win2._sel_data[1:] == ("s001", "n1"), "selection survives stages"
+
+    # close during busy from another stage: Stop and wait settles, then closes
+    fake.gate = threading.Event()
+    win2.generate_btn.click()
+    assert _pump(a, lambda: fake.started >= 2)
+    win2.select_stage("review")
+    answers.append("Stop and wait")
+    # the gated fake observes Stop at the request boundary: release the gate
+    # from a timer while the close's settlement pump is running
+    from PySide6.QtCore import QTimer
+    QTimer.singleShot(150, fake.gate.set)
+    win2.close()
+    assert _pump(a, lambda: not win2._busy), "Stop and wait settles"
+    assert _pump(a, lambda: not win2.isVisible()), \
+        "closes only after settlement"
+
+
 def case_review_export_enterable_with_warnings(root):
     """Review and Export are deliberately enterable on a project without
     saved scenes: advisory content, no modal gate, no automatic call."""
@@ -5208,6 +5344,7 @@ CASES = {
     "case_workflow_readiness": case_workflow_readiness,
     "case_review_export_enterable_with_warnings":
         case_review_export_enterable_with_warnings,
+    "case_workflow_dirty_busy": case_workflow_dirty_busy,
 }
 
 
