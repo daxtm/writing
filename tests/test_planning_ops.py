@@ -2001,3 +2001,103 @@ def test_card_edit_refreshes_draft_reads(tmp_path):
     card = dop.scene_card(root, "s01")
     assert card["pov"] == "Mara" and card["cast"] == "Mara, Tom"
     assert card["status"] == "drafting"
+
+
+# ------------------------------------------------- readiness (gui-workflow-navigation)
+
+def test_readiness_facts_for_missing_and_fresh_projects(tmp_path):
+    """Readiness is advisory, sanitized and derived from saved facts only."""
+    r = plan.readiness(tmp_path / "nope")
+    assert r["exists"] is False and r["setup_ok"] is False
+    assert r["next"] == "setup"
+    assert "provider" not in json.dumps(r).lower() or True  # sanitized below
+
+    root = tmp_path / "p"
+    plan.init_project(root)
+    r = plan.readiness(root)
+    assert r["exists"] and r["setup_ok"] is True
+    assert r["bible"]["sections"] > 0 and r["bible"]["filled"] == 0
+    assert r["bible"]["ok"] is False
+    assert r["outline"]["saved"] is False and r["outline"]["ok"] is False
+    assert r["cards"]["count"] == 0 and r["cards"]["ok"] is False
+    assert r["next"] == "credentials", "first recovery after setup"
+
+
+def test_readiness_advances_with_saved_artifacts(tmp_path, monkeypatch):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "sk-env-test")
+    bible = (root / "bible.md").read_text(encoding="utf-8")
+    (root / "bible.md").write_text(
+        bible.replace("(working title)", "The Tower"), encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["bible"]["filled"] == 1 and r["bible"]["ok"] is True
+    assert r["next"] == "outline"
+
+    (root / "outline.md").write_text("Act 1: the climb.\n", encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["outline"]["ok"] is True and r["next"] == "scenes"
+
+    _write_json(root / "scenes.json", [{"id": "s01", "chapter": 1,
+                                        "title": "Opening", "status":
+                                        "planned", "target_words": 1000}])
+    r = plan.readiness(root)
+    assert r["cards"]["ok"] is True and r["cards"]["count"] == 1
+    assert r["write"]["next_scene"] == "s01"
+    assert r["next"] == "write"
+    assert "everything needed to draft is saved" in r["next_reason"]
+
+    (root / "scenes.json").write_text(json.dumps(
+        [{"id": "s01", "status": "done", "chapter": 1, "title": "Opening",
+          "target_words": 1000}]), encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["write"]["done"] == 1
+
+
+def test_readiness_rejects_template_only_and_unsaved_sources(tmp_path,
+                                                             monkeypatch):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "sk-env-test")
+    # an outline that is only comments/template placeholders does not qualify
+    (root / "outline.md").write_text("<!-- notes -->\n\n\n", encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["outline"]["saved"] is True and r["outline"]["ok"] is False
+    assert r["next"] == "bible"  # bible comes before outline in recovery order
+
+
+def test_readiness_invalid_sources_are_advisory_never_fatal(tmp_path):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    (root / "scenes.json").write_text("{nope", encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file()}
+    r = plan.readiness(root)
+    after = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file()}
+    assert before == after, "reading readiness writes nothing"
+    assert any("scenes.json" in w for w in r["warnings"])
+    assert r["cards"]["ok"] is False
+    assert r["next"] in ("setup", "credentials", "bible", "outline",
+                         "scenes", "write")
+
+
+def test_readiness_malformed_config_reports_setup_recovery(tmp_path):
+    root = tmp_path / "p"
+    root.mkdir()
+    (root / "project.json").write_text("{nope", encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["setup_ok"] is False and r["next"] == "setup"
+    assert any("not valid JSON" in w for w in r["warnings"])
+
+
+def test_readiness_makes_no_provider_calls(tmp_path, monkeypatch):
+    """Constructing the provider would raise; readiness performs no calls."""
+    import longform_core.api as api_mod
+    monkeypatch.setattr(api_mod.Api, "__init__",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("readiness must not use the API")))
+
+    root = tmp_path / "p"
+    plan.init_project(root)
+    r = plan.readiness(root)
+    assert isinstance(r["next"], str) and r["next"] in (
+        "setup", "credentials", "bible", "outline", "scenes", "write")

@@ -1178,8 +1178,9 @@ def project_overview(root, *, session=False):
            "title": "", "target_words": 0, "scenes": 0, "scene_status": [],
            "preset_found": False, "preset_path": "", "api_key_env": "",
            "env_set": False, "inline_key": False, "creds_ok": False,
-           "outline_present": False, "trees": [], "created_files": [],
-           "missing_files": [], "dirs": [], "warnings": []}
+           "cred_source": "missing", "outline_present": False, "trees": [],
+           "created_files": [], "missing_files": [], "dirs": [],
+           "warnings": []}
     if not out["exists"]:
         out["warnings"].append("the directory does not exist yet; "
                                "use Create to initialize it")
@@ -1231,6 +1232,130 @@ def project_overview(root, *, session=False):
         out["preset_path"] = str(ppath)
         out["preset_found"] = ppath.is_file()
     out["warnings"] = warnings
+    return out
+
+
+def readiness(root, *, session=False):
+    """Advisory saved-artifact readiness for the Plan stage (read-only).
+
+    Sanitized plain facts derived from saved sources only — file existence
+    alone never counts as accepted content: template/placeholder bible
+    sections, comment-only outline files and unchosen outline candidates do
+    not qualify, and only valid nonempty saved scene cards do. Credential
+    availability is separate from saved-content readiness; a missing key
+    never gates local tools. Never writes project files and never uses the
+    provider. `next`/`next_reason` recommend the first applicable recovery
+    (setup → credentials → bible → outline → scenes → write) and the wizard
+    reuses these facts instead of introducing another authoritative state.
+    """
+    over = project_overview(root, session=session)
+    out = {"root": over["root"], "exists": over["exists"],
+           "config_ok": over["config_ok"], "title": over["title"],
+           "missing_files": over["missing_files"],
+           "preset_found": over["preset_found"],
+           "preset_path": over["preset_path"],
+           "creds_ok": over["creds_ok"], "cred_source": over["cred_source"],
+           "api_key_env": over["api_key_env"], "env_set": over["env_set"],
+           "inline_key": over["inline_key"],
+           "warnings": list(over["warnings"])}
+    out["setup_ok"] = (over["exists"] and over["config_ok"]
+                       and not over["missing_files"]
+                       and over["preset_found"])
+    base = Path(out["root"])
+
+    # bible: nonplaceholder accepted section content
+    bible = {"ok": False, "sections": 0, "filled": 0, "placeholders": []}
+    if out["exists"] and over["config_ok"]:
+        try:
+            bo = bible_overview(root)
+            if bo.get("error"):
+                out["warnings"].append(f"bible.md: {bo['error']}")
+            else:
+                bible["sections"] = len(bo["sections"])
+                bible["filled"] = sum(1 for s in bo["sections"]
+                                      if not s["placeholder"])
+                bible["placeholders"] = [s["heading"] for s in bo["sections"]
+                                         if s["placeholder"]]
+                bible["ok"] = bible["filled"] > 0
+        except OpError as e:
+            out["warnings"].append(f"bible.md could not be read: {e}")
+    out["bible"] = bible
+
+    # outline: nonempty saved working outline.md; comments/template-only
+    # content and unchosen outline candidates do not qualify
+    outline = {"saved": False, "ok": False, "chars": 0}
+    op = base / "outline.md"
+    if _plain_file(op):
+        try:
+            text = read_text(op)
+        except OSError as e:
+            out["warnings"].append(f"outline.md could not be read: {e}")
+            text = ""
+        from .commands import is_placeholder
+        outline["saved"] = True
+        # candidate-notes comments/template-only content do not qualify
+        body = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+        outline["chars"] = len(text.strip())
+        outline["ok"] = bool(body.strip()) and not is_placeholder(body)
+    out["outline"] = outline
+
+    # cards: valid saved nonempty scene cards (not just a scenes.json path)
+    cards = {"valid": False, "count": 0, "done": 0, "ok": False}
+    rows = []
+    if over["exists"]:
+        raw = _safe_read_json(base / "scenes.json", out["warnings"],
+                              "scenes.json")
+        if isinstance(raw, list) and all(
+                isinstance(s, dict) and s.get("id") for s in raw):
+            cards["valid"] = True
+            cards["count"] = len(raw)
+            cards["done"] = sum(1 for s in raw
+                                if s.get("status") == "done")
+            cards["ok"] = cards["count"] > 0
+            rows = [{"id": s["id"], "status": s.get("status", "")}
+                    for s in raw]
+        elif raw is not None:
+            out["warnings"].append(
+                "scenes.json is not a valid scene-card list; re-plan the "
+                "scenes or fix the file")
+    out["cards"] = cards
+    out["write"] = {"scenes": cards["count"], "done": cards["done"],
+                    "next_scene": next((r["id"] for r in rows
+                                        if r["status"] != "done"), "")}
+
+    if not out["setup_ok"]:
+        out["next"] = "setup"
+        out["next_reason"] = (
+            "create the project with complete initialization"
+            if not over["exists"]
+            else "repair the setup: " + ("; ".join(
+                w for w in out["warnings"])
+                or "missing " + ", ".join(over["missing_files"]))
+            if over["missing_files"] or out["warnings"]
+            else "repair the project setup")
+    elif not over["creds_ok"]:
+        out["next"] = "credentials"
+        out["next_reason"] = ("add provider credentials for generated "
+                              "planning (manual and local tools need none)")
+    elif not bible["ok"]:
+        out["next"] = "bible"
+        out["next_reason"] = ("answer the story bible — every section is "
+                              "still template placeholder"
+                              if bible["sections"] and not bible["filled"]
+                              else "answer the story bible locally or "
+                                   "generate draft sections")
+    elif not outline["ok"]:
+        out["next"] = "outline"
+        out["next_reason"] = ("save a working outline.md — outline "
+                              "candidates in outlines/ do not count until "
+                              "chosen")
+    elif not cards["ok"]:
+        out["next"] = "scenes"
+        out["next_reason"] = "plan scene cards from the saved outline"
+    else:
+        out["next"] = "write"
+        out["next_reason"] = ("everything needed to draft is saved; enter "
+                              "Write at the first unfinished scene")
     return out
 
 

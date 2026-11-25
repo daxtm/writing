@@ -157,6 +157,8 @@ class MainWindow(QMainWindow):
         self._status_facts = None    # last read-only status overview
         self._plan = plan.project_overview(self._root,
                                            session=self._availability())
+        self._ready = plan.readiness(self._root,
+                                     session=self._availability())
 
         self.snap = None              # last valid Snapshot
         self._stale_config = False    # required configuration currently invalid
@@ -561,6 +563,78 @@ class MainWindow(QMainWindow):
             self.select_stage("write")
         else:
             self.select_tool(target[0])
+
+    _PLAN_NEXT_LABELS = {
+        "setup": "Create / repair setup",
+        "credentials": "Add credentials",
+        "bible": "Answer the bible",
+        "outline": "Save the outline",
+        "scenes": "Plan scenes",
+        "write": "Enter Write",
+    }
+
+    def _update_plan_overview(self):
+        """Fill the Plan overview from the read-only readiness facts."""
+        r = getattr(self, "_ready", None)
+        if r is None:
+            return
+        self.plan_summary.setText(self._plan_summary_text(r))
+        self.plan_overview.setPlainText(self._plan_overview_text(r))
+        self.plan_next_btn.setText(self._PLAN_NEXT_LABELS.get(
+            r["next"], "Go"))
+        self._plan_next_route = (r["next"],)
+
+    def _plan_summary_text(self, r):
+        if not r["exists"]:
+            return "No project here yet — Create initializes this directory."
+        title = r.get("title") or "(untitled)"
+        return (f"{title} — {r['cards']['count']} scene card(s) saved, "
+                f"{r['write']['done']} done")
+
+    def _plan_overview_text(self, r):
+        lines = [f"root: {r['root']}"]
+        if not r["exists"]:
+            lines.append("setup: the directory does not exist yet; Create "
+                         "performs complete initialization")
+        elif r["setup_ok"]:
+            lines.append("setup: complete (project.json valid, writer "
+                         "preset found)")
+        else:
+            detail = []
+            if not r["config_ok"]:
+                detail.append("project.json missing or invalid")
+            if r["missing_files"]:
+                detail.append("missing init files: "
+                              + ", ".join(r["missing_files"]))
+            if not r["preset_found"]:
+                detail.append("writer preset missing")
+            lines.append("setup: incomplete — " + "; ".join(detail))
+        lines.append(
+            f"credentials: source {r['cred_source']}"
+            + (f" ({r['api_key_env']})" if r["api_key_env"] else "")
+            + " — generated planning needs a key; local tools do not")
+        b = r["bible"]
+        if b["sections"]:
+            lines.append(f"bible: {b['filled']}/{b['sections']} sections "
+                         "answered"
+                         + ("; still template: " + ", ".join(b["placeholders"])
+                            if b["placeholders"] else ""))
+        else:
+            lines.append("bible: no sections found")
+        o = r["outline"]
+        lines.append("outline: "
+                     + ("saved" if o["ok"] else
+                        ("saved but still template/placeholder"
+                         if o["saved"] else "not saved yet"))
+                     + f" ({o['chars']} characters)")
+        c = r["cards"]
+        lines.append(f"scene cards: {c['count']} saved, {c['done']} done"
+                     if c["valid"] else
+                     f"scene cards: none saved")
+        lines.append(f"next: {r['next_reason']}")
+        for w in r["warnings"]:
+            lines.append(f"! {w}")
+        return "\n".join(lines)
 
     def show_help(self):
         """Draft action help in the reading pane (CLI ?); no terminal."""
@@ -3966,6 +4040,8 @@ class MainWindow(QMainWindow):
         self._stale_config = False
         self._plan = plan.project_overview(self._root,
                                            session=self._availability())
+        self._ready = plan.readiness(self._root,
+                                     session=self._availability())
         self._bible_overview = None
         self._bible_session = False
         self._bible_heading = None
@@ -4344,6 +4420,8 @@ class MainWindow(QMainWindow):
         if force:
             self._plan = plan.project_overview(self._root,
                                                session=self._availability())
+            self._ready = plan.readiness(self._root,
+                                         session=self._availability())
             self._refresh_bible_overview()
             self._refresh_outline_overview()
             self._refresh_scenes_overview()
@@ -4353,6 +4431,7 @@ class MainWindow(QMainWindow):
             except dop.OpError:
                 pass   # keep the last known session facts
         self._update_setup_tab()
+        self._update_plan_overview()
         try:
             res = self._load(self._root, cache=self._cache, force=force)
         except OSError as e:

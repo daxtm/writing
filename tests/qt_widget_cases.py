@@ -136,6 +136,68 @@ def case_workflow_stages(root):
         a.processEvents()   # the next case asserts one top-level window
 
 
+def case_workflow_readiness(root):
+    """Plan overview: saved-artifact readiness, one recommended next action,
+    advisory warnings for invalid sources; reading never writes or calls."""
+    import longform_core.gui_window as gw
+    import longform_core.planning_operations as pop
+    a = app()
+    project = _build_project(root / "p", scenes=[_scene("s001")], trees={
+        "s001": _tree({"n1": _node("n1", None, "A.")}, head="n1")},
+        bible="## Title\nThe Tower\n", state="state body",
+        project_extra={"api_key": "sk-test"})
+    (project / "writer_preset.json").write_text(json.dumps(PRESET),
+                                                encoding="utf-8")
+    (project / "outline.md").write_text("Act 1: the climb.\n",
+                                        encoding="utf-8")
+    before = {f.name: f.read_bytes() for f in project.iterdir()
+              if f.is_file()}
+
+    win = gw.MainWindow(str(project), choice=_no_dialogs("readiness"))
+    win.show()
+    try:
+        # A ready project recommends Write and shows the saved-artifact facts.
+        r = pop.readiness(project)
+        assert r["next"] == "write", r["next"]
+        assert win.plan_next_btn.text() == "Enter Write"
+        overview = win.plan_overview.toPlainText()
+        assert "setup: complete" in overview
+        assert "1 scene card(s) saved" in win.plan_summary.text()
+        assert "bible: 1/1 sections answered" in overview
+
+        # Watching the Plan overview never writes project files.
+        win.select_stage("plan")
+        for _ in range(2):
+            win.refresh(force=True)
+        after = {f.name: f.read_bytes() for f in project.iterdir()
+                 if f.is_file()}
+        assert before == after, "the Plan overview must not write files"
+
+        # The recommended action routes without starting an operation.
+        win.plan_next_btn.click()
+        assert win.current_stage() == "write"
+
+        # An invalid scenes.json is an advisory warning, not a crash.
+        (project / "scenes.json").write_text("{nope", encoding="utf-8")
+        win.refresh(force=True)
+        overview = win.plan_overview.toPlainText()
+        assert "scenes.json is missing or not valid JSON" in overview
+
+        # A fresh directory shows setup recovery before anything else.
+        win2 = gw.MainWindow(str(root / "fresh"),
+                             choice=_no_dialogs("readiness2"))
+        win2.show()
+        assert "does not exist" in win2.plan_overview.toPlainText()
+        assert win2.plan_next_btn.text() == "Create / repair setup"
+        win2.close()
+        win2.deleteLater()
+        a.processEvents()
+        win.close()
+    finally:
+        win.deleteLater()
+        a.processEvents()
+
+
 def case_owner_flow_reading(root):
     """Owner journey, reading half: one window, inactive node + notes readable."""
     import longform_core.gui_window as gw
@@ -5085,6 +5147,7 @@ CASES = {
     # gui-workflow-navigation cases (kept last: earlier cases assert a single
     # top-level window, so this case must not linger before them)
     "case_workflow_stages": case_workflow_stages,
+    "case_workflow_readiness": case_workflow_readiness,
 }
 
 
