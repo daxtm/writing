@@ -20,6 +20,9 @@ except to mark it superseded by a newer ADR.
 | [0011](0011-gui-project-credentials.md) | Enter project credentials in the GUI using existing storage | Accepted | 2026-11-23 |
 | [0012](0012-shared-generation-stream-events.md) | Deliver all generated answers through shared preview events | Accepted | 2026-11-23 |
 | [0013](0013-cpython-minor-runtime-pin.md) | Pin the CPython minor and accept patch updates automatically | Accepted | 2026-11-25 |
+| [0014](0014-android-native-shared-core-apk.md) | Use a native Android UI with the shared Python core in an APK | Accepted | 2026-11-25 |
+| [0015](0015-android-private-project-transfer.md) | Keep Android projects private and transfer portable snapshots | Accepted | 2026-11-25 |
+| [0016](0016-android-lifecycle-operation-runner.md) | Run Android writing operations once with lifecycle-aware cancellation | Accepted | 2026-11-25 |
 
 ADR-0004/0005 are the reader-baseline decisions integrated from the
 `feat/reader-gui` branch; ADR-0006 supersedes 0005's Tk presentation choice for

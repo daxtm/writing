@@ -18,6 +18,11 @@ GUI, and a resumable wizard leads through bible, outline and scenes into
 drafting, review and export. All provider-generated answer text appears while
 it arrives, including multiple candidates, rather than only when a call finishes.
 
+The next platform target is an **Android app with complete CLI/desktop feature
+parity, delivered as a signed, directly installable APK**. The Android track
+below extends this roadmap; it does not replace the desktop history or turn
+pending Wayland acceptance into a pass.
+
 ## Out of scope
 
 New model/provider capabilities, autonomous whole-book generation, browser/server
@@ -34,6 +39,180 @@ The original private project and preset remain outside the repository; only
 reviewed, sanitized runtime defaults may be bundled, not private test fixtures.
 No new toolkit, provider, model capability, secret-service dependency, automatic
 paid pipeline, key synchronization, installer or shipping authorization is added.
+
+Those exclusions describe the desktop extension. The Android request explicitly
+adds a native Android UI, embedded Python runtime, Android file pickers and APK
+build/signing/delivery. It authorizes planning that delivery, not shipping an
+unfinished build. It does not authorize shipping the still-unaccepted desktop
+workspace.
+
+## Next platform — Android feature parity and APK delivery
+
+**Status:** roadmap only; no Android implementation, APK, device acceptance or
+new OpenSpec changes exist yet. Select the changes below individually for
+build. Do not create speculative change directories for this roadmap.
+
+### Goal and scope
+
+Install one APK on a supported Android phone or tablet, open/create a project,
+plan and draft with the same Featherless operations, review/revise it, and
+export the manuscript and portable project without a terminal, desktop host,
+Python installation or companion server. Every row of the existing full-parity
+map below, plus the guided wizard, explicit credentials and live multi-answer
+previews, is required on Android. Mobile layouts may differ; writing rules,
+prompts, samplers, saved branches/history and project formats may not.
+
+The existing `Project`/`Tree`/`Lore`/`Api`, snapshots and Qt-independent
+`planning_operations`, `draft_operations`, `review_operations`,
+`scene_steering` and cancellation/preview events are the implementation
+baseline. Fix/extract a missing boundary there before adding an Android-only
+rule. The Wayland launcher, Qt window/worker and Linux frozen-executable builder
+cannot supply Android screens, URI pickers, lifecycle management or an APK;
+only those adapters and packaging are new. No duplicated writing engine,
+terminal automation or localhost service.
+
+**Out of scope:** iOS, Play Store/AAB publishing, web/remote interfaces, cloud
+accounts or synchronization, concurrent desktop/mobile edits, automatic merges,
+new provider/model capabilities, autonomous book generation, on-device model
+inference, DOCX/rich text, always-on background generation, automatic paid
+retries after app restart, and an Android CLI. UI equivalents of CLI commands
+are required; shell syntax, `$EDITOR`, environment-variable setup, Wayland and
+Linux binary packaging are desktop-specific mechanisms, not phone features.
+No new encrypted credential store is required: retain ADR-0011's explicit
+session or plaintext-project choice and explain the latter. Tests remain
+offline; dependency/SDK provisioning may use network.
+
+**Supported baseline:** Android 7.0/API 24 or newer, 64-bit `arm64-v8a`
+devices and `x86_64` emulator coverage, Kotlin/Jetpack Compose UI, embedded
+CPython 3.13 through Chaquopy, no PySide6 in the APK (ADR-0014).
+Use the root minor pin; Android's embedded patch is supplied by the selected
+Chaquopy distribution, not host `uv`. Record it and update the runtime
+distribution through reviewed builds. Choose and lock compatible Gradle,
+Android Gradle Plugin, JDK, SDK and Compose versions when building the skeleton;
+record the resolved toolchain rather than treating moving documentation as a
+lockfile. First-party references checked 2026-11-25 are in ADR-0014.
+
+### Android milestone 1 — Walking skeleton: APK to accepted prose and export
+
+- [ ] android-apk-project-shell — Add the Compose/embedded-core APK adapter and repeatable debug/release build path, local create/open/read views and the one lifecycle-aware operation runner; prove install, reopen, rotation, interruption and same-signature update without any writing-engine rewrite.
+- [ ] android-project-transfer — Add system-picker project ZIP import/export and manuscript export around app-private project directories, staged validation, explicit conflict/external-preset recovery, credential-safe transfer and byte-compatible desktop round trips.
+- [ ] android-steered-drafting — On a ready imported project, provide masked session/project credential actions and Test connection, scene selection, multiline steering Save/Clear, one streamed Generate, Stop, completed-candidate Accept and destination-picked manuscript export using the existing operations.
+
+**Observable slice:** build the APK, install it, import a synthetic ready-to-draft
+desktop project ZIP with its relative preset, select a scene, enter a synthetic
+session key and use a test-only fake provider. Save steering, Generate, see
+answer text before completion, Accept a completed candidate, export a manuscript
+and project ZIP through the Android system picker, force-stop/reopen, and see the
+accepted head and saved steering again. Open the exported project with the
+existing desktop/CLI and see the same text, branches and metadata. Creation
+already performs complete local init, but a complete from-empty planning wizard
+and every draft action belong to milestone 2.
+
+The skeleton must use the production packaging path and real embedded Python,
+not a mocked Kotlin writing engine. Offline instrumentation may inject a
+provider from test-only adapters, including in release-mode tests; the
+owner-distributed APK has no fake-provider selector or bundled test backend.
+Synthetic fixtures are portable and contain no private sample/preset
+or real credentials. The owner can enter a real key and explicitly generate
+with Featherless in a normal APK; live calls are never automated acceptance
+requirements.
+
+**Planned commands, not available yet:** `./scripts/build-android.sh --debug`
+produces `dist/android/writing-debug.apk`; install with
+`adb install -r dist/android/writing-debug.apk` or copy/tap the APK on the
+device. `./scripts/build-android.sh --release` produces
+`dist/android/writing-release.apk`, a SHA-256 checksum and build metadata
+containing package/version, certificate fingerprint, ABIs, SDK/toolchain and
+actual embedded Python version. Release requires the owner's external signing
+material; absence fails clearly, never falls back to a debug key.
+
+`com.daxtm.writing` is the stable release application ID; debug uses a `.debug`
+suffix and separate app data. A test-only signing identity proves release-mode
+build and upgrade behavior in checks; it is not the owner's distribution key.
+`./scripts/check.sh` must build/run the Android regression and emulator slice
+as soon as the skeleton exists, alongside—not instead of—the existing source,
+Qt and frozen-Linux coverage. Missing Android tooling/device coverage fails the
+required automated phase rather than silently skipping.
+
+**Persistence/lifecycle acceptance is part of this slice:** imported archives
+never operate in place on document-provider URIs. Reject traversal, links,
+duplicate/unsafe members and oversized expansion before publishing a new
+private project; cancelled/failed imports leave existing projects untouched.
+Export only settled saved state. Rotation reattaches to the same operation;
+leaving the foreground requests cooperative Stop, and reopening never replays
+a paid request. Do not promise Android will wait for cancellation on process
+death. Test kills at representative request/save boundaries, preserve complete
+saved files/branches and surface incomplete cross-file state honestly rather
+than inventing acceptance or claiming a whole-operation transaction.
+
+Milestone 1 forces [ADR-0014](adr/0014-android-native-shared-core-apk.md)
+(native Android/embedded core and APK delivery),
+[ADR-0015](adr/0015-android-private-project-transfer.md) (private projects and
+portable picker transfers) and
+[ADR-0016](adr/0016-android-lifecycle-operation-runner.md) (one lifecycle-aware
+runner, cooperative foreground-only work).
+
+### Android milestone 2 — Complete author workflow and ship the parity APK
+
+- [ ] android-guided-planning — Adapt the existing readiness/wizard and every planning action: complete init/defaults, preset selection, all supported settings/models/roles/samplers, credential source/status, explicit limits fetch, local bible answers/edit/accept/skip/history, streamed outline N/notes/reroll/choose/edit, and scene generate/edit/validate/force/accept with resumable guidance.
+- [ ] android-draft-feature-parity — Extend the skeleton to all candidate/swipe/reroll/add/view/keep/discard/delete actions, manual passage/head edits/diffs/history, branch tree/rewind/jump, reading/tail, scene card/POV/cast/session length/done/next, exact prompt/budget/samplers/lore inspection and prompt saving, plus all lore toggles/classification/aliases/JSON/PNG imports.
+- [ ] android-review-export-parity — Adapt continuity full/summary-only raw/edit/regenerate/accept and warnings, compression ranges/overlap/replace/history, critique/check scope/report and note editing, per-passage revision diff/accept/skip/edit/regenerate/quit/history, complete status and manuscript export without new review gates.
+- [ ] android-apk-parity-release — Run the complete offline create-to-export/resume and row-by-row parity journeys on the packaged app, record real-device acceptance and signed upgrade preservation, then deliver the owner-signed release APK with checksum, provenance and install/update instructions using the existing skeleton build path.
+
+Each feature change owns touch/keyboard/TalkBack labels and focus, IME-safe
+multiline editing (Enter never generates), readable large fonts, light/dark
+themes, compact-phone/tablet layouts, Back/dirty Save/Discard/Cancel, pickers,
+failure recovery and lifecycle tests. This is acceptance within the feature
+work, not a later polish/hardening milestone.
+
+**Parity ledger:** extend the existing map with Android route/control,
+automated case and device-evidence columns, initially marking all Android
+entries PENDING. Keep every existing row, and add guided setup/defaults,
+credentials and streaming cases. A missing, hidden or unexecuted action is a
+gap. For identical captured inputs/fake responses, compare exact prompts,
+request parameters, accepted text, node/scene metadata, histories, warnings,
+reports and exported bytes with the shared CLI/desktop fixtures; normalize only
+existing nondeterministic IDs/timestamps/roots. No new Android story format or
+weaker acceptance rules.
+
+**Finish line:** in the release-mode packaged app, a beginner can Create →
+credentials → local bible → streamed outline choice → generated/edited accepted
+scene cards → steered multi-candidate drafting/branch editing/lore → continuity/
+review/revision → destination-picked manuscript and project export, interrupt
+and resume saved work, then import the ZIP on desktop and continue. Negative
+cases include offline/no key, provider failures/retries, Stop while blocked,
+malformed responses/imports, denied/cancelled picker access, full storage, stale
+edits, rotation/background/process death and upgrade. No partial response is
+accepted, hidden reasoning is not exposed, keys do not enter previews/logs/
+reports/transfer archives, and no navigation/reopen starts a paid request.
+
+Every selected change gets at most eight test-first OpenSpec tasks: first a
+failing observable test, last `scripts/check.sh` integration. Android JVM/
+instrumentation and embedded-core parity cases run offline with fake transports
+and network guards, on API 24 and the selected current target emulator; record
+the actual images/toolchain. Check both advertised ABIs, including an ARM64
+device/emulator install. Never infer Android behavior from desktop Qt tests.
+Separate real ARM64 phone acceptance covers OS/device versions, installation
+and signed update, touch/soft keyboard/Back/TalkBack, font scale/themes,
+pickers/share, rotation/background/Stop/reopen and large-project reading.
+Unavailable device/owner signing evidence remains PENDING and blocks a parity
+shipping claim; no live provider spend is needed to establish parity.
+
+The final delivery is the actual owner-signed APK and checksum, not merely a
+Gradle project, debug APK, AAB, screenshot or download instructions. Keep
+signing keys/passwords outside git and outside project ZIPs; document key
+backup/custody and fingerprint without publishing private material. Install a
+newer same-ID/same-signature version over a populated older build and verify
+projects, branches and settings survive; also test debug-to-release isolation.
+Project ZIP backups remain explicit: app-private projects are removed by
+uninstall, and disabling automatic backup is not a durable external backup.
+
+**Open questions / owner inputs:** which physical ARM64 phone/tablet and Android
+versions can supply real-device evidence, who holds/backs up the release signing
+key, and where should the signed APK/checksum be delivered? Local owner handoff
+is sufficient; public hosting/Play publication is not assumed. Toolchain patch
+pins and concrete layouts are implementation choices in the selected changes,
+not reasons to invent speculative OpenSpec artifacts now.
 
 ## Next extension — Guided writing workflow
 

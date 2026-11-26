@@ -10,6 +10,43 @@ Python: CPython 3.13 minor, pinned by the authoritative `.python-version`
 automatic, a minor bump is one reviewed pin/mirror change. uv script runner,
 PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
 
+## Android target — roadmap only
+`docs/ROADMAP.md` now includes an owner-requested Android feature-parity app,
+delivered as an owner-signed APK. No Android code, build script, artifact or
+OpenSpec change has been created for that track. Create proposals only when a
+listed change is selected for build; do not infer implementation from this plan.
+The APK request is not permission to ship the unaccepted desktop workspace.
+
+Planned stack (ADR-0014): Kotlin/Jetpack Compose, Chaquopy-embedded CPython 3.13,
+`httpx` and the existing Qt-independent `longform_core` operations/resources;
+Android API 24+, ARM64 devices and x86_64 emulator coverage. No PySide6, uv runtime,
+terminal loop, companion server or duplicated engine in the APK. Host checks
+keep ADR-0013's automatic patch policy; Android's embedded patch comes from its
+reviewed runtime distribution and is recorded, not replaced by host uv.
+Concrete compatible Android build-tool/dependency pins are chosen and locked
+in the skeleton, not guessed here. Release ID: `com.daxtm.writing`; debug
+adds `.debug`. Owner signing material is external; synthetic signing only for tests.
+
+Milestone 1: `android-apk-project-shell`, `android-project-transfer`,
+`android-steered-drafting` — installed APK, ready-project import, credentials,
+steering, streamed Generate/Accept, export/reopen/update. Milestone 2:
+`android-guided-planning`, `android-draft-feature-parity`,
+`android-review-export-parity`, `android-apk-parity-release` — every existing
+CLI/desktop action plus guided setup, full offline/device parity and signed APK
+handoff. New tests belong in `scripts/check.sh` alongside all existing checks.
+Android build/demo commands in the roadmap are planned interfaces, not commands
+that currently exist; Android emulator/device acceptance is entirely PENDING.
+
+ADR-0015: private ordinary project directories, system-picker ZIP/resource/
+manuscript transfer, unchanged portable files except explicit credential
+sanitization; no in-place URI editing, sync or automatic cloud backup. Reuse
+ADR-0011's masked session or explicitly saved plaintext project credentials;
+no new keyring. Warn that uninstall removes private projects without an export.
+ADR-0016: one non-Qt process-owned operation runner, rotation reattaches,
+background requests cooperative Stop, no background completion guarantee or
+automatic paid replay after process death. Preserve saved branches, never accept
+partial previews, and surface interrupted cross-file state honestly.
+
 ## Checks
 `./scripts/check.sh`: verifies the pin, provisions the latest available
 managed CPython 3.13 patch (`uv python install --upgrade cpython@3.13`),
