@@ -228,3 +228,75 @@ def parse_sections(text, names):
 def name_re(n):
     return r"(?<!\w)" + re.escape(n) + r"(?!\w)"
 
+
+
+# ------------------------------------------------------------ credential redaction
+
+REDACTED = "[redacted]"
+
+
+def redact_text(text, secrets, repl=REDACTED):
+    """Replace every nonempty secret value in `text`; ordinary text is
+    returned unchanged byte for byte (ADR-0011: credentials from session,
+    saved-project and configured-environment sources never reach results,
+    events, logs or persistence)."""
+    out = text or ""
+    for s in secrets or ():
+        if s and s in out:
+            out = out.replace(s, repl)
+    return out
+
+
+def redact_obj(obj, secrets, repl=REDACTED):
+    """Recursive string redaction for structured records (logs, usage,
+    metadata); keys are preserved, values are scrubbed."""
+    if isinstance(obj, str):
+        return redact_text(obj, secrets, repl)
+    if isinstance(obj, dict):
+        return {k: redact_obj(v, secrets, repl) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [redact_obj(v, secrets, repl) for v in obj]
+    return obj
+
+
+class StreamRedactor:
+    """Redaction for split streamed fragments.
+
+    Retains a potential secret-prefix suffix until it is safe to emit; a
+    complete secret is never emitted and an unsafe prefix is withheld (and
+    retracted when the next fragment completes a match). Feed every chunk;
+    call flush() once after the stream ends and emit its remainder."""
+
+    def __init__(self, secrets):
+        self.secrets = tuple(s for s in (secrets or ()) if s)
+        self.tail = ""
+
+    def _unsafe_prefix_len(self, text):
+        """Longest suffix of `text` that is a proper prefix of some secret."""
+        best = 0
+        for s in self.secrets:
+            top = min(len(text), len(s) - 1)
+            for k in range(top, best, -1):
+                if text[-k:] == s[:k]:
+                    best = k
+                    break
+        return best
+
+    def feed(self, chunk):
+        text = self.tail + (chunk or "")
+        for s in self.secrets:
+            if s in text:
+                text = text.replace(s, REDACTED)
+        k = self._unsafe_prefix_len(text)
+        self.tail = text[len(text) - k:] if k else ""
+        return text[:len(text) - k] if k else text
+
+    def flush(self):
+        text = self.tail
+        self.tail = ""
+        for s in self.secrets:
+            if s in text:
+                text = text.replace(s, REDACTED)
+        if text and self._unsafe_prefix_len(text):
+            return ""   # never emit an unsafe prefix of a secret
+        return text

@@ -4,10 +4,20 @@
 CLI for writers planning and collaboratively drafting long-form fiction with Featherless.ai: a thin `longform.py` launcher over the `longform_core/` package (ADR-0003).
 
 ## Stack
-Python 3.11+, uv script runner, PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
+Python: CPython 3.13 minor, pinned by the authoritative `.python-version`
+(`cpython@3.13`) and mirrored as PEP 723 `requires-python = ">=3.13,<3.14"` in
+`longform.py`/`longform_core/cli.py` (ADR-0013); patch updates within 3.13 are
+automatic, a minor bump is one reviewed pin/mirror change. uv script runner,
+PEP 723 inline `httpx>=0.27` and `pyside6>=6.12.0,<6.13`; argparse CLI, JSON/Markdown files, no database.
 
 ## Checks
-`./scripts/check.sh`: py_compile; CLI `--help` if uv exists; `== standalone`
+`./scripts/check.sh`: verifies the pin, provisions the latest available
+managed CPython 3.13 patch (`uv python install --upgrade cpython@3.13`),
+reports `== python: CPython 3.13.<patch>` and runs every phase (syntax, CLI
+`--help`, `== standalone`, both pytest processes) on that explicitly selected
+interpreter — host Python, active environments and `UV_PYTHON` cannot override
+it, and missing/malformed pins, other minors, non-CPython or missing uv fail
+early; `== standalone`
 (builds `dist/longform` through `scripts/build-standalone.sh` and runs the frozen
 executable tests — needs uv and a C compiler providing `cc` for the test-only
 network guard, never skipped); source pytest for the remaining regression and
@@ -22,69 +32,76 @@ PySide6 (~hundreds of MB of wheel downloads plus installed size, and the matchin
 use even for CLI-only users, as accepted in ADR-0006; GUI imports stay lazy, so `--help` needs no display.
 `ock check` runs committed checks in a clean checkout; there is no hosted CI workflow (`ock ship` runs checks locally before opening the PR).
 Run / demo: `uv run --script longform.py --help` prints commands without API calls.
+Source runs use an explicitly selected CPython 3.13; the launcher itself exits
+nonzero when the running interpreter's minor disagrees with `.python-version`
+(uv only warns on a conflicting explicit `--python` request).
 A bare `uv run --script longform.py` (or a copied standalone executable with no
 arguments, such as a file-manager double-click) opens the GUI for the current
 directory; `gui` accepts an optional DIR.
 GUI demo: `QT_QPA_PLATFORM=wayland uv run --script longform.py gui DIR` (or no
 argument / `gui` with no DIR from the project directory) opens one native Wayland
 window
-(the complete draft loop: reading all saved branches/notes, per-scene steering Save/Clear, Generate with
-count/swipes and streaming preview, candidate tray Accept/Reroll selected/all/Add N/View/Delete leaf/
-Keep branches/Discard, built-in New passage/Edit head editors with diff/history, Rewind/Use as head/
-Delete leaf/marked manuscript/Tail N, Scene tab card/POV/cast/session length/Mark done/Next unfinished,
-Context tab budget/samplers/injected-lore/exact prompt/Save last_prompt.txt, Lore tab toggles/classify/
-aliases/import). Generation runs through `longform_core.draft_operations` (Qt-independent, ADR-0007) on
+(the Plan/Write/Review/Export workspace with the guided setup wizard and
+readiness overview; Write carries the complete draft loop: reading all saved
+branches/notes, per-scene steering Save/Clear, Generate with count/swipes and
+streaming preview, candidate tray Accept/Reroll selected/all/Add N/View/Delete
+leaf/Keep branches/Discard, built-in New passage/Edit head editors with
+diff/history, Rewind/Use as head/Delete leaf/marked manuscript/Tail N, Scene
+tab card/POV/cast/session length/Mark done/Next unfinished, Context tab
+budget/samplers/injected-lore/exact prompt/Save last_prompt.txt, Lore tab
+toggles/classify/aliases/import; Review covers continuity/compression/reports/
+revision; Export covers status and destination-picked export). Generation runs through `longform_core.draft_operations` (Qt-independent, ADR-0007) on
 one background worker (`longform_core.draft_worker`); the CLI `draft` loop is an adapter over the same
 operations with frozen prompts/transcripts (`tests/test_draft_parity.py`). Stop is cooperative at
 request/chunk/save boundaries, close offers Stop-and-wait/Keep open, stale sources refuse writes.
 `gui` refuses any explicit platform except `wayland`, never falls back to XWayland, and prints recovery
 guidance when Wayland is unavailable. Model/CLI tests run headless; Qt widget tests run offscreen in a
-subprocess (`tests/qt_widget_cases.py`, never skipped; 38 cases, all enforced
-by an unregistered-case guard). Real Wayland acceptance for the
-drafting loop (generation/Stop/close, picker, keyboard, scaling/theme) is recorded as PENDING in
-`openspec/changes/gui-drafting-workspace/evidence.md` and remains a separate owner desktop step; the
-shell's pre-drafting smoke (KWin 6.8.3, PySide6 6.12.0, DPR 1.0) predates generation.
+subprocess (`tests/qt_widget_cases.py`, never skipped; 56 cases, all enforced
+by an unregistered-case guard). Real Wayland acceptance for setup, planning,
+drafting, review and export remains PENDING in each change's `evidence.md` and
+is a separate owner desktop step; the shell's pre-drafting smoke (KWin 6.8.3,
+PySide6 6.12.0, DPR 1.0) predates generation.
 
-## Planned desktop workspace
+## Desktop workspace status — implemented, unshipped
+The owner-authorized **Guided writing workflow** in `docs/ROADMAP.md` is
+implemented on `feat/guided-workflow` (unshipped): `project-defaults-full-init`,
+`gui-api-key-setup`, `gui-generated-text-streaming`,
+`gui-workflow-navigation`, `gui-project-setup-wizard`. Each has OpenSpec
+proposal/design/specs, checked test-first tasks and evidence; offline CLI/GUI
+parity, offscreen journeys and the standalone build pass. Real Wayland
+acceptance remains PENDING in each change's evidence, and this branch is not
+`origin/main`; do not claim whole-workspace completion or ship.
+This explicit request supersedes the earlier stop-planning instruction below,
+not the prohibition on shipping or the outstanding real Wayland acceptance.
+ADR-0010 chooses reviewed bundled nonsecret defaults and shared complete init;
+ADR-0011 chooses masked per-project/session GUI credential entry using the
+existing api_key field only on explicit save (plaintext, not a system keyring);
+ADR-0012 extends existing streaming callbacks/worker events to every generated
+answer and candidate. Existing name-only credentials and completion-only
+planning previews were baseline limitations; ADR-0011 and ADR-0012 now address
+them.
+The read-only defaults sources are
+`/home/daxtm/Documents/fuckpi/project.json` and
+`/home/daxtm/Documents/fuckpi/56295265-LLam_ception-1.3.json`; never write there
+or require them at app startup, build time or test execution. Review derived
+runtime assets before tracking; force empty api_key, FEATHERLESS_API_KEY
+environment name and project-relative writer_preset.json. The originals remain
+untracked and are never fixtures. GUI full init includes the preset, not
+automatic paid generation. Bible setup currently composes local answer forms;
+do not invent an AI bible generation endpoint. Reuse planning/review/draft
+operations and the one worker; redesign the workflow, not the writing engine.
+
 `docs/ROADMAP.md` requires every CLI/TUI feature in the GUI, start to finish;
-no individual change completes the workspace. The sequence is
-`gui-drafting-workspace` (implemented), `gui-project-planning` (implemented),
-then `gui-continuity-review-export` (implemented). M1's first change, `openspec/changes/gui-wayland-shell/`,
-is implemented on `feat/gui-wayland-shell`: the `gui` command opens the Qt
-Widgets reading/steering shell over `longform_core.reader_model` snapshots with
-per-scene steering via `longform_core.scene_steering`; the implemented shell is
-unshipped. `openspec/changes/gui-drafting-workspace/` is now implemented on
-`feat/gui-wayland-shell`: the complete draft loop through shared operations
-(`longform_core.draft_operations`), one worker (`longform_core.draft_worker`),
-cooperative Stop, stale-write refusal, and CLI adapters with byte-identical
-transcripts; real Wayland acceptance for drafting remains pending
-(`evidence.md`). `openspec/changes/gui-project-planning/` is now implemented on
-`feat/gui-wayland-shell`: Create/Open with create-missing-only init and
-validated preset import, the supported nonsecret settings form with explicit
-Fetch limits (credential name/availability only), bible forms/section
-acceptance/direct edits/history, outline notes/competing
-candidates/choose/edit, scene generation/previews/confirmed replacement and
-saved-card editing — all through shared Qt-independent
-`longform_core.planning_operations` on the one worker; the offscreen
-Create-to-scene journey (`case_planning_journey`) is green and CLI/GUI
-parity is frozen in `tests/test_planning_ops.py`; real Wayland
-Create-to-scene acceptance is recorded as PENDING in the change's
-`evidence.md`. Planning is unshipped. Continuity/review/export
-(`openspec/changes/gui-continuity-review-export/`) is implemented on
-`feat/gui-wayland-shell` (all eight tasks), unshipped. It covers
-update-state/summary-only, compression, critique/check reports and
-editing, passage revision, read-only full status and destination-picked export
-through ADR-0007 shared operations/the existing worker, with one-worker
-settlement and dirty-source Save/Discard/Cancel before Revise/Export; the
-offscreen review journey (`case_review_journey`) and CLI/GUI parity
-(`tests/test_review_ops.py`) are green, and the M1–M3 parity audit is
-recorded in its `evidence.md`. Real Wayland M3
-acceptance is PENDING, not inferred from offscreen tests. Stop planning after
-this proposal; the roadmap parity matrix across M1–M3 has been audited row by
-row (controls/tests/evidence, explicit gaps in the change's `evidence.md`),
-but the full workspace is still not claimed complete. Do not ship.
-Full completion requires setup through export, all draft actions, offline
-CLI/GUI parity and separate real Wayland acceptance; this plan does not authorize shipping.
+the full-parity map was re-audited through the Plan/Write/Review/Export routes.
+The native Wayland workspace is implemented on `feat/guided-workflow`
+(unshipped): reader shell, complete draft loop, planning, continuity/review/
+export and the guided-workflow extension above. All change tasks are checked;
+offline CLI/GUI parity is frozen in `tests/test_*_ops.py`, and the offscreen
+journeys (`case_planning_journey`, `case_review_journey`,
+`case_setup_wizard_journey`, `case_workflow_parity`) run in checks. Real
+Wayland acceptance for every milestone remains PENDING in the respective
+`evidence.md`. Full completion still requires that separate owner desktop
+walkthrough; do not claim whole-workspace completion, and do not ship.
 ADR-0004/0005 (integrated from the reader baseline; 0005 superseded by ADR-0006)
 select PySide6/Qt Widgets for the expanded native Wayland workspace;
 ADR-0007 selects incremental shared operations and one background GUI worker.
@@ -104,8 +121,10 @@ switching, and mouse/keyboard work remain an owner acceptance step.
 ## Rules
 - Specs: `openspec/`. Decisions: `docs/adr/`. Plan: `docs/ROADMAP.md`.
 - Roadmap changes get OpenSpec artifacts only when selected for implementation;
-  no speculative change directories. ADR-0004/0005 are reserved on `feat/reader-gui`.
+  no speculative change directories. ADR-0004/0005 are integrated, not available numbers.
 - Keep `myfic/` and the third-party `56295265-LLam_ception-1.3.json` preset untracked.
+  ADR-0010 permits only reviewed, sanitized application-owned runtime defaults,
+  not the original private files or private test fixtures.
 - Never commit API keys or `.env`; synthetic test credentials only.
 - Tests are offline/deterministic: no live API calls; use MockTransport/fakes and temporary projects.
 - Keep `longform.py` as the thin PEP 723 launcher over `longform_core/` (ADR-0003); behavior, output, and file formats are frozen behind the test suite. Monkeypatch at the owning module (e.g. `longform.api.warn`), not the launcher re-exports.

@@ -17,6 +17,7 @@ is never skipped.
 """
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -322,30 +323,115 @@ def run_source(args, root: Path, cwd=None, extra_env=None, timeout=300):
 # Session-scoped build through the production script
 # ---------------------------------------------------------------------------
 
+def read_python_pin(root=REPO):
+    """The authoritative cpython@X.Y request, or None when the pin is missing,
+    unreadable or malformed (never a patch)."""
+    try:
+        text = (Path(root) / ".python-version").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text if re.fullmatch(r"cpython@\d+\.\d+", text) else None
+
+
+def interpreter_of(python_exe):
+    """(implementation, version_tuple) reported by an interpreter executable,
+    or None when it cannot be queried."""
+    try:
+        r = subprocess.run(
+            [str(python_exe), "-c",
+             "import platform; print(platform.python_implementation() + ' ' + "
+             "platform.python_version())"],
+            capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or " " not in r.stdout.strip():
+        return None
+    impl, _, version = r.stdout.strip().partition(" ")
+    parts = []
+    for part in version.split(".")[:3]:
+        if not part.isdigit():
+            return None
+        parts.append(int(part))
+    return impl, tuple(parts)
+
+
+def cache_mismatch(exe, venv_py, sidecar_path, inputs, request=None):
+    """None when the artifact may be reused under the reviewed minor pin, else
+    a reason. The pin, the sidecar's requested minor and actual
+    implementation/full version, the actual build-venv implementation/minor
+    and ordinary input freshness must all agree; patch differences within the
+    pinned minor never invalidate, and a failure is never a silent fallback."""
+    request = request or read_python_pin(exe.parent.parent)
+    if request is None:
+        return ".python-version missing or malformed"
+    if not exe.is_file():
+        return f"no artifact at {exe}"
+    if not venv_py.is_file():
+        return f"build venv interpreter missing at {venv_py}"
+    if not sidecar_path.is_file():
+        return f"build sidecar missing at {sidecar_path}"
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "build sidecar unreadable"
+    interp = sidecar.get("interpreter") or {}
+    if interp.get("requested") != request:
+        return f"sidecar requested {interp.get('requested')!r}, pin is {request!r}"
+    version = interp.get("version")
+    if interp.get("implementation") != "CPython":
+        return f"sidecar records implementation {interp.get('implementation')!r}, expected CPython"
+    if not isinstance(version, str) or not version.startswith(
+            f"{request.split('@')[1]}."):
+        return f"sidecar records version {version!r}, outside the {request!r} minor"
+    actual = interpreter_of(venv_py)
+    if actual is None:
+        return f"could not query the build venv interpreter at {venv_py}"
+    impl, ver = actual
+    if impl != "CPython":
+        return f"build venv interpreter is {impl}, expected CPython"
+    if f"{ver[0]}.{ver[1]}" != request.split("@")[1]:
+        return f"build venv interpreter is {ver[0]}.{ver[1]}.x, expected {request}"
+    if not all(p.stat().st_mtime_ns <= exe.stat().st_mtime_ns for p in inputs):
+        return "stale against build inputs"
+    return None
+
+
+def rebuild_standalone(runner=None):
+    """Rebuild through the production script; a failure never falls back to
+    the old executable."""
+    runner = runner or subprocess.run
+    proc = runner(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
+                  capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0:
+        pytest.fail("scripts/build-standalone.sh failed:\n"
+                    + (proc.stdout or "") + "\n" + (proc.stderr or ""))
+
+
 @pytest.fixture(scope="session")
 def built(tmp_path_factory, net_guard):
     """Build once per session through the documented script, then copy only the
     executable into a temporary directory with spaces. An artifact that is
     newer than every build input (e.g. produced by ./scripts/check.sh moments
-    earlier) is reused; anything missing or stale is rebuilt by the script."""
+    earlier) is reused; anything missing, stale, built under another requested
+    or actual implementation/minor, or with missing/unreadable metadata is
+    rebuilt by the script, and a failed rebuild fails the session."""
     if not BUILD_SCRIPT.is_file():
         pytest.fail(f"scripts/build-standalone.sh not found at {BUILD_SCRIPT}: the documented "
                     "build entry point does not exist, so the standalone owner journey cannot run")
     exe = REPO / "dist" / BINARY_NAME
     venv_py = REPO / "build" / "standalone" / "venv" / "bin" / "python"
+    sidecar = REPO / "dist" / "longform-build.json"
     inputs = [BUILD_SCRIPT, REPO / "scripts" / "standalone-requirements.txt", REPO / "longform.py"]
     inputs += sorted((REPO / "longform_core").glob("*.py"))
+    inputs += sorted((REPO / "longform_core" / "resources").glob("*.json"))
     inputs += [REPO / "scripts" / "standalone_sidecars.py"]
     inputs += sorted((REPO / "scripts" / "standalone-licenses").glob("*"))
-    fresh = (exe.is_file() and venv_py.is_file()
-             and all(p.stat().st_mtime_ns <= exe.stat().st_mtime_ns for p in inputs))
-    if not fresh:
-        print("\nbuilding standalone executable via scripts/build-standalone.sh ...")
-        proc = subprocess.run(["bash", str(BUILD_SCRIPT)], cwd=str(REPO),
-                              capture_output=True, text=True, timeout=3600)
-        if proc.returncode != 0:
-            pytest.fail("scripts/build-standalone.sh failed:\n"
-                        + (proc.stdout or "") + "\n" + (proc.stderr or ""))
+    inputs += [REPO / ".python-version"]
+    reason = cache_mismatch(exe, venv_py, sidecar, inputs)
+    if reason:
+        print(f"\nrebuilding standalone executable via scripts/build-standalone.sh "
+              f"(cache rejected: {reason}) ...")
+        rebuild_standalone()
     if not exe.is_file():
         pytest.fail(f"build script reported success but no artifact at {exe}")
     if not os.access(exe, os.X_OK):
@@ -353,12 +439,131 @@ def built(tmp_path_factory, net_guard):
     if not venv_py.is_file():
         pytest.fail(f"build venv interpreter missing at {venv_py}; the build script did not "
                     "provision its documented build environment")
+    still_bad = cache_mismatch(exe, venv_py, sidecar, inputs)
+    if still_bad:
+        pytest.fail(f"rebuilt artifact is not usable under the pin: {still_bad}")
     copied_dir = tmp_path_factory.mktemp("copied dir with spaces")
     copied = copied_dir / BINARY_NAME
     shutil.copy2(exe, copied)
     copied.chmod(0o755)
     return types.SimpleNamespace(exe=exe, copied=copied, copied_dir=copied_dir, venv_py=venv_py,
                                  guard_so=net_guard.so)
+
+
+# ---------------------------------------------------------------------------
+# Artifact reuse under the minor pin: synthetic cache contracts (task 1.4)
+# ---------------------------------------------------------------------------
+
+def make_synthetic_cache(tmp_path, *, requested="cpython@3.13", impl="CPython",
+                         version="3.13.15", venv_version="3.13.15",
+                         sidecar="present", pin="cpython@3.13"):
+    """A fake dist/build layout with sidecar metadata and a fake build-venv
+    python, all newer than the freshness inputs."""
+    root = tmp_path / "repo"
+    root.mkdir(exist_ok=True)
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    (root / "dist").mkdir(exist_ok=True)
+    venv_bin = root / "build" / "standalone" / "venv" / "bin"
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    if pin is not None:
+        (root / ".python-version").write_text(pin + "\n", encoding="utf-8")
+    marker = root / "scripts" / "standalone-requirements.txt"
+    marker.write_text("httpx==0.28.1\n", encoding="utf-8")
+    exe = root / "dist" / "longform"
+    exe.write_bytes(b"\x7fELF-fake-standalone")
+    exe.chmod(0o755)
+    sc = root / "dist" / "longform-build.json"
+    if sidecar == "present":
+        sc.write_text(json.dumps({"interpreter": {
+            "requested": requested, "implementation": impl, "version": version,
+        }}), encoding="utf-8")
+    elif sidecar == "legacy":  # pre-policy sidecar without a requested pin
+        sc.write_text(json.dumps({"interpreter": {
+            "implementation": impl, "version": version}}), encoding="utf-8")
+    elif sidecar == "unreadable":
+        sc.write_bytes(b"\x00\xff not json")
+    fake_py = venv_bin / "python"
+    fake_py.write_text(f"#!/usr/bin/env bash\nprintf 'CPython {venv_version}\\n'\nexit 0\n")
+    fake_py.chmod(0o755)
+    return root, exe, fake_py, sc
+
+
+def synthetic_mismatch(root, request=None):
+    return cache_mismatch(root / "dist" / "longform",
+                          root / "build" / "standalone" / "venv" / "bin" / "python",
+                          root / "dist" / "longform-build.json",
+                          [root / "scripts" / "standalone-requirements.txt"],
+                          request=request)
+
+
+@pytest.mark.parametrize("sidecar_version,venv_version",
+                         [("3.13.9", "3.13.15"), ("3.13.15", "3.13.9")])
+def test_cache_reuse_accepts_other_313_patches(tmp_path, sidecar_version, venv_version):
+    """Different 3.13 patches in the recorded artifact and the build venv do
+    not invalidate reuse and never require patch equality."""
+    root, *_ = make_synthetic_cache(tmp_path, version=sidecar_version,
+                                    venv_version=venv_version)
+    assert synthetic_mismatch(root) is None
+
+
+def test_cache_invalidated_by_other_minor_even_when_newer(tmp_path):
+    """An artifact recorded under another actual minor is rejected despite
+    being newer than every build input."""
+    root, *_ = make_synthetic_cache(tmp_path, version="3.12.14")
+    reason = synthetic_mismatch(root)
+    assert reason is not None
+    assert "cpython@3.13" in reason, reason
+    assert "stale" not in reason, reason
+
+
+def test_cache_invalidated_by_other_requested_minor(tmp_path):
+    root, *_ = make_synthetic_cache(tmp_path, requested="cpython@3.12")
+    reason = synthetic_mismatch(root)
+    assert reason is not None and "cpython@3.12" in reason, reason
+
+
+def test_cache_invalidated_by_other_implementation(tmp_path):
+    root, *_ = make_synthetic_cache(tmp_path, impl="PyPy")
+    reason = synthetic_mismatch(root)
+    assert reason is not None and "PyPy" in reason, reason
+
+
+@pytest.mark.parametrize("mode,fragment", [
+    ("absent", "missing"),
+    ("unreadable", "unreadable"),
+    ("legacy", "requested"),
+])
+def test_cache_invalidated_by_missing_or_incomplete_metadata(tmp_path, mode, fragment):
+    root, *_ = make_synthetic_cache(tmp_path, sidecar=mode)
+    reason = synthetic_mismatch(root)
+    assert reason is not None and fragment in reason, reason
+
+
+def test_cache_invalidated_by_wrong_build_venv_minor(tmp_path):
+    root, *_ = make_synthetic_cache(tmp_path, venv_version="3.12.14")
+    reason = synthetic_mismatch(root)
+    assert reason is not None and "3.12" in reason and "cpython@3.13" in reason, reason
+
+
+def test_cache_invalidated_when_pin_missing_or_malformed(tmp_path):
+    root, *_ = make_synthetic_cache(tmp_path, pin=None)
+    reason = synthetic_mismatch(root)
+    assert reason is not None and ".python-version" in reason, reason
+    root, *_ = make_synthetic_cache(tmp_path, pin="cpython@3.13.15")
+    reason = synthetic_mismatch(root)
+    assert reason is not None and ".python-version" in reason, reason
+
+
+def test_rebuild_failure_propagates_without_fallback():
+    """A failed rebuild fails the session instead of accepting the old
+    executable."""
+    class FakeFailure:
+        returncode = 5
+        stdout = ""
+        stderr = "boom"
+
+    with pytest.raises(pytest.fail.Exception, match="build-standalone.sh failed"):
+        rebuild_standalone(runner=lambda *a, **k: FakeFailure())
 
 
 # ---------------------------------------------------------------------------
@@ -406,12 +611,85 @@ def test_copied_binary_init_creates_project_files(built, tmp_path):
     assert f"project: {proj}" in r.stdout
     made = r.stdout.splitlines()[1]
     assert made.startswith("created: ")
-    for name in ("project.json", "bible.md", "state.md", "scenes.json", "summaries.json"):
+    assert made == "created: project.json, bible.md, state.md, scenes.json, " \
+        "summaries.json, writer_preset.json", made
+    for name in ("project.json", "bible.md", "state.md", "scenes.json",
+                 "summaries.json", "writer_preset.json"):
         assert (proj / name).is_file(), name
-    for d in ("trees", "outlines", "critiques", "checks", "state_history", "lorebooks", "bible_history"):
+    for d in ("trees", "outlines", "critiques", "checks", "state_history",
+              "lorebooks", "bible_history"):
         assert (proj / d).is_dir(), d
     cfg = json.loads((proj / "project.json").read_text(encoding="utf-8"))
     assert cfg["title"] == "Untitled"
+    # The bundled defaults match the reviewed repository assets byte for byte.
+    assert (proj / "writer_preset.json").read_bytes() == \
+        (REPO / "longform_core" / "resources" / "writer_preset.json").read_bytes(), \
+        "the copied executable must ship the reviewed preset verbatim"
+    defaults = json.loads(
+        (REPO / "longform_core" / "resources" / "project_defaults.json")
+        .read_text(encoding="utf-8"))
+    for key, value in defaults.items():
+        if key == "api_key":
+            assert cfg.get("api_key", "") == "", "no credential is initialized"
+            continue
+        assert cfg.get(key) == value, \
+            f"project.json field {key} not taken from the bundled defaults"
+
+
+def test_copied_binary_init_repeat_and_preset_override(built, tmp_path):
+    """create-missing-only semantics and explicit override precedence agree
+    between the copied executable and the source launcher, with the owner's
+    originals inaccessible and no checkout adjacency supplying defaults."""
+    work = tmp_path / "repeat work dir"
+    work.mkdir()
+    env = frozen_env(tmp_path, built.guard_so)
+    proj = tmp_path / "repeat project"
+    assert run_frozen(built.copied, ["init", str(proj)], env=env, cwd=work).returncode == 0
+
+    preset = proj / "writer_preset.json"
+    preset.write_text('{"custom": true}\n', encoding="utf-8")
+    before = preset.read_bytes()
+    r = run_frozen(built.copied, ["init", str(proj)], env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert "nothing; all files already exist" in r.stdout, r.stdout
+    assert preset.read_bytes() == before, "repeat init overwrote an existing preset"
+
+    # an explicit synthetic preset wins for a missing destination
+    synthetic = tmp_path / "synthetic override.json"
+    synthetic.write_text(json.dumps(WRITER_PRESET) + "\n", encoding="utf-8")
+    other = tmp_path / "override project"
+    r = run_frozen(built.copied, ["init", str(other), "--preset", str(synthetic)],
+                   env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert (other / "writer_preset.json").read_bytes() == synthetic.read_bytes()
+    # an existing destination is preserved and the override is refused
+    r = run_frozen(built.copied, ["init", str(other), "--preset", str(synthetic)],
+                   env=env, cwd=work)
+    assert r.returncode == 0, r.stderr
+    assert "not overwritten" in r.stdout or "not-overwritten" in r.stdout, r.stdout
+    assert (other / "writer_preset.json").read_bytes() == synthetic.read_bytes()
+
+    # an invalid explicit preset fails closed with a diagnostic, exit nonzero
+    bad = tmp_path / "bad preset.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+    fresh = tmp_path / "fresh failclosed"
+    r = run_frozen(built.copied, ["init", str(fresh), "--preset", str(bad)],
+                   env=env, cwd=work)
+    assert r.returncode != 0, r.stdout
+    blob = r.stdout + r.stderr
+    assert "error: the selected preset is not valid JSON" in blob, blob
+    assert "created before the error" in blob, \
+        "partial work must be reported truthfully"
+    assert not (fresh / "writer_preset.json").exists(), \
+        "an invalid preset must not produce a preset"
+    # an unreadable explicit source names the supplied path, as in source
+    gone = tmp_path / "unreadable preset.json"
+    fresh2 = tmp_path / "fresh unreadable"
+    r = run_frozen(built.copied, ["init", str(fresh2), "--preset", str(gone)],
+                   env=env, cwd=work)
+    assert r.returncode != 0, r.stdout
+    assert str(gone) in r.stdout + r.stderr, "the diagnostic must name the path"
+    assert not (fresh2 / "writer_preset.json").exists()
 
 
 def test_copied_binary_headless_cli_without_display_variables(built, tmp_path):
@@ -487,6 +765,13 @@ INSPECT_ARCHIVE_SCRIPT = textwrap.dedent("""
     libpython_name = [n for n in cnames if n.startswith("libpython")][0]
     libpython = r.extract(libpython_name)
     cacert = r.extract("certifi/cacert.pem")
+    import hashlib
+    resources = {}
+    for n in cnames:
+        if n.startswith("longform_core/resources/"):
+            data = r.extract(n)
+            resources[n] = {"bytes": len(data),
+                            "sha256": hashlib.sha256(data).hexdigest()}
     print(json.dumps({
         "carchive": cnames,
         "pyz": pyz_names,
@@ -494,6 +779,7 @@ INSPECT_ARCHIVE_SCRIPT = textwrap.dedent("""
         "has_pyinit_ssl": b"PyInit__ssl" in libpython,
         "cacert_size": len(cacert),
         "cacert_head": cacert[:2048].decode("ascii", "replace"),
+        "resources": resources,
     }))
 """)
 
@@ -548,6 +834,25 @@ def test_archive_contains_no_private_or_test_inputs(archive_contents):
     names = archive_contents["carchive"] + archive_contents["pyz"]
     for fragment in FORBIDDEN_ARCHIVE_FRAGMENTS:
         assert not any(fragment in n for n in names), f"private/test input {fragment!r} in bundle"
+
+
+def test_archive_bundles_reviewed_resources_exactly(archive_contents):
+    """Only the two reviewed defaults assets are packaged, byte-identical to the
+    repository copies; any missing/stale/corrupt packaged resource breaks the
+    frozen suite instead of producing a silently incomplete executable."""
+    resources = archive_contents["resources"]
+    assert set(resources) == {"longform_core/resources/project_defaults.json",
+                              "longform_core/resources/writer_preset.json"}, \
+        f"unexpected packaged resource set: {sorted(resources)}"
+    for name, info in resources.items():
+        repo_bytes = (REPO / name).read_bytes()
+        assert info["bytes"] == len(repo_bytes), name
+        assert info["sha256"] == hashlib.sha256(repo_bytes).hexdigest(), \
+            f"{name} differs between the archive and the repository"
+    assert all(f not in archive_contents["carchive"] + archive_contents["pyz"]
+               for f in ("project.json", "writer_prompt_fixture.json",
+                         "56295265-LLam_ception-1.3.json")), \
+        "private project data must never be packaged"
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1295,150 @@ def test_build_script_fails_without_uv(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Builder interpreter policy: fake provisioning contracts (task 1.3, ADR-0013)
+# ---------------------------------------------------------------------------
+
+def make_fake_build_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy(BUILD_SCRIPT, repo / "scripts" / "build-standalone.sh")
+    (repo / ".python-version").write_text("cpython@3.13\n", encoding="utf-8")
+    (repo / "scripts" / "standalone-requirements.txt").write_text(
+        "httpx==0.28.1\n", encoding="utf-8")
+    return repo
+
+
+def make_fake_provisioner(tmp_path):
+    d = tmp_path / "fake-provisioner"
+    d.mkdir()
+    template = d / "fake-python"
+    template.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        if [[ "$1" == "-c" && "$2" == *python_implementation* ]]; then
+          echo "${FAKE_VENV_IMPL:-CPython} ${FAKE_VENV_VERSION:-3.13.15}"
+          exit ${FAKE_VENV_PY_EXIT:-0}
+        fi
+        exit 0
+    """), encoding="utf-8")
+    template.chmod(0o755)
+    uv = d / "uv"
+    uv.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        echo "uv $*" >> "$FAKE_LOG"
+        case "$*" in
+          *"python install"*) exit ${FAKE_INSTALL_EXIT:-0} ;;
+          *"pip install"*) exit ${FAKE_PIP_EXIT:-0} ;;
+          *"venv"*)
+            target="${*: -1}"
+            mkdir -p "$target/bin"
+            cp "$FAKE_VENV_PYTHON_TEMPLATE" "$target/bin/python"
+            chmod +x "$target/bin/python"
+            exit ${FAKE_VENV_EXIT:-0} ;;
+          *) exit ${FAKE_UV_EXIT:-0} ;;
+        esac
+    """), encoding="utf-8")
+    uv.chmod(0o755)
+    return d
+
+
+def run_fake_build(repo, tmp_path, extra_env=None):
+    prov = make_fake_provisioner(tmp_path)
+    env = {
+        "PATH": os.pathsep.join([str(prov), "/usr/bin", "/bin"]),
+        "HOME": str(tmp_path),
+        "FAKE_LOG": str(repo / "log"),
+        "FAKE_VENV_PYTHON_TEMPLATE": str(prov / "fake-python"),
+    }
+    env.update(extra_env or {})
+    return subprocess.run(["bash", str(repo / "scripts" / "build-standalone.sh")],
+                          cwd=str(repo), capture_output=True, text=True, env=env,
+                          timeout=300)
+
+
+def fake_build_log(repo):
+    log = repo / "log"
+    if not log.is_file():
+        return []
+    return log.read_text(encoding="utf-8").splitlines()
+
+
+def test_build_script_provisions_latest_313_patch_automatically(tmp_path):
+    """The builder requests the pinned minor with --upgrade and selects it
+    explicitly for its cleared venv; no patch value appears in any request."""
+    repo = make_fake_build_repo(tmp_path)
+    r = run_fake_build(repo, tmp_path, {"FAKE_PIP_EXIT": "4"})
+    lines = fake_build_log(repo)
+    assert lines[0] == "uv python install --upgrade cpython@3.13"
+    assert r.returncode != 0  # stopped at the fake pinned dependency install
+    assert "could not install pinned build requirements" in r.stderr
+    venv_line = next(l for l in lines if l.startswith("uv venv"))
+    assert "--python cpython@3.13" in venv_line
+    assert "--managed-python" in venv_line
+    assert "--clear" in venv_line
+    assert "3.13.15" not in venv_line, "no patch value may be baked into a request"
+
+
+def test_build_script_explicit_requests_despite_host_env(tmp_path):
+    """Another Python first on PATH resolution or a conflicting UV_PYTHON must
+    not change the selected implementation/minor."""
+    repo = make_fake_build_repo(tmp_path)
+    r = run_fake_build(repo, tmp_path,
+                       {"FAKE_PIP_EXIT": "4", "UV_PYTHON": "3.12"})
+    lines = fake_build_log(repo)
+    assert lines[0] == "uv python install --upgrade cpython@3.13"
+    venv_line = next(l for l in lines if l.startswith("uv venv"))
+    assert "--python cpython@3.13" in venv_line
+    pip_line = next(l for l in lines if l.startswith("uv pip install"))
+    assert "--python " in pip_line, pip_line
+
+
+@pytest.mark.parametrize("impl,version", [("PyPy", "3.13.5"), ("CPython", "3.12.14"),
+                                          ("CPython", "3.14.10")])
+def test_build_script_rejects_wrong_interpreter_before_dependencies(tmp_path, impl, version):
+    """A provisioned interpreter of the wrong implementation or minor fails
+    before pip or PyInstaller can run; the diagnostic names the request and
+    the actual interpreter."""
+    repo = make_fake_build_repo(tmp_path)
+    r = run_fake_build(repo, tmp_path,
+                       {"FAKE_VENV_IMPL": impl, "FAKE_VENV_VERSION": version})
+    assert r.returncode != 0
+    lines = fake_build_log(repo)
+    assert not any(l.startswith("uv pip install") for l in lines), lines
+    assert not any("PyInstaller" in l for l in lines), lines
+    blob = r.stdout + r.stderr
+    assert impl in blob and version in blob
+    assert "cpython@3.13" in blob
+
+
+def test_build_script_provisioning_failure_propagates(tmp_path):
+    repo = make_fake_build_repo(tmp_path)
+    r = run_fake_build(repo, tmp_path, {"FAKE_INSTALL_EXIT": "1"})
+    assert r.returncode != 0
+    assert fake_build_log(repo) == ["uv python install --upgrade cpython@3.13"]
+    assert "cpython@3.13" in (r.stdout + r.stderr)
+
+
+@pytest.mark.parametrize("pin", ["", "3.13", "cpython@3.13.15", "cpython@3.12",
+                                 "pypy@3.13", "cpython@3.13\n3.13"])
+def test_build_script_rejects_missing_or_malformed_pins(tmp_path, pin):
+    repo = make_fake_build_repo(tmp_path)
+    (repo / ".python-version").write_text(pin, encoding="utf-8")
+    r = run_fake_build(repo, tmp_path)
+    assert r.returncode != 0
+    assert ".python-version" in (r.stdout + r.stderr)
+    assert fake_build_log(repo) == [], "no provisioning may run on an invalid pin"
+
+
+def test_build_script_missing_pin_fails(tmp_path):
+    repo = make_fake_build_repo(tmp_path)
+    (repo / ".python-version").unlink()
+    r = run_fake_build(repo, tmp_path)
+    assert r.returncode != 0
+    assert ".python-version" in (r.stdout + r.stderr)
+    assert fake_build_log(repo) == []
+
+
+# ---------------------------------------------------------------------------
 # Sidecars: build identity and third-party notices (tasks 1.3)
 # ---------------------------------------------------------------------------
 
@@ -1016,8 +1465,18 @@ def test_build_json_records_source_platform_interpreter_deps(built, build_json):
     assert re.search(r"\d+\.\d+", plat["glibc"])
 
     interp = build_json["interpreter"]
+    assert interp["requested"] == "cpython@3.13", \
+        "the sidecar must record the reviewed minor request"
     assert interp["implementation"] == "CPython"
-    assert interp["version"].startswith("3.11.")
+    version = tuple(int(part) for part in interp["version"].split(".")[:2])
+    assert version >= (3, 12), (
+        f"build interpreter {interp['version']} is below 3.12: PySide6 6.12.0 drops "
+        "a reference to None on every Qt call there (PYSIDE-3424), so long GUI sessions "
+        "abort with 'none_dealloc: deallocating None'")
+    assert version == (3, 13), \
+        f"build interpreter {interp['version']} disagrees with the requested cpython@3.13"
+    # the full actual version is recorded; the patch is observed, never asserted
+    assert re.fullmatch(r"3\.13\.\d+", interp["version"]), interp["version"]
 
     deps = build_json["dependencies"]
     for name, version in (("pyinstaller", "6.22.3"), ("pyinstaller-hooks-contrib", "2026.10"),
@@ -1036,10 +1495,53 @@ def test_build_json_records_source_platform_interpreter_deps(built, build_json):
     import hashlib
     assert art["sha256"] == hashlib.sha256(built.exe.read_bytes()).hexdigest()
 
+    res = build_json["bundled_resources"]
+    assert "ADR-0010" in res["note"]
+    assert [e["path"] for e in res["files"]] == \
+        ["longform_core/resources/project_defaults.json",
+         "longform_core/resources/writer_preset.json"]
+    for e in res["files"]:
+        repo_bytes = (REPO / e["path"]).read_bytes()
+        assert e["bytes"] == len(repo_bytes)
+        assert e["sha256"] == hashlib.sha256(repo_bytes).hexdigest()
+
     for name, version in (("pyside6-essentials", "6.12.0"), ("shiboken6", "6.12.0")):
         actual = next((v for k, v in deps.items()
                        if k.lower().replace("_", "-") == name), None)
         assert actual == version, f"{name}: expected {version}, recorded {actual}"
+
+
+NONE_PROBE = textwrap.dedent("""
+    import os
+    import sys
+
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    app = QApplication([])
+    widget = QWidget()
+    before = sys.getrefcount(None)
+    for i in range(50000):
+        widget.setEnabled(i % 2 == 0)
+        widget.clearMask()
+        widget.setToolTip(None)
+    after = sys.getrefcount(None)
+    print(f"None refcount {before} -> {after}")
+    assert after >= before, after
+""")
+
+
+def test_build_python_does_not_drop_none_refcount_under_qt_churn(built):
+    """PYSIDE-3424: PySide6 6.12.0's abi3 wheels assume immortal None. On
+    CPython 3.11 every None-returning Qt call loses a reference and a
+    long-running GUI aborts with 'none_dealloc: deallocating None'; CPython
+    3.12+ makes None immortal. The build interpreter must never leak here."""
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.run([str(built.venv_py), "-c", NONE_PROBE],
+                          capture_output=True, text=True, timeout=120, env=env)
+    assert proc.returncode == 0, (
+        "build interpreter leaks references to None under Qt call churn "
+        f"(PYSIDE-3424); exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}")
 
 
 def test_build_json_records_gui_versions_plugins_and_native_inspection(built, build_json):
@@ -1098,6 +1600,12 @@ def test_third_party_notices_cover_bundled_licenses(built, build_json):
     assert "Bundled plugin inventory:" in text
     for plugin in gui["inventory"]["wayland_platform_plugins"]:
         assert plugin in text, f"bundled plugin {plugin} not listed in notices"
+    assert "Bundled reviewed resources (application-owned, ADR-0010):" in text
+    for e in build_json["bundled_resources"]["files"]:
+        assert e["path"] in text, f"bundled resource {e['path']} not listed"
+        assert f"sha256={e['sha256']}" in text
+    for fragment in ("fuckpi", "56295265", "LLam_ception"):
+        assert fragment not in text, "private source data leaked into notices"
 
 
 def test_copied_binary_runs_without_sidecars(built, tmp_path):
@@ -1136,3 +1644,39 @@ def test_extracted_certifi_data_loads_into_verifying_ssl_context(built, tmp_path
     import ssl as _ssl
     assert result["verify_mode"] == _ssl.CERT_REQUIRED, "verification must stay enabled"
     assert result["ca_certs"] > 50, "certifi CA bundle did not load any certificates"
+
+
+# ---------------------------------------------------------------------------
+# Bundled defaults: failure and override parity (project-defaults-full-init)
+# ---------------------------------------------------------------------------
+
+def test_parity_init_explicit_preset_failure_and_missing_source(built, tmp_path):
+    """Invalid and unreadable explicit presets fail closed identically: exit
+    status, the diagnostic naming the supplied path and no success transcript
+    agree between the copied executable and the source launcher."""
+    bad = tmp_path / "bad preset.json"
+    bad.write_text("{nope", encoding="utf-8")
+    fr, sr, f_root, _ = parity(built, tmp_path,
+                               ["init", "@ROOT@", "--preset", str(bad)])
+    assert fr.returncode != 0
+    assert "not valid JSON" in fr.stderr
+    assert not (f_root / "writer_preset.json").exists()
+    gone = tmp_path / "definitely gone.json"
+    fr, _, _, _ = parity(built, tmp_path,
+                         ["init", "@ROOT@", "--preset", str(gone)],
+                         cwd="frozen-work-bad")
+    assert fr.returncode != 0
+    assert "gone.json" in fr.stderr + fr.stdout
+
+
+def test_parity_init_preset_restore_after_removal(built, tmp_path):
+    """Removing a default preset and repeating init restores exactly that
+    missing default on both sides (create-missing-only, other bytes intact)."""
+    _, _, f_root, s_root = parity(built, tmp_path, ["init", "@ROOT@"])
+    for root in (f_root, s_root):
+        (root / "writer_preset.json").unlink()
+    parity(built, tmp_path, ["init", "@ROOT@"], cwd="frozen-work-restore")
+    assert (f_root / "writer_preset.json").read_bytes() == \
+        (REPO / "longform_core" / "resources" / "writer_preset.json").read_bytes()
+    assert (f_root / "writer_preset.json").read_bytes() == \
+        (s_root / "writer_preset.json").read_bytes()

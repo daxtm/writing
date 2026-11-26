@@ -11,6 +11,13 @@ run the existing planning, drafting, review, and export flow through buttons,
 with a persistent multiline steering box and native Wayland support. The CLI
 remains available and uses the same writing operations and project files.
 
+The next owner-requested extension is a beginner-friendly, guided workspace:
+every new project gets the owner's sanitized configuration and writer preset,
+GUI Create performs complete initialization, API keys can be entered in the
+GUI, and a resumable wizard leads through bible, outline and scenes into
+drafting, review and export. All provider-generated answer text appears while
+it arrives, including multiple candidates, rather than only when a call finishes.
+
 ## Out of scope
 
 New model/provider capabilities, autonomous whole-book generation, browser/server
@@ -20,29 +27,146 @@ tests. Existing CLI capabilities becoming GUI controls are in scope; changing
 their prompts, sampling policy, or file formats is not. Dependency provisioning
 may use network; test execution must not.
 
+For this extension, replacing new-project defaults and adding explicit GUI
+credential entry are intentional exceptions to the earlier frozen-default and
+credential-name-only scope. Existing projects are not migrated or reset.
+The original private project and preset remain outside the repository; only
+reviewed, sanitized runtime defaults may be bundled, not private test fixtures.
+No new toolkit, provider, model capability, secret-service dependency, automatic
+paid pipeline, key synchronization, installer or shipping authorization is added.
+
+## Next extension — Guided writing workflow
+
+This section supersedes the earlier instruction to stop planning after GUI
+milestone 3, and its credential-name-only/completion-based-progress limitations.
+The implemented milestone/history sections below remain baseline evidence,
+not acceptance of this extension. Its five OpenSpec changes are implemented on
+`feat/guided-workflow` (unshipped), each with checked tasks and evidence; real
+Wayland acceptance remains PENDING as recorded below.
+
+### Milestone 1 — Walking skeleton: initialized project to live outline
+
+- [x] project-defaults-full-init — Fix shared CLI/GUI init to create every initial file/directory plus a usable bundled writer preset, using the owner's sanitized project defaults; cover immediate and deferred GUI Create paths and copied-executable resource loading. Implemented on `feat/guided-workflow`; unshipped.
+- [x] gui-api-key-setup — Extend existing Setup/settings and shared provider construction with masked session-key entry and explicit local-project Save/Replace/Clear, missing/available status and an explicit Test connection action; never copy credentials into defaults. Implemented; real Wayland credential-entry acceptance PENDING.
+- [x] gui-generated-text-streaming — Extend existing Api callbacks, candidate batching, shared operations and the one worker so every generated answer streams into its owning preview, including planner, writer, summarizer, critic and editor calls and every candidate. Implemented; real Wayland live-preview acceptance PENDING.
+
+**Observable slice:** launch
+`QT_QPA_PLATFORM=wayland uv run --script longform.py gui /path/to/new-project`,
+choose Create, inspect complete local setup without a preset picker, enter a
+key, save bible answers using the existing forms, then Generate an outline.
+The first answer chunks appear before completion; the author explicitly
+chooses a completed candidate. No terminal, external preset path, manual JSON
+editing or environment export is required. This is the walking skeleton,
+not the completed wizard or redesigned workspace.
+
+**Defaults contract:** the read-only sources are
+`/home/daxtm/Documents/fuckpi/project.json` and
+`/home/daxtm/Documents/fuckpi/56295265-LLam_ception-1.3.json`.
+Read them only when preparing the implementation's reviewed defaults, never
+at app startup, build time or test execution. Copy supported nonsecret project
+settings and the validated master-export preset into application-owned runtime
+resources. Force `api_key` empty, `api_key_env` to `FEATHERLESS_API_KEY`, and
+`roles.writer.preset` to project-relative `writer_preset.json`; keep the
+source's other supported defaults, including model/sampler/prompt settings.
+Use the chosen project title when supplied, otherwise the source's Untitled
+default. Review all nested values for credentials/private data before tracking
+derived assets. Record source provenance and preset notices without including
+the original private files. Never use the owner's source files as test fixtures.
+
+Full init means the existing five files and seven directories plus the default
+`writer_preset.json`, not implicit bible/outline/scene generation or limits
+fetching. Both adapters use the same operation. Existing files/presets are
+never overwritten; repeated init only fills missing paths. Explicit CLI
+`--preset FILE` overrides the bundled preset only when creating a missing
+destination. Existing configured external paths are not silently rewritten.
+Open remains read-only. Report collisions and partial-init failures truthfully;
+retry fills missing paths without resetting prior work.
+
+**Streaming coverage:** outline Generate/Reroll (N candidates), scene
+Generate/Regenerate, draft Generate/Reroll/Add N, continuity full/summary-only,
+compression, critique and revision/Regenerate all show answer deltas before
+completion. Bible answers currently compose locally with no provider request;
+the wizard must not invent an AI bible call. Show waiting/thinking status
+before answer tokens, not fabricated text or a blank unexplained box.
+Incomplete JSON/tagged responses are provisional raw previews; existing parsers
+and acceptance gates run on the completed answer. Candidate and retry-attempt
+identities prevent mixing fragments; retries reset only the affected preview.
+Keep hidden reasoning separate, Stop/close cooperative, controls responsive,
+existing completed saves intact and partial answers out of accepted files.
+Preserve existing final-output parsing, prompts, samplers and CLI transcripts.
+
+**Acceptance:** offline paused fake streams prove intermediate text is visible
+while a request is still blocked, for each operation family and concurrent
+candidate, including retry/Stop/failure. Synthetic secret sentinels prove no
+credential reaches events, logs, errors, export or bundled defaults. Fresh
+source/frozen CLI init results agree away from the checkout with the owner's
+source paths unavailable. GUI Create and deferred Create produce the same
+complete result. Add all tests to `scripts/check.sh`; real native Wayland
+credential entry, live previews, Stop/close and focus remain separate desktop
+acceptance, not inferred from offscreen results.
+
+Milestone 1 forces [ADR-0010](adr/0010-sanitized-new-project-defaults.md),
+[ADR-0011](adr/0011-gui-project-credentials.md) and
+[ADR-0012](adr/0012-shared-generation-stream-events.md).
+
+### Milestone 2 — Guided setup and a coherent writing workspace
+
+- [x] gui-workflow-navigation — Rework the existing Qt window into Plan → Write → Review → Export navigation with a project overview, plain-language readiness/next actions, focused stage layouts and context-only generation/steering controls; retain every existing advanced action through secondary panels and update the parity map. Implemented; real Wayland navigation/presentation acceptance PENDING.
+- [x] gui-project-setup-wizard — Compose shared init/settings/bible/outline/scenes operations into a back/next, save-and-resume wizard: location/title and defaults → credentials → bible questions → generate/choose outline → generate/edit/accept scene cards → enter the first unfinished scene, with streaming previews, explicit paid actions and acceptance. Implemented; real Wayland setup-to-export acceptance PENDING.
+
+The wizard launches after successful new-project Create and can be reopened
+for incomplete projects. It uses saved project artifacts/answer histories to
+derive readiness rather than a second authoritative project format; no hidden
+wizard-only document owns bible/outline/scenes. Back/Next never generate, accept
+or discard edits implicitly. Save/Discard/Cancel resolves dirty forms; leaving
+and reopening resumes saved work and shows incomplete prerequisites. Replacing
+an outline or scene plan explains downstream impact and preserves existing
+history/trees under the existing confirmation rules. Manual planning and the
+advanced controls remain available; the wizard is guidance, not a lockstep
+requirement for existing writers.
+
+Each stage identifies what it does, what input is missing, where output goes
+and the one primary next action. Move the always-visible draft steering and
+Generate controls into Write; do not show a wall of fifteen equal-priority tabs.
+Keep scene/branch navigation, candidate selection, lore, exact prompts, settings,
+continuity, revision, reports and destination-picked export discoverable.
+Review/Export can be entered deliberately; readiness warnings explain concerns
+without inventing new mandatory review gates or automatic model calls.
+Keyboard navigation, focus order, labels, empty/error states, resize/scaling and
+light/dark readability are acceptance criteria within these two changes, not
+a later polish milestone.
+
+**Acceptance:** a first-time user follows visible instructions from a missing
+directory through credential setup, accepted bible/outline/scenes, streamed
+draft candidates and Accept, continuity/review/revision and picked export, with
+no terminal/config/preset knowledge. An offline offscreen journey uses
+synthetic credentials, fake streams and interruption/reopen checks; the full
+existing CLI/GUI action parity map is re-audited. `scripts/check.sh` runs the
+journey and all new regressions. Record a separate real Wayland walkthrough
+including keyboard, pickers, scaling/theme and Stop/close before claiming this
+extension complete; an unavailable desktop leaves acceptance explicitly pending.
+
+**Open questions:** no blocking product choices remain. Exact visual styling
+can be decided in the selected navigation change against the above journey.
+Encrypted/system-keyring storage and a shared key across projects are not
+implied by API-key entry; ADR-0011 deliberately retains existing per-project
+storage with an unsaved-session alternative.
+
 ## Planning baseline and completion bar
 
 The owner's completion bar is **every feature the CLI/TUI has, start to finish,
-must exist in the GUI**. No individual change below completes the workspace.
-Completion requires the entire three-change remaining sequence, command/action
-parity tests, the from-empty-project through export demo and separate real
-Wayland acceptance. This plan does not authorize shipping.
+must exist in the GUI**. The full guided-workflow sequence is implemented on
+`feat/guided-workflow` (unshipped): project defaults, credentials, streaming,
+staged navigation and the setup wizard, on top of the reader shell, draft loop,
+planning and continuity/review/export. Command/action parity, the
+from-empty-project through export journeys and the standalone build pass in
+`scripts/check.sh`. Completion still requires the separate real Wayland
+acceptance described above; this plan does not authorize shipping.
 
-The Qt reading/steering shell is implemented but unshipped on
-`feat/gui-wayland-shell`; it integrates the reader snapshots and ADR-0004/0005.
-Do not confuse that branch with `origin/main`. Its existing
-`openspec/changes/gui-wayland-shell/` records the shell, not working generation.
-The complete draft loop is implemented on this branch (real drafting Wayland
-acceptance remains pending). Milestone 2 is now implemented on this branch:
-`openspec/changes/gui-project-planning/` has its eight tasks landed
-(Create/Open through saved scene cards, offline parity and offscreen journey
-coverage; real Wayland Create-to-scene acceptance recorded as PENDING in
-`openspec/changes/gui-project-planning/evidence.md`). Milestone 3
-(`gui-continuity-review-export`) is now selected/proposed in
-`openspec/changes/gui-continuity-review-export/`, with eight unchecked test-first
-tasks. It is not implemented; this proposal does not authorize shipping.
-Stop planning after this final change: after implementation, audit the full
-parity matrix below before any whole-workspace completion claim.
+Do not confuse `feat/guided-workflow` with `origin/main`. The implementation
+evidence and the full-parity audit are in the respective
+`openspec/changes/*/evidence.md` files; real Wayland acceptance for every
+milestone remains PENDING there.
 
 The existing `cmd_*` commands already implement the rules. Fix/extract those
 boundaries, keeping CLI adapters and reusing `Project`, `Tree`, `Lore`, prompt/
@@ -172,33 +296,42 @@ shipping is authorized; no more speculative changes.
 
 ## Full-parity coverage map — no CLI command or draft action left behind
 
-| Existing CLI surface | Required GUI control(s) | Implementing change |
-|---|---|---|
-| `gui [DIR]` | Native Wayland project window, reading/notes, refresh/navigation, font size; no-argument launch opens it in the current directory | Existing shell; retained throughout |
-| `draft [--scene ID]`, resume/default next unfinished | Select scene / Next unfinished / reopen done scene, resume head, status/prerequisite warnings | `gui-drafting-workspace` |
-| `g [N]` / `gN`, default writer.swipes | Generate, count, streaming/completion progress, Stop | `gui-drafting-workspace` |
-| Candidate `K`, `r K…` / `r all`, `+ N`, `v K`, `d K`, Enter | Accept, Reroll selected/all, Add N, View, Delete leaf, Keep branches/Discard preview | `gui-drafting-workspace` |
-| `s TEXT` / `s -` / `se`, `l N`, `who`, `pov` | Multiline steering Save/Clear/capture, passage length/token cap, cast/POV forms | `gui-drafting-workspace` |
-| `w`, `e`, `r`, `t`, `j ID`, `x ID` | New passage, Edit head/diff/history, Rewind, full branch tree/metadata, Jump/Use as head, Delete leaf | `gui-drafting-workspace` |
-| `v`, `v ID`, `tail [N]`, `card`, `c`, `cp` | Marked manuscript, full node viewer, Tail N, scene card, context/budget/sampler/injected-lore panel, exact prompt preview/Save last_prompt.txt | `gui-drafting-workspace` |
-| `lb`, `lb N…`, `lb all on/off`, `char NAME`, `alias A,B`, `world`; lorebook/card files | Lore list, individual/multi/all toggles, character name/aliases/world, JSON/PNG import picker | `gui-drafting-workspace` |
-| `d`, scene-end confirmation, `q`, `?` / `h` / `help` | Mark done/decline end suggestion, Leave draft, action help; dirty-editor Save/Discard/Cancel | `gui-drafting-workspace` |
-| `init [--preset FILE]`, project configuration | Create/Open directory, preset picker, models/roles/settings forms | `gui-project-planning` |
-| `limits`, `bible` | Fetch/display limits, section question/answer/edit/accept/skip/quit forms/history | `gui-project-planning` |
-| `outline --n --notes`, candidate selection/new notes/reroll/view/quit | Count/notes editor, Generate/Reroll, candidate viewer/selection, Cancel | `gui-project-planning` |
-| `scenes [--force]`, view/regenerate/accept/quit | Scene cards list/editor/validation, Generate/Regenerate, Accept/Replace confirmation, Cancel | `gui-project-planning` |
-| `update-state [--scene] [--summary-only]`, invalid raw edit/retry, warnings | Scene/summary-only selection, diff/raw editor, Accept/Edit/Regenerate/Cancel, warning confirmation | `gui-continuity-review-export` |
-| `compress --from --to [--replace]` | Range/overlap validation, Replace confirmation, preview/Edit/Accept/Regenerate/Cancel | `gui-continuity-review-export` |
-| `critique --scene`, `check [--scene]` | Critique, Check scene/all, report viewer/editable review notes | `gui-continuity-review-export` |
-| `revise --scene` | Per-passage diff, Accept/Skip/Edit/Regenerate/Quit, saved revision history | `gui-continuity-review-export` |
-| `status`, `export [--out FILE]` | Project status, Export with destination picker | `gui-continuity-review-export` |
+| Existing CLI surface | Required GUI control(s) | Workflow route | Case | Implementing change |
+|---|---|---|---|---|
+| `gui [DIR]` | Native Wayland project window, reading/notes, refresh/navigation, font size; no-argument launch opens it in the current directory | window: Plan/Write/Review/Export stages, sidebar, refresh/prose size (global) | `case_workflow_stages`, `case_owner_flow_reading` | Existing shell; retained throughout |
+| `draft [--scene ID]`, resume/default next unfinished | Select scene / Next unfinished / reopen done scene, resume head, status/prerequisite warnings | Write → scene | `case_draft_scene_context`, `case_workflow_stages` | `gui-drafting-workspace` |
+| `g [N]` / `gN`, default writer.swipes | Generate, count, streaming/completion progress, Stop | Write → draft (Stop global) | `case_draft_generate_acceptance`, `case_stream_draft_candidates` | `gui-drafting-workspace` |
+| Candidate `K`, `r K…` / `r all`, `+ N`, `v K`, `d K`, Enter | Accept, Reroll selected/all, Add N, View, Delete leaf, Keep branches/Discard preview | Write → draft (tray) | `case_draft_candidate_tray` | `gui-drafting-workspace` |
+| `s TEXT` / `s -` / `se`, `l N`, `who`, `pov` | Multiline steering Save/Clear/capture, passage length/token cap, cast/POV forms | Write → draft (steering), scene | `case_owner_flow_steering`, `case_workflow_dirty_busy` | `gui-drafting-workspace` |
+| `w`, `e`, `r`, `t`, `j ID`, `x ID` | New passage, Edit head/diff/history, Rewind, full branch tree/metadata, Jump/Use as head, Delete leaf | Write → manuscript/branches | `case_draft_edit_and_branches` | `gui-drafting-workspace` |
+| `v`, `v ID`, `tail [N]`, `card`, `c`, `cp` | Marked manuscript, full node viewer, Tail N, scene card, context/budget/sampler/injected-lore panel, exact prompt preview/Save last_prompt.txt | Write → manuscript (marked/tail), context, scene | `case_draft_scene_context` | `gui-drafting-workspace` |
+| `lb`, `lb N…`, `lb all on/off`, `char NAME`, `alias A,B`, `world`; lorebook/card files | Lore list, individual/multi/all toggles, character name/aliases/world, JSON/PNG import picker | Write → lore | `case_draft_lore` | `gui-drafting-workspace` |
+| `d`, scene-end confirmation, `q`, `?` / `h` / `help` | Mark done/decline end suggestion, Leave draft, action help; dirty-editor Save/Discard/Cancel | Write → draft, scene | `case_draft_help_and_leave`, `case_workflow_dirty_busy` | `gui-drafting-workspace` |
+| `init [--preset FILE]`, project configuration | Create/Open directory, preset picker, models/roles/settings forms | Plan → setup | `case_planning_create_open`, `case_planning_deferred_create` | `gui-project-planning` |
+| `limits`, `bible` | Fetch/display limits, section question/answer/edit/accept/skip/quit forms/history | Plan → setup (limits), bible | `case_planning_settings_limits`, `case_planning_bible` | `gui-project-planning` |
+| `outline --n --notes`, candidate selection/new notes/reroll/view/quit | Count/notes editor, Generate/Reroll, candidate viewer/selection, Cancel | Plan → outline | `case_planning_outline` | `gui-project-planning` |
+| `scenes [--force]`, view/regenerate/accept/quit | Scene cards list/editor/validation, Generate/Regenerate, Accept/Replace confirmation, Cancel | Plan → scenes | `case_planning_scenes`, `case_planning_card_edit` | `gui-project-planning` |
+| `update-state [--scene] [--summary-only]`, invalid raw edit/retry, warnings | Scene/summary-only selection, diff/raw editor, Accept/Edit/Regenerate/Cancel, warning confirmation | Review → continuity | `case_review_update_state`, `case_review_dirty_sources` | `gui-continuity-review-export` |
+| `compress --from --to [--replace]` | Range/overlap validation, Replace confirmation, preview/Edit/Accept/Regenerate/Cancel | Review → continuity | `case_review_compress` | `gui-continuity-review-export` |
+| `critique --scene`, `check [--scene]` | Critique, Check scene/all, report viewer/editable review notes | Review → reports | `case_review_reports` | `gui-continuity-review-export` |
+| `revise --scene` | Per-passage diff, Accept/Skip/Edit/Regenerate/Quit, saved revision history | Review → revision | `case_review_revise`, `case_review_settlement` | `gui-continuity-review-export` |
+| `status`, `export [--out FILE]` | Project status, Export with destination picker | Export → status | `case_review_status_export`, `case_review_export_enterable_with_warnings` | `gui-continuity-review-export` |
 
-The sequence is drafting workspace -> setup/planning -> continuity/review/export.
-Do not tick future work based on its proposal. Every row of the map is now
-implemented through GUI controls with offline parity coverage (audited row by
-row in `openspec/changes/gui-continuity-review-export/evidence.md`), but the
-finish line still requires separate native Wayland acceptance for all three
-milestones; no offscreen result or shell smoke establishes it.
+Every route column names the actual stage → tool path after
+`gui-workflow-navigation`; `case_workflow_parity` audits each row's named
+controls through those routes, `case_workflow_readiness` covers the Plan
+overview/next-action facts and `case_workflow_presentation` covers keyboard,
+window sizes, font, palette and offscreen scale 1/2. The end-to-end journeys
+(`case_planning_journey`, `case_review_journey`, `case_owner_flow_reading`)
+still cover Create → planning → draft → review → export across stages.
+
+The sequence is drafting workspace -> setup/planning -> continuity/review/export
+-> guided workflow (defaults, credentials, streaming, navigation, wizard).
+Every row of the map is now implemented through staged GUI controls with
+offline parity coverage (audited row by row in the changes' `evidence.md`
+files), and all guided-workflow tasks are checked. The finish line still
+requires separate native Wayland acceptance for every milestone; no offscreen
+result or shell smoke establishes it.
 
 ## Delivery rules for every GUI change
 

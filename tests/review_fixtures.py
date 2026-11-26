@@ -48,9 +48,15 @@ class _FakeApi:
         self._calls = calls
 
     def chat(self, role, msgs, max_tokens=None, stream_cb=None, progress=True,
-             token=None, on_retry_event=None):
+             token=None, on_retry_event=None, preview_events=None, **kw):
         self._calls.append(("chat", role, msgs, max_tokens))
-        return self._responses.pop(0), "stop", {}
+        raw = self._responses.pop(0)
+        if preview_events is not None:
+            preview_events({"type": "preview_start", "attempt_id": 1})
+            preview_events({"type": "preview_delta", "attempt_id": 1,
+                            "text": raw})
+            preview_events({"type": "preview_complete", "attempt_id": 1})
+        return raw, "stop", {}
 
 
 def run_cli(root, name, responses, answers=(), edits=None, args=None):

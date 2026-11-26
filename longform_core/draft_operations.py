@@ -21,7 +21,8 @@ from .lore import is_present, Lore, pov_name
 from .prompt import build_writer_prompt, clean_continuation, format_card, writer_sampling
 from .reader_model import _no_symlink_below
 from .tree import Tree
-from .utils import FatalError, keep_lead, now, write_text
+from .utils import (FatalError, keep_lead, now, redact_text, write_text,
+                    StreamRedactor)
 
 
 class OpError(Exception):
@@ -96,6 +97,47 @@ def _provider(p, factory):
         return (factory or (lambda pp: Api(pp)))(p)
     except FatalError as e:
         raise OpError(str(e.msg), from_die=True) from None
+
+
+def credential_state(cfg, session=False):
+    """Availability-only credential facts (ADR-0011): effective source
+    ('session'|'project'|'environment'|'missing') and booleans; never a key
+    value. `session` is the GUI's window-override availability input."""
+    key = str(cfg.get("api_key") or "").strip()
+    env = str(cfg.get("api_key_env") or "")
+    env_set = bool(env) and bool(os.environ.get(env, "").strip())
+    if session:
+        source = "session"
+    elif key:
+        source = "project"
+    elif env_set:
+        source = "environment"
+    else:
+        source = "missing"
+    return {"available": source != "missing", "source": source,
+            "api_key_env": env, "inline_key": bool(key), "env_set": env_set}
+
+
+def redaction_secrets(p, provider=None):
+    """Every nonempty credential value this call knows (session, saved
+    project, configured environment) for scrubbing echoes; provider objects
+    built by the GUI window carry the full context in `secrets`."""
+    vals = []
+    for v in (getattr(provider, "secrets", None) or ()):
+        if v and v not in vals:
+            vals.append(v)
+    key = str(p.cfg.get("api_key") or "").strip()
+    env = str(p.cfg.get("api_key_env") or "")
+    envval = os.environ.get(env, "").strip() if env else ""
+    for v in (key, envval):
+        if v and v not in vals:
+            vals.append(v)
+    return tuple(vals)
+
+
+def scrub_credentials(p, text, provider=None):
+    """Redact all known credential values from one text (errors, echoes)."""
+    return redact_text(text or "", redaction_secrets(p, provider))
 
 
 def _find_idx(scenes, scene_id):
@@ -196,14 +238,22 @@ class GenerateResult:
 
 def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
                         passage_words=None, provider_factory=None, token=None,
-                        events=None):
+                        events=None, preview_events=None):
     """Generate `count` candidate passages as siblings of `parent` (default head).
 
     Cleaning, cutoff handling and node metadata match the CLI byte-for-byte.
     A failed, cancelled or empty cleaned response creates no node; complete
     candidates saved earlier stay saved. Raises OpError (stale/soft) or
-    Cancelled; never moves the head."""
+    Cancelled; never moves the head.
+
+    `preview_events` (ADR-0012), when given, is called with the submission
+    slot index i and must return that candidate's live answer subscriber;
+    slot ids are assigned before submission, so preview candidate_id stays
+    stable regardless of completion order. Without it the legacy single-
+    stream/CLI delta events are unchanged and no preview events are emitted."""
     count = max(1, int(count))
+    pf = None if preview_events is None else preview_factory(events,
+                                                             preview_events)
     p, scenes, idx, sc = _session(root, scene_id)
     tree = _tree(p, scene_id)
     head0 = tree.head if parent is None else parent
@@ -232,34 +282,54 @@ def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
     meta = {"scene": sc["id"], "head": head0, "lorebooks": lore.active(),
             "present": sc.get("characters") or [], "char": rep["char"], "steer": steer}
 
-    def one():
-        return provider.complete("writer", prompt, params, extra, meta=meta, token=token)
+    def one(i=None):
+        return provider.complete("writer", prompt, params, extra, meta=meta,
+                                 token=token,
+                                 preview_events=None if pf is None else pf(i))
 
     try:
         if count == 1:
             _emit(events, "stream_start")
-            results = [provider.complete("writer", prompt, params, extra,
-                                         stream_cb=(lambda t: _emit(events, "delta", text=t)) if events else None,
-                                         meta=meta, token=token,
-                                         on_retry_event=(lambda kind: _emit(events, kind)) if events else None)]
+            sub = None if pf is None else pf(0)
+            if sub is not None:
+                # ADR-0012: the subscriber receives the answer preview; the
+                # legacy CLI delta channel is not duplicated on top of it.
+                results = [provider.complete(
+                    "writer", prompt, params, extra, meta=meta, token=token,
+                    preview_events=sub)]
+                rest = ""
+            else:
+                red = StreamRedactor(redaction_secrets(p, provider))
+                results = [provider.complete("writer", prompt, params, extra,
+                                             stream_cb=(lambda t: _emit(events, "delta",
+                                                                        text=red.feed(t))) if events else None,
+                                             meta=meta, token=token,
+                                             on_retry_event=(lambda kind: _emit(events, kind)) if events else None)]
+                rest = red.flush()
+                if rest and events:
+                    _emit(events, "delta", text=rest)
             _emit(events, "stream_end")
             streamed = True
         else:
             _emit(events, "progress",
                   msg=f"generating {count} candidates (max_parallel {p.cfg['max_parallel']})...")
             results = provider.many(one, count, token=token,
-                                    on_event=(lambda ev: _emit_raw(events, ev)) if events else None)
+                                    on_event=(lambda ev: _emit_raw(events, ev)) if events else None,
+                                    indexed=(lambda i: (lambda: one(i)))
+                                    if pf is not None else None)
             streamed = False
     except Cancelled:
         raise
     except (HttpErr, NoAnswerErr, httpx.HTTPError, FatalError) as e:
-        raise OpError(f"generation failed: {e}", soft=True) from None
+        raise OpError(f"generation failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
     _advance(p, baseline, "calib.json")   # our own calls may record calibration
     ids = []
+    secrets = redaction_secrets(p, provider)
     for text, finish, _ in results:
         if token:
             token.check()
-        clean, ended, trimmed = clean_continuation(text, finish, rep["continuing"])
+        clean, ended, trimmed = clean_continuation(redact_text(text, secrets), finish, rep["continuing"])
         if not clean.strip():
             _emit(events, "skipped_empty")
             continue
@@ -282,6 +352,31 @@ def generate_candidates(root, scene_id, *, count=1, parent=None, steer=None,
 def _emit_raw(events, payload):
     if events:
         events(dict(payload))
+
+
+def preview_factory(events, preview_events):
+    """Common ADR-0012 forwarding: bind each slot's subscriber to its candidate
+    slot before submission. With an events channel, each provider preview
+    event is re-emitted on it tagged with candidate_id=i+1 (the queued worker
+    channel pairs it with the operation id); otherwise the subscriber receives
+    the provider event directly."""
+    def factory(i):
+        sub = preview_events(i) if preview_events is not None else None
+        if sub is None:
+            return None
+        if events is None:
+            return sub
+        c = i + 1
+
+        def fwd(ev, c=c):
+            d = {k: v for k, v in ev.items() if k != "type"}
+            _emit(events, ev.get("type"), candidate_id=c, **d)
+        return fwd
+    return factory
+
+
+PREVIEW_TYPES = ("preview_start", "preview_delta", "preview_reset",
+                 "preview_complete")
 
 
 def accept_candidate(root, scene_id, nid, *, token=None, events=None):
@@ -638,13 +733,15 @@ def lore_import(root, src, scene_id=None, replace=False, *, token=None, events=N
 
 # ------------------------------------------------------ session/inspection
 
-def session_info(root, scene_id=None):
+def session_info(root, scene_id=None, *, session=False):
     """Plain session defaults and prerequisite/warning report (no calls).
 
     `warnings` holds ignored project sampler keys and earlier-scene warnings;
     `sampler_warnings` holds preset sampler notes. The CLI prints warnings,
     then its preset line, then sampler warnings — keep that order when
-    adapting; the GUI shows both lists combined."""
+    adapting; the GUI shows both lists combined. `session` is the GUI's
+    window-credential availability input (ADR-0011); only availability facts
+    are reported, never a key value."""
     info = {"swipes": 1, "passage_words": 220, "model": "", "preset_found": False,
             "creds_ok": False, "api_key_env": "", "warnings": [],
             "sampler_warnings": [], "scene_ok": False}
@@ -653,12 +750,9 @@ def session_info(root, scene_id=None):
     rc = p.cfg["roles"]["writer"]
     info.update(swipes=max(1, int(rc.get("swipes", 1))),
                 passage_words=int(rc.get("passage_words", 220)), model=rc["model"])
-    key = str(p.cfg.get("api_key") or "").strip()
-    env = str(p.cfg.get("api_key_env") or "")
-    info["api_key_env"] = env
-    if not key and env and os.environ.get(env, "").strip():
-        key = "env"
-    info["creds_ok"] = bool(key)
+    creds = credential_state(p.cfg, session=session)
+    info.update(api_key_env=creds["api_key_env"], cred_source=creds["source"])
+    info["creds_ok"] = creds["available"]
     stale = [k for k in SAMPLING_KEYS if k in rc]
     if stale:
         info["warnings"].append("writer keys " + ", ".join(stale)

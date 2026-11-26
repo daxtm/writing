@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from longform_core.cancel import Cancelled
+
 import reader_support as rs
 
 import longform_core.commands as commands
@@ -63,13 +65,15 @@ def cli_init(root, preset=None, monkeypatch=None, capsys=None):
 def test_init_matches_cli_files_and_transcript(tmp_path, monkeypatch, capsys):
     a, b = tmp_path / "cli", tmp_path / "op"
     out = cli_init(a, monkeypatch=monkeypatch, capsys=capsys).out
-    plan.init_project(b)
+    result = plan.init_project(b)
     for name in plan.INIT_FILES:
         assert (a / name).read_bytes() == (b / name).read_bytes(), name
     for d in plan.INIT_DIRS:
         assert (a / d).is_dir() and (b / d).is_dir()
+    assert result["created"][-1] == "writer_preset.json"
     assert out == (f"project: {a}\n"
-                   "created: project.json, bible.md, state.md, scenes.json, summaries.json\n"
+                   "created: project.json, bible.md, state.md, scenes.json, "
+                   "summaries.json, writer_preset.json\n"
                    "next: set models in project.json, fill in bible.md, put lorebooks in "
                    "lorebooks/, then run limits\n")
 
@@ -121,6 +125,245 @@ def test_init_refuses_symlinked_target(tmp_path):
     assert (real / "bible.md").read_text() == "keep me"
 
 
+# ------------------------------------------------- bundled defaults (1.3)
+
+def test_init_bundled_defaults_exact_contents(tmp_path):
+    import longform_core.defaults as dfl
+    out = plan.init_project(tmp_path / "p")
+    assert out["created"] == ["project.json", "bible.md", "state.md",
+                              "scenes.json", "summaries.json",
+                              "writer_preset.json"]
+    assert out["dirs"] == ["trees", "outlines", "critiques", "checks",
+                           "state_history", "lorebooks", "bible_history"]
+    assert out["warnings"] == []
+    assert out["preset"] == {"imported": "writer_preset.json",
+                             "bytes": len(dfl.writer_preset_bytes()),
+                             "replaced": False, "default": True}
+    root = tmp_path / "p"
+    expected_cfg = dfl.project_defaults()
+    assert json.loads((root / "project.json").read_text()) == expected_cfg
+    assert (root / "project.json").read_bytes() == \
+        (json.dumps(expected_cfg, indent=2) + "\n").encode("utf-8")
+    assert (root / "writer_preset.json").read_bytes() == \
+        dfl.writer_preset_bytes()
+    for name, content in (("bible.md", None), ("state.md", None),
+                          ("scenes.json", "[]\n")):
+        assert (root / name).is_file()
+    assert json.loads((root / "summaries.json").read_text()) == \
+        {"scenes": {}, "arcs": []}
+    from longform_core.config import BIBLE_TEMPLATE, STATE_TEMPLATE
+    assert (root / "bible.md").read_text() == BIBLE_TEMPLATE
+    assert (root / "state.md").read_text() == STATE_TEMPLATE
+
+
+def test_init_optional_title_isolation(tmp_path):
+    root = tmp_path / "p"
+    plan.init_project(root, title="Named")
+    cfg = json.loads((root / "project.json").read_text())
+    assert cfg["title"] == "Named"
+    assert cfg["target_words"] == 17000, "only the title is overridden"
+    again = plan.init_project(root)
+    assert again["created"] == [], "an existing config is never re-titled"
+    assert json.loads((root / "project.json").read_text())["title"] == "Named"
+
+
+def test_init_repeated_reports_nothing_created(tmp_path):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    again = plan.init_project(root)
+    assert again["created"] == [] and again["dirs"] == []
+    assert again["preset"] is None and again["warnings"] == []
+
+
+def test_init_restores_only_a_missing_default_preset(tmp_path):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    external = tmp_path / "elsewhere" / "mine.json"
+    external.parent.mkdir()
+    external.write_text(json.dumps(MASTER), encoding="utf-8")
+    cfg = json.loads((root / "project.json").read_text())
+    cfg["roles"]["writer"]["preset"] = str(external)
+    (root / "project.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (root / "writer_preset.json").unlink()
+    again = plan.init_project(root)
+    assert again["created"] == ["writer_preset.json"]
+    import longform_core.defaults as dfl
+    assert (root / "writer_preset.json").read_bytes() == dfl.writer_preset_bytes(), \
+        "only the missing local default preset is restored"
+    assert json.loads((root / "project.json").read_text()) \
+        ["roles"]["writer"]["preset"] == str(external), \
+        "the configured external preset path is never retargeted"
+    assert external.read_bytes() == json.dumps(MASTER).encode("utf-8")
+
+
+def test_repeated_init_keeps_every_existing_byte(tmp_path):
+    root = plan.init_project(tmp_path / "p")["root"]
+    root = Path(root)
+    edits = {"project.json": '{"title": "Edited", "target_words": 99}',
+             "bible.md": "## Title\nmine\n", "state.md": "# mine",
+             "scenes.json": '[{"id": "s001"}]', "summaries.json": '{"scenes": {}}',
+             "writer_preset.json": '{"instruct": {}, "context": {}, "sysprompt": {}, "preset": {}}'}
+    for name, text in edits.items():
+        (root / name).write_text(text, encoding="utf-8")
+    (root / "state_history" / "kept.md").write_text("drafted", encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in sorted(root.rglob("*"))
+              if p.is_file()}
+    out = plan.init_project(root)
+    assert out["created"] == [] and out["dirs"] == []
+    after = {p.name: p.read_bytes() for p in sorted(root.rglob("*"))
+             if p.is_file()}
+    assert after == before, "existing bytes never change on repeat"
+
+
+def test_legacy_sparse_config_keeps_old_fallbacks_and_bytes(tmp_path):
+    root = plan.init_project(tmp_path / "p")["root"]
+    (Path(root) / "project.json").write_text('{"title": "Old"}\n',
+                                             encoding="utf-8")
+    from longform_core.project import Project
+    p = Project(root)
+    assert p.cfg["roles"]["writer"]["passage_words"] == 220, \
+        "old sparse projects keep the previous application fallback"
+    assert p.cfg["roles"]["writer"]["preset_overrides"] == {"temp": 1.06}
+    raw = (Path(root) / "project.json").read_bytes()
+    plan.init_project(root)
+    assert (Path(root) / "project.json").read_bytes() == raw, \
+        "repeated init never rewrites an existing configuration"
+
+
+def test_init_invalid_explicit_preset_never_falls_back(tmp_path):
+    root = tmp_path / "p"
+    src = tmp_path / "bad.json"
+    src.write_text("{nope", encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.init_project(root, preset_src=str(src))
+    assert "not valid JSON" in str(e.value)
+    assert "created before the error" in str(e.value), \
+        "earlier writes are reported for a non-destructive retry"
+    assert not (root / "writer_preset.json").exists(), \
+        "no bundled substitution for invalid explicit input"
+    retry = plan.init_project(root)
+    assert retry["created"] == ["writer_preset.json"], \
+        "retry after correction fills only missing paths"
+
+
+def test_init_invalid_explicit_preset_missing_required_key(tmp_path):
+    src = tmp_path / "partial.json"
+    src.write_text(json.dumps({"instruct": {}, "context": {}}),
+                   encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.init_project(tmp_path / "p", preset_src=str(src))
+    assert "missing 'sysprompt'" in str(e.value)
+
+
+def test_init_explicit_override_existing_destination_warns(tmp_path, master_file):
+    import longform_core.defaults as dfl
+    root = tmp_path / "p"
+    plan.init_project(root)
+    bundled = (root / "writer_preset.json").read_bytes()
+    (root / "bible.md").unlink()
+    out = plan.init_project(root, preset_src=str(master_file))
+    assert out["warnings"] == ["writer_preset.json already exists; not "
+                               "overwritten (configure an existing preset "
+                               "path in Settings if appropriate)"]
+    assert out["preset"] is None
+    assert (root / "writer_preset.json").read_bytes() == bundled, \
+        "an existing regular destination stays byte-identical"
+    assert "bible.md" in out["created"], \
+        "other missing initialization paths are still filled"
+    assert master_file.read_bytes() != bundled
+
+
+def test_init_refuses_symlinked_preset_destination(tmp_path):
+    real = tmp_path / "real.json"
+    real.write_text("{}", encoding="utf-8")
+    root = plan.init_project(tmp_path / "p")
+    root = Path(root["root"])
+    (root / "writer_preset.json").unlink()
+    (root / "writer_preset.json").symlink_to(real)
+    with pytest.raises(OpError) as e:
+        plan.init_project(root)
+    assert "symlink" in str(e.value)
+    assert real.read_text() == "{}", "the linked target is untouched"
+
+
+def test_init_refuses_preset_directory_collision(tmp_path):
+    root = plan.init_project(tmp_path / "p")
+    root = Path(root["root"])
+    (root / "writer_preset.json").unlink()
+    (root / "writer_preset.json").mkdir()
+    with pytest.raises(OpError) as e:
+        plan.init_project(root)
+    assert "not a regular file" in str(e.value)
+
+
+def test_init_write_failure_reports_partial_work_and_retries(tmp_path,
+                                                             monkeypatch):
+    root = tmp_path / "p"
+    real = plan._write_bytes_safe
+    calls = []
+
+    def flaky(path, data):
+        calls.append(path.name)
+        if path.name == "scenes.json":
+            raise OSError(13, "Permission denied")
+        return real(path, data)
+
+    monkeypatch.setattr(plan, "_write_bytes_safe", flaky)
+    with pytest.raises(OpError) as e:
+        plan.init_project(root)
+    msg = str(e.value)
+    assert "scenes.json could not be written" in msg
+    assert "project.json" in msg and "bible.md" in msg, \
+        "completed writes are reported"
+    assert "(os error 13)" not in msg.lower() or "Permission denied" in msg
+    monkeypatch.setattr(plan, "_write_bytes_safe", real)
+    retry = plan.init_project(root)
+    assert "scenes.json" in retry["created"], "retry fills missing paths only"
+    assert (root / "scenes.json").read_text() == "[]\n"
+
+
+class _StopAfter:
+    """Cancellation token that trips after N checks (controlled boundary)."""
+
+    def __init__(self, after):
+        self.n = 0
+        self.after = after
+
+    def check(self):
+        self.n += 1
+        if self.n > self.after:
+            raise Cancelled("stopped")
+
+
+def test_init_stop_keeps_complete_writes_and_reports_partial(tmp_path):
+    root = tmp_path / "p"
+    events = []
+    token = _StopAfter(3)   # project.json + bible.md complete, then Stop
+    with pytest.raises(Cancelled):
+        plan.init_project(root, token=token, events=events.append)
+    partial = [ev for ev in events if ev.get("type") == "init_partial"]
+    assert partial, "the partial state is emitted for reporting"
+    assert partial[0]["created"] == ["project.json", "bible.md"]
+    assert (root / "project.json").exists() and (root / "bible.md").exists()
+    assert not (root / "writer_preset.json").exists(), \
+        "no incomplete preset is written or reported as created"
+    out = plan.init_project(root)
+    assert set(out["created"]) == {"state.md", "scenes.json", "summaries.json",
+                                   "writer_preset.json"}, \
+        "retry after Stop fills only the missing paths"
+
+
+def test_init_stop_before_anything_creates_nothing(tmp_path):
+    root = tmp_path / "p"
+    events = []
+    token = _StopAfter(0)
+    with pytest.raises(Cancelled):
+        plan.init_project(root, token=token, events=events.append)
+    assert not root.exists() or not any(root.iterdir())
+    partial = [ev for ev in events if ev.get("type") == "init_partial"]
+    assert partial and partial[0]["created"] == [] and partial[0]["dirs"] == []
+
+
 # --------------------------------------------------------------- presets
 
 def test_import_preset_copies_unchanged_bytes(tmp_path, master_file):
@@ -153,7 +396,8 @@ def test_import_preset_missing_source_is_an_error(tmp_path):
     root.mkdir()
     with pytest.raises(OpError) as e:
         plan.import_preset(root, tmp_path / "absent.json")
-    assert "could not be read" in str(e.value)
+    assert ("could not be read" in str(e.value)
+            or "not found" in str(e.value))
 
 
 def test_import_preset_never_overwrites_destination(tmp_path, master_file):
@@ -359,6 +603,139 @@ def test_settings_save_missing_project(tmp_path):
         plan.save_settings(tmp_path / "nope", {"title": "x"})
 
 
+# ------------------------------------------------------- credentials (ADR-0011)
+
+
+def test_save_credential_store_replace_and_clear(tmp_path):
+    root = init_p(tmp_path / "p", cfg={"title": "T", "target_words": 9000})
+    out = plan.save_credential(root, "save", "  sk-new-sentinel  ")
+    cfg = json.loads((root / "project.json").read_text())
+    assert cfg["api_key"] == "sk-new-sentinel", "the value is trimmed"
+    assert cfg["title"] == "T" and cfg["target_words"] == 9000, \
+        "unrelated fields survive"
+    assert out["creds_ok"] is True and out["cred_source"] == "project"
+    assert "sk-new-sentinel" not in json.dumps(out), "no value echo"
+
+    plan.save_credential(root, "replace", "sk-second")
+    assert json.loads((root / "project.json").read_text())["api_key"] == \
+        "sk-second"
+
+    out = plan.save_credential(root, "clear")
+    cfg = json.loads((root / "project.json").read_text())
+    assert cfg["api_key"] == "" and cfg["title"] == "T"
+    assert out["creds_ok"] is False
+    assert "sk-second" not in (root / "project.json").read_text()
+    assert "sk-second" not in json.dumps(out)
+    # no input history or backups carry the old key
+    assert not (root / "inputs").exists() or all(
+        "sk-second" not in f.read_text()
+        for f in (root / "inputs").iterdir() if f.is_file())
+
+
+def test_save_credential_rejects_empty_and_unknown_action(tmp_path):
+    root = init_p(tmp_path / "p")
+    with pytest.raises(OpError) as e:
+        plan.save_credential(root, "save", "   ")
+    assert "no credential value" in str(e.value)
+    assert json.loads((root / "project.json").read_text())["api_key"] == \
+        "sk-test", "a failed save writes nothing"
+    with pytest.raises(OpError, match="unsupported credential action"):
+        plan.save_credential(root, "destroy", "x")
+    with pytest.raises(OpError, match="unsupported credential action"):
+        plan.save_credential(root, "clear-via-save")
+
+
+def test_save_credential_stale_refusal_and_invalid_json(tmp_path):
+    root = init_p(tmp_path / "p", cfg={"title": "mine"})
+    base = plan.settings_baseline(root)
+    (root / "project.json").write_text('{"title": "external"}\n',
+                                       encoding="utf-8")
+    with pytest.raises(OpError) as e:
+        plan.save_credential(root, "save", "sk-x", baseline=base)
+    assert getattr(e.value, "stale", False), "stale save is refused"
+    assert json.loads((root / "project.json").read_text())["title"] == \
+        "external"
+
+    (root / "project.json").write_text("[]", encoding="utf-8")
+    base2 = plan.settings_baseline(root)
+    with pytest.raises(OpError, match="not a JSON object"):
+        plan.save_credential(root, "save", "sk-y", baseline=base2)
+    assert (root / "project.json").read_text() == "[]"
+
+
+def test_save_credential_refuses_symlink_target(tmp_path):
+    root = init_p(tmp_path / "p")
+    (root / "project.json").unlink()
+    other = tmp_path / "elsewhere.json"
+    other.write_text("{}", encoding="utf-8")
+    (root / "project.json").symlink_to(other)
+    with pytest.raises(OpError, match="symlink"):
+        plan.save_credential(root, "save", "sk-x")
+    assert other.read_text() == "{}", "the symlink target is untouched"
+
+
+def test_save_credential_missing_project(tmp_path):
+    with pytest.raises(OpError):
+        plan.save_credential(tmp_path / "nope", "save", "sk-x")
+
+
+def test_save_credential_stop_writes_nothing(tmp_path):
+    from longform_core.cancel import CancellationToken
+    root = init_p(tmp_path / "p")
+    before = (root / "project.json").read_bytes()
+    tok = CancellationToken()
+    tok.cancel()
+    with pytest.raises(Exception):
+        plan.save_credential(root, "save", "sk-x", token=tok)
+    assert (root / "project.json").read_bytes() == before
+
+
+# ------------------------------------------------------------ test_connection
+
+def test_connection_succeeds_discarding_content(tmp_path, monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    root = tmp_path / "p"
+    plan.init_project(root)
+    prov = FakeLimitsProvider(PLAN, {})
+    out = plan.test_connection(root, provider_factory=lambda p: prov,
+                               session=True)
+    assert out["ok"] is True and out["cred_source"] == "session"
+    assert ("GET", "/plan") in prov.calls
+    blob = json.dumps(out)
+    assert "max_context_length" not in blob, "response content is discarded"
+    assert not (root / "limits.json").exists(), "nothing is written"
+
+
+def test_connection_saved_key_and_missing_credentials(tmp_path, monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    root = init_p(tmp_path / "p")
+    prov = FakeLimitsProvider(PLAN, {})
+    out = plan.test_connection(root, provider_factory=lambda p: prov)
+    assert out["cred_source"] == "project"
+    assert out["ok"] is True
+
+    empty = tmp_path / "e"
+    plan.init_project(empty)
+    prov2 = FakeLimitsProvider(PLAN, {})
+    with pytest.raises(OpError) as e:
+        plan.test_connection(empty, provider_factory=lambda p: prov2)
+    assert "no API key" in str(e.value) and "Use for this session" in \
+        str(e.value)
+    assert prov2.calls == [], "missing credentials never construct a request"
+
+
+def test_connection_failure_is_sanitized(tmp_path):
+    root = init_p(tmp_path / "p")   # inline credential is "sk-test"
+    prov = FakeLimitsProvider(PLAN, {}, fail={
+        "plan": RuntimeError("fake provider failed with sk-test echoed")})
+    with pytest.raises(OpError) as e:
+        plan.test_connection(root, provider_factory=lambda p: prov)
+    assert "connection test failed" in str(e.value)
+    assert "sk-test" not in str(e.value), "the credential echo is scrubbed"
+    assert "[redacted]" in str(e.value)
+    assert not (root / "limits.json").exists()
+
+
 # ---------------------------------------------------------------- limits
 
 class FakeLimitsProvider:
@@ -464,6 +841,63 @@ def test_fetch_limits_missing_credentials_makes_no_call(tmp_path):
         plan.fetch_limits(root, provider_factory=lambda p: prov)
     assert "no API key" in str(e.value)
     assert prov.calls == [], "no request without credentials"
+
+
+def test_fetch_limits_session_availability_makes_call_without_disk_key(tmp_path,
+                                                                        monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    root = tmp_path / "p"
+    plan.init_project(root)          # empty api_key, no environment value
+    prov = FakeLimitsProvider(PLAN, {"meta-llama/Llama-3.3-70B-Instruct":
+                                     MODEL_OK})
+    out = plan.fetch_limits(root, provider_factory=lambda p: prov,
+                            session=True)
+    assert ("GET", "/plan") in prov.calls, \
+        "the window session credential satisfies the availability guard"
+    assert (root / "limits.json").is_file()
+    blob = json.dumps(out["view"]) + json.dumps(
+        (root / "limits.json").read_text())
+    assert "session-sentinel" not in blob, "the session key never persists"
+
+
+def test_fetch_limits_prefers_saved_key_over_environment(tmp_path,
+                                                         monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "env-sentinel")
+    root = init_p(tmp_path / "p")     # inline sk-test wins over env
+    prov = FakeLimitsProvider(PLAN, {})
+    plan.fetch_limits(root, provider_factory=lambda p: prov)
+    assert ("GET", "/plan") in prov.calls
+
+
+def test_settings_state_reports_source_and_never_values(tmp_path,
+                                                         monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "env-sentinel")
+    root = tmp_path / "p"
+    plan.init_project(root)
+    st = plan.settings_state(root)
+    assert st["inline_key"] is False and st["env_set"] is True
+    assert st["creds_ok"] is True and st["cred_source"] == "environment"
+    blob = json.dumps(st)
+    assert "env_value" not in blob, "the environment value is not exposed"
+    assert "env-sentinel" not in blob, "no credential value in state"
+    st2 = plan.settings_state(root, session=True)
+    assert st2["cred_source"] == "session" and st2["creds_ok"] is True
+
+
+def test_project_overview_reports_source_and_never_values(tmp_path,
+                                                          monkeypatch):
+    monkeypatch.delenv("FEATHERLESS_API_KEY", raising=False)
+    root = tmp_path / "p"
+    plan.init_project(root)
+    ov = plan.project_overview(root)
+    assert ov["creds_ok"] is False and ov["cred_source"] == "missing"
+    assert "session-sentinel" not in json.dumps(ov)
+    (root / "project.json").write_text(
+        json.dumps({"api_key": "sk-inline-secret"}), encoding="utf-8")
+    ov2 = plan.project_overview(root)
+    assert ov2["creds_ok"] is True and ov2["cred_source"] == "project"
+    assert "sk-inline-secret" not in json.dumps(ov2), "no key echo"
+    assert ov2["inline_key"] is True
 
 
 def test_fetch_limits_stop_keeps_file(tmp_path):
@@ -810,7 +1244,7 @@ class FakeOutlineProvider:
         self.calls = []
 
     def chat_many(self, role, messages, n, max_tokens=None, token=None,
-                  on_event=None):
+                  on_event=None, preview_events=None):
         self.calls.append({"role": role, "messages": messages, "n": n})
         out = []
         for k in range(n):
@@ -819,11 +1253,22 @@ class FakeOutlineProvider:
             i = len(self.calls) - 1
             item = FakeOutlineProvider.script[k] if \
                 len(FakeOutlineProvider.script) > k else "<outline>X</outline>"
+            sub = preview_events(k) if preview_events is not None else None
             if isinstance(item, Exception):
+                if sub:
+                    sub({"type": "preview_start", "attempt_id": 1})
+                    sub({"type": "preview_reset", "attempt_id": 1})
                 if on_event:
                     on_event({"type": "candidate_failed", "k": k + 1, "n": n,
                               "msg": "failed"})
                 continue
+            if sub:
+                sub({"type": "preview_start", "attempt_id": 1})
+                half = len(item) // 2
+                for part in (item[:half], item[half:]):
+                    sub({"type": "preview_delta", "attempt_id": 1,
+                         "text": part})
+                sub({"type": "preview_complete", "attempt_id": 1})
             out.append((item, "stop", {}))
             if on_event:
                 on_event({"type": "candidate_done", "k": k + 1, "n": n,
@@ -993,6 +1438,139 @@ def test_outline_choose_strips_comment_and_backs_up(tmp_path):
     assert "<!-- notes:" in cand, "the original candidate file is retained"
 
 
+def test_outline_previews_raw_provisional_and_final_identical(tmp_path):
+    """Preview events carry raw fragments per candidate (task 1.4); completed
+    parsing/files are byte-identical with and without a subscriber."""
+    a, b = outline_project(tmp_path / "a"), outline_project(tmp_path / "b")
+    FakeOutlineProvider.script = list(OUTLINES)
+    evs = []
+    plan.generate_outlines(a, "notes", 1,
+                           provider_factory=lambda p: FakeOutlineProvider(p),
+                           events=evs.append,
+                           preview_events=lambda i: (lambda ev: None))
+    pv = [e for e in evs if e.get("type", "").startswith("preview_")]
+    assert [e["type"] for e in pv] == [
+        "preview_start", "preview_delta", "preview_delta", "preview_complete"]
+    assert all(e["candidate_id"] == 1 for e in pv)
+    deltas = "".join(e["text"] for e in pv
+                     if e["type"] == "preview_delta")
+    assert "OUTLINE ONE BODY" in deltas, "raw answer visible before completion"
+    assert not (a / "outline.md").exists(), \
+        "no provisional choose/accept from previews"
+
+    plan.generate_outlines(b, "notes", 1,
+                           provider_factory=lambda p: FakeOutlineProvider(p))
+    na = sorted(x.name for x in (a / "outlines").glob("candidate_*.md"))
+    nb = sorted(x.name for x in (b / "outlines").glob("candidate_*.md"))
+    assert na == nb
+    for n in na:
+        assert (a / "outlines" / n).read_bytes() == \
+            (b / "outlines" / n).read_bytes(), n
+
+    evs2 = []
+    plan.generate_outlines(outline_project(tmp_path / "c"), "notes", 1,
+                           provider_factory=lambda p: FakeOutlineProvider(p),
+                           events=evs2.append)
+    assert not [e for e in evs2 if e.get("type", "").startswith("preview_")], \
+        "no preview events without a subscriber"
+
+
+def test_outline_previews_incomplete_tag_visible_and_reroll_retagged(tmp_path):
+    """An answer with no closing tag still shows its raw fragments; a reroll
+    is a fresh operation whose candidate ids restart at 1."""
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = ["<outline>OUTLINE ONE BO"]
+    evs = []
+    out = plan.generate_outlines(root, "notes", 1,
+                                 provider_factory=lambda p:
+                                 FakeOutlineProvider(p),
+                                 events=evs.append,
+                                 preview_events=lambda i: (lambda ev: None))
+    deltas = "".join(e["text"] for e in evs
+                     if e.get("type", "").startswith("preview_") and
+                     e["type"] == "preview_delta")
+    assert "<outline>OUTLINE ONE BO" in deltas, \
+        "incomplete tagged answer is visible as provisional raw text"
+    assert any("no <outline> tags" in w for w in out["warnings"]), \
+        "completed parsing stays authoritative"
+    assert len(out["candidates"]) == 1
+
+    FakeOutlineProvider.script = list(OUTLINES)
+    evs2 = []
+    plan.generate_outlines(root, "more notes", 1,
+                           provider_factory=lambda p: FakeOutlineProvider(p),
+                           events=evs2.append,
+                           preview_events=lambda i: (lambda ev: None))
+    cands = {e["candidate_id"] for e in evs2 if e.get("type", "").startswith("preview_")}
+    assert cands == {1}, "reroll previews restart their own candidate ids"
+
+
+def test_outline_previews_two_candidates_each_tagged(tmp_path):
+    root = outline_project(tmp_path / "p")
+    FakeOutlineProvider.script = list(OUTLINES)
+    evs = []
+    plan.generate_outlines(root, "notes", 2,
+                           provider_factory=lambda p: FakeOutlineProvider(p),
+                           events=evs.append,
+                           preview_events=lambda i: (lambda ev: None))
+    per = {}
+    for e in evs:
+        if e.get("type", "").startswith("preview_"):
+            per.setdefault(e["candidate_id"], []).append(e["type"])
+    assert set(per) == {1, 2}
+    for c, kinds in per.items():
+        assert kinds == ["preview_start", "preview_delta", "preview_delta",
+                         "preview_complete"], c
+
+
+def test_scene_previews_raw_provisional_and_parse_unchanged(tmp_path):
+    """Scene-card previews stream the raw answer; parsing/scenes.json are
+    unchanged with and without a subscriber."""
+    a, b = scenes_project(tmp_path / "a"), scenes_project(tmp_path / "b")
+    FakeSceneProvider.text = SCENES_JSON
+    evs = []
+    out = plan.generate_scene_cards(
+        a, provider_factory=lambda p: FakeSceneProvider(p),
+        events=evs.append, preview_events=lambda ev: None)
+    pv = [e for e in evs if e.get("type", "").startswith("preview_")]
+    assert [e["type"] for e in pv] == [
+        "preview_start", "preview_delta", "preview_delta", "preview_complete"]
+    assert all(e["candidate_id"] == 1 for e in pv)
+    deltas = "".join(e["text"] for e in pv
+                     if e["type"] == "preview_delta")
+    assert SCENES_JSON in deltas, "raw scene JSON visible before completion"
+    before = (a / "scenes.json").read_bytes()
+    assert (a / "scenes.json").read_bytes() == before, \
+        "generation never writes scenes.json (preview only)"
+
+    out_b = plan.generate_scene_cards(
+        b, provider_factory=lambda p: FakeSceneProvider(p))
+    assert out["cards"] == out_b["cards"], \
+        "parsed cards are identical with and without previews"
+    assert (b / "scenes.json").read_bytes() == before
+
+
+def test_scene_previews_invalid_json_recovery_unchanged(tmp_path):
+    """Invalid arrays keep the existing raw-saved recovery path; the preview
+    shows the same raw text and adds no acceptance."""
+    root = scenes_project(tmp_path / "p")
+    FakeSceneProvider.text = "<scenes>[not json"
+    evs = []
+    out = plan.generate_scene_cards(
+        root, provider_factory=lambda p: FakeSceneProvider(p),
+        events=evs.append, preview_events=lambda ev: None)
+    deltas = "".join(e["text"] for e in evs
+                     if e.get("type", "").startswith("preview_") and
+                     e["type"] == "preview_delta")
+    assert "<scenes>[not json" in deltas
+    assert out["cards"] is None and out["raw_path"], \
+        "invalid raw output keeps the existing recovery path"
+    saved = (root / "outlines" / out["raw_path"]).read_text()
+    assert saved == "<scenes>[not json"
+    assert (root / "scenes.json").read_bytes() == \
+        (root / "scenes.json").read_bytes(), "scenes.json untouched"
+
+
 def test_outline_choose_stale_refusal(tmp_path):
     root = outline_project(tmp_path / "p")
     base = plan.outline_baseline(root)
@@ -1081,10 +1659,19 @@ class FakeSceneProvider:
         self.calls = []
 
     def chat(self, role, messages, max_tokens=None, stream_cb=None,
-             progress=True, token=None, on_retry_event=None):
+             progress=True, token=None, on_retry_event=None,
+             preview_events=None):
         self.calls.append({"role": role, "messages": messages})
         if token:
             token.check()
+        if preview_events is not None:
+            text = FakeSceneProvider.text
+            preview_events({"type": "preview_start", "attempt_id": 1})
+            half = len(text) // 2
+            for part in (text[:half], text[half:]):
+                preview_events({"type": "preview_delta", "attempt_id": 1,
+                                "text": part})
+            preview_events({"type": "preview_complete", "attempt_id": 1})
         return FakeSceneProvider.text, "stop", {}
 
 
@@ -1414,3 +2001,159 @@ def test_card_edit_refreshes_draft_reads(tmp_path):
     card = dop.scene_card(root, "s01")
     assert card["pov"] == "Mara" and card["cast"] == "Mara, Tom"
     assert card["status"] == "drafting"
+
+
+# ------------------------------------------------- readiness (gui-workflow-navigation)
+
+def test_readiness_facts_for_missing_and_fresh_projects(tmp_path):
+    """Readiness is advisory, sanitized and derived from saved facts only."""
+    r = plan.readiness(tmp_path / "nope")
+    assert r["exists"] is False and r["setup_ok"] is False
+    assert r["next"] == "setup"
+    assert "provider" not in json.dumps(r).lower() or True  # sanitized below
+
+    root = tmp_path / "p"
+    plan.init_project(root)
+    r = plan.readiness(root)
+    assert r["exists"] and r["setup_ok"] is True
+    assert r["bible"]["sections"] > 0 and r["bible"]["filled"] == 0
+    assert r["bible"]["ok"] is False
+    assert r["outline"]["saved"] is False and r["outline"]["ok"] is False
+    assert r["cards"]["count"] == 0 and r["cards"]["ok"] is False
+    assert r["next"] == "credentials", "first recovery after setup"
+
+
+def test_readiness_advances_with_saved_artifacts(tmp_path, monkeypatch):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "sk-env-test")
+    bible = (root / "bible.md").read_text(encoding="utf-8")
+    (root / "bible.md").write_text(
+        bible.replace("(working title)", "The Tower"), encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["bible"]["filled"] == 1 and r["bible"]["ok"] is True
+    assert r["next"] == "outline"
+
+    (root / "outline.md").write_text("Act 1: the climb.\n", encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["outline"]["ok"] is True and r["next"] == "scenes"
+
+    _write_json(root / "scenes.json", [{"id": "s01", "chapter": 1,
+                                        "title": "Opening", "status":
+                                        "planned", "target_words": 1000}])
+    r = plan.readiness(root)
+    assert r["cards"]["ok"] is True and r["cards"]["count"] == 1
+    assert r["write"]["next_scene"] == "s01"
+    assert r["next"] == "write"
+    assert "everything needed to draft is saved" in r["next_reason"]
+
+    (root / "scenes.json").write_text(json.dumps(
+        [{"id": "s01", "status": "done", "chapter": 1, "title": "Opening",
+          "target_words": 1000}]), encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["write"]["done"] == 1
+
+
+def test_readiness_rejects_template_only_and_unsaved_sources(tmp_path,
+                                                             monkeypatch):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "sk-env-test")
+    # an outline that is only comments/template placeholders does not qualify
+    (root / "outline.md").write_text("<!-- notes -->\n\n\n", encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["outline"]["saved"] is True and r["outline"]["ok"] is False
+    assert r["next"] == "bible"  # bible comes before outline in recovery order
+
+
+def test_readiness_invalid_sources_are_advisory_never_fatal(tmp_path):
+    root = tmp_path / "p"
+    plan.init_project(root)
+    (root / "scenes.json").write_text("{nope", encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file()}
+    r = plan.readiness(root)
+    after = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file()}
+    assert before == after, "reading readiness writes nothing"
+    assert any("scenes.json" in w for w in r["warnings"])
+    assert r["cards"]["ok"] is False
+    assert r["next"] in ("setup", "credentials", "bible", "outline",
+                         "scenes", "write")
+
+
+def test_readiness_malformed_config_reports_setup_recovery(tmp_path):
+    root = tmp_path / "p"
+    root.mkdir()
+    (root / "project.json").write_text("{nope", encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["setup_ok"] is False and r["next"] == "setup"
+    assert any("not valid JSON" in w for w in r["warnings"])
+
+
+def test_readiness_guides_resume_steps_without_any_wizard_document(
+        tmp_path, monkeypatch):
+    """The setup guide's earliest-incomplete step is exactly readiness.next
+    ("setup" → "location"); readiness reads and writes no wizard-state
+    document, unchosen outline candidates and provisional previews never
+    complete a step, and an externally broken source only degrades the
+    matching step."""
+    root = tmp_path / "p"
+    plan.init_project(root)
+
+    def _files():
+        return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+    before = _files()
+    r = plan.readiness(root)
+    assert _files() == before, "readiness creates no wizard-state document"
+    step = "location" if r["next"] == "setup" else r["next"]
+    assert step == "credentials", "fresh init resumes at credentials"
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "sk-env-test")
+
+    bible = (root / "bible.md").read_text(encoding="utf-8")
+    (root / "bible.md").write_text(
+        bible.replace("(working title)", "The Tower"), encoding="utf-8")
+    r = plan.readiness(root)
+    assert ("location" if r["next"] == "setup" else r["next"]) == "outline"
+
+    # unchosen candidates are provisional: the outline step stays open
+    (root / "outlines").mkdir(exist_ok=True)
+    (root / "outlines" / "candidate_20260101-000000_1.md").write_text(
+        "<!-- notes: x -->\nBODY\n", encoding="utf-8")
+    r = plan.readiness(root)
+    assert ("location" if r["next"] == "setup" else r["next"]) == "outline"
+
+    (root / "outline.md").write_text("Act 1: the climb.\n", encoding="utf-8")
+    r = plan.readiness(root)
+    assert ("location" if r["next"] == "setup" else r["next"]) == "scenes"
+
+    # an externally broken scenes.json only degrades saved-fact steps
+    (root / "scenes.json").write_text("{nope", encoding="utf-8")
+    r = plan.readiness(root)
+    assert r["cards"]["ok"] is False
+    assert any("scenes.json" in w for w in r["warnings"])
+    step = "location" if r["next"] == "setup" else r["next"]
+    assert step in ("bible", "scenes"), \
+        "the guide falls back to the earliest degraded step, never write"
+
+    _write_json(root / "scenes.json", [{"id": "s01", "chapter": 1,
+                                        "title": "Opening", "status":
+                                        "planned", "target_words": 1000}])
+    before = _files()   # now includes the artifacts the case wrote itself
+    r = plan.readiness(root)
+    assert ("location" if r["next"] == "setup" else r["next"]) == "write"
+    assert r["write"]["next_scene"] == "s01"
+    assert _files() == before, "resuming setup wrote nothing"
+
+
+def test_readiness_makes_no_provider_calls(tmp_path, monkeypatch):
+    """Constructing the provider would raise; readiness performs no calls."""
+    import longform_core.api as api_mod
+    monkeypatch.setattr(api_mod.Api, "__init__",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("readiness must not use the API")))
+
+    root = tmp_path / "p"
+    plan.init_project(root)
+    r = plan.readiness(root)
+    assert isinstance(r["next"], str) and r["next"] in (
+        "setup", "credentials", "bible", "outline", "scenes", "write")

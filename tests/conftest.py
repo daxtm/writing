@@ -5,6 +5,8 @@ credentials, and fails closed on any real network access -- in-process and in
 subprocesses (checker/CLI runs) via a temporary sitecustomize.py on PYTHONPATH.
 """
 
+import builtins
+import io
 import os
 import socket
 import sys
@@ -22,9 +24,50 @@ import longform  # noqa: E402
 
 CREDENTIAL_VARS = ("FEATHERLESS_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 
+# The owner's original selected source files (ADR-0010). Never read, renamed or
+# modified by any test, build or runtime path; the reviewed copies tracked under
+# longform_core/resources/ are the only permitted derivatives.
+ORIGINAL_SOURCES = (
+    Path("/home/daxtm/Documents/fuckpi/project.json"),
+    Path("/home/daxtm/Documents/fuckpi/56295265-LLam_ception-1.3.json"),
+)
+
 
 def _refuse(*_args, **_kwargs):
     raise AssertionError("real network access attempted during tests")
+
+
+@pytest.fixture(autouse=True)
+def original_sources_read_guard(monkeypatch):
+    """No test process may open the owner's original source files (ADR-0010).
+
+    Applies to builtins.open and io.open (Path.read_text/read_bytes) for the
+    exact absolute paths only; the files themselves are never renamed, moved or
+    modified.
+    """
+    blocked = {str(p) for p in ORIGINAL_SOURCES}
+    real_b_open, real_io_open = builtins.open, io.open
+
+    def _blocked(file):
+        try:
+            return str(Path(file).resolve()) in blocked
+        except (OSError, TypeError, ValueError):
+            return str(file) in blocked
+
+    def guarded_b_open(file, *a, **k):
+        if _blocked(file):
+            raise AssertionError(
+                "tests must never read the owner's original source files")
+        return real_b_open(file, *a, **k)
+
+    def guarded_io_open(file, *a, **k):
+        if _blocked(file):
+            raise AssertionError(
+                "tests must never read the owner's original source files")
+        return real_io_open(file, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", guarded_b_open)
+    monkeypatch.setattr(io, "open", guarded_io_open)
 
 
 @pytest.fixture(autouse=True)

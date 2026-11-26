@@ -8,6 +8,7 @@ lore) runs as a shared draft_operations call on one background worker
 touches widgets. No terminal helpers, external editors or subprocesses.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -16,12 +17,12 @@ from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-    QSpinBox, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget, QLineEdit,
 )
 
 from .prompt import tail_trim_chars
-from .utils import word_diff
+from .utils import redact_text, word_diff
 from .gui import launch_advice
 from . import draft_operations as dop
 from . import planning_operations as plan
@@ -39,11 +40,98 @@ def pre_start_guidance():
 
 REFRESH_MS = 2000
 
-# Tabs
-MANUSCRIPT, BRANCHES, DRAFT, SCENE, CONTEXT, LORE, NOTES = 0, 1, 2, 3, 4, 5, 6
-SETUP, BIBLE = 7, 8
-OUTLINE, SCENES = 9, 10
-CONTINUITY, REVIEW, REVISION, STATUS = 11, 12, 13, 14
+# Four primary stages (semantic routes; never numeric tab walls).
+STAGE_ORDER = ("plan", "write", "review", "export")
+STAGE_TITLES = {"plan": "&Plan", "write": "&Write", "review": "&Review",
+                "export": "&Export"}
+STAGE_PURPOSE = {
+    "plan": "Plan — set up the project, answer the story bible, save the "
+            "outline and the scene cards. Inputs: this directory, a writer "
+            "preset and (for generated planning) provider credentials. "
+            "Output: project.json, bible.md, outline.md, scenes.json.",
+    "write": "Write — draft the selected scene: saved steering, candidate "
+             "generation and acceptance, manual passages, branches, lore "
+             "and notes. Input: accepted scene cards. Output: "
+             "trees/<scene>.json.",
+    "review": "Review — continuity (state/summaries), compression, "
+              "critique/check reports and passage revision for saved "
+              "scenes. Input: saved prose and summaries. Output: "
+              "state.md, summaries.json, critiques/, checks/.",
+    "export": "Export — pick a destination and export the manuscript; the "
+              "full saved status stays read-only. Output: the picked "
+              "manuscript file.",
+}
+# Stage-local secondary tools (labelled panels, not equal-priority tabs).
+STAGE_TOOLS = {
+    "plan": ("overview", "setup", "bible", "outline", "scenes"),
+    "write": ("manuscript", "branches", "draft", "scene", "context",
+              "lore", "notes"),
+    "review": ("continuity", "reports", "revision"),
+    "export": ("status",),
+}
+TOOL_TITLES = {
+    "overview": "Overview", "setup": "Project settings", "bible": "Bible",
+    "outline": "Outline", "scenes": "Scene plan",
+    "manuscript": "Manuscript", "branches": "Branches", "draft": "Draft",
+    "scene": "Scene", "context": "Context", "lore": "Lore", "notes": "Notes",
+    "continuity": "Continuity", "reports": "Reports", "revision": "Revision",
+    "status": "Export & status",
+}
+# Ordered setup guide (gui-project-setup-wizard): presentation keys only.
+# Resume derives from saved artifacts via planning_operations.readiness()
+# (whose `next` uses exactly these keys, with "setup" → "location"); no
+# wizard-owned document exists.
+SETUP_STEPS = ("location", "credentials", "bible", "outline", "scenes",
+               "write")
+SETUP_STEP_TITLES = {
+    "location": "Location, title and defaults",
+    "credentials": "Credentials",
+    "bible": "Story bible answers",
+    "outline": "Outline",
+    "scenes": "Scene cards",
+    "write": "First unfinished scene",
+}
+SETUP_STEP_INSTRUCTIONS = {
+    "location":
+        "Step 1 of 6 — Location, title and defaults. Type a title, press "
+        "Create project and pick the directory: complete bundled defaults "
+        "(project.json with a forced empty api_key, bible.md, state.md, "
+        "scenes.json, summaries.json and the bundled nonsecret "
+        "writer_preset.json) are initialized locally with no provider call. "
+        "Existing files are never replaced; a stopped run keeps what it "
+        "wrote and a retry fills only missing paths.",
+    "credentials":
+        "Step 2 of 6 — Credentials. Paste a masked key and press Use for "
+        "this session (this window only), or Save to this project after "
+        "the plaintext warning; Test connection is the only request. "
+        "Optional for local and manual work — generated planning needs a "
+        "key. The value is never displayed or prefilled.",
+    "bible":
+        "Step 3 of 6 — Story bible answers. Begin answering, fill the "
+        "fixed form and Save answers (bible.md is unchanged), then press "
+        "Accept section to replace only that section. Entirely local: no "
+        "AI bible call exists. Skipped or still-template sections stay "
+        "visibly incomplete without blocking unrelated work.",
+    "outline":
+        "Step 4 of 6 — Outline. Generate outlines and Reroll are provider "
+        "requests that may cost money; every candidate streams into a "
+        "provisional live preview. Choose as outline.md (or Save edited "
+        "outline) is the only way outline.md changes. Back/Next never "
+        "generate, choose or accept, and they never start scene planning.",
+    "scenes":
+        "Step 5 of 6 — Scene cards. Generate cards is a provider request "
+        "that may cost money and streams the raw JSON into a provisional "
+        "preview; edit validated cards, then Accept preview replaces "
+        "scenes.json (previous list backed up, trees kept). Regenerating "
+        "drafted scenes confirms first.",
+    "write":
+        "Step 6 of 6 — Enter Write opens the first saved scene that is "
+        "not marked done with its saved head and steering. It is "
+        "navigation: it never generates, accepts, marks done or updates "
+        "continuity. All scenes done means an explicit sidebar selection "
+        "instead; nothing is reset.",
+}
+
 # Sidebar item kinds
 KIND_MANUSCRIPT = "manuscript"
 KIND_NODE = "node"
@@ -106,6 +194,7 @@ class MainWindow(QMainWindow):
         self._choice = choice or _ask_choice
         self._timer_factory = timer_factory
         self._provider_factory = provider_factory
+        self._session_key = None      # window-only credential (ADR-0011); never config/environment
         self._picker = picker or self._default_picker
         self._dir_picker = dir_picker or self._default_dir_picker
         self._preset_picker = preset_picker or self._default_preset_picker
@@ -122,7 +211,10 @@ class MainWindow(QMainWindow):
         self._revision = None        # shared revise session + active passage
         self._rev_editing = False
         self._status_facts = None    # last read-only status overview
-        self._plan = plan.project_overview(self._root)
+        self._plan = plan.project_overview(self._root,
+                                           session=self._availability())
+        self._ready = plan.readiness(self._root,
+                                     session=self._availability())
 
         self.snap = None              # last valid Snapshot
         self._stale_config = False    # required configuration currently invalid
@@ -165,6 +257,10 @@ class MainWindow(QMainWindow):
         self._bible_preview_is_current = True
         self._outline_overview = None
         self._outline_candidates = []   # candidate names generated this session
+        self._op_previews = {}   # (candidate_id, attempt_id) -> {text,status}
+        self._op_preview_latest = {}   # candidate_id -> latest attempt seen
+        self._op_preview_row = None   # selected live-preview candidate
+        self._preview_dirty = False   # a delta flush is pending this loop turn
         self._outline_notes_loaded = None
         self._outline_body_loaded = None
         self._scenes_overview = None
@@ -172,8 +268,18 @@ class MainWindow(QMainWindow):
         self._scenes_card_row = None
         self._scenes_preview_baseline = None
         self._scenes_force_once = False
+        # Setup guide state (gui-project-setup-wizard): transient window
+        # state only — resume is derived from saved artifacts, never from
+        # a wizard-owned document, and no guide flag is persisted.
+        self._guide_active = False
+        self._guide_step = "location"
+        self._guide_row_guard = False
+        self._guide_dir = None        # location picked on the guide step
+        self._pending_title = None    # carried with the pending Create
+        self._pending_guide_leave = False  # resume-later save settling
         try:
-            self._session = dop.session_info(self._root)
+            self._session = dop.session_info(
+                self._root, session=self._availability())
         except dop.OpError as e:
             self._session = {"swipes": 1, "passage_words": 220, "model": "",
                              "preset_found": False, "creds_ok": False,
@@ -186,9 +292,72 @@ class MainWindow(QMainWindow):
         self._wire_tab_order()
         self.refresh(force=True)
         self._autoselect()
+        # Plan is the initial page for a project without scene cards yet; a
+        # planned project opens Write (readiness is refined on refresh).
+        self.select_stage("write" if self._card_ids() else "plan")
         self._start_timer()
 
     # ------------------------------------------------------------------ UI
+
+    def _availability(self):
+        """Availability input for shared ops: this window's session credential
+        (ADR-0011). False lets the ops resolve project then environment."""
+        return bool(self._session_key)
+
+    def _credential_secrets(self):
+        """Every nonempty credential value this window knows (session,
+        saved project, configured environment) for redaction before events,
+        logs and persistence (ADR-0011). Never returned to callers that
+        display text."""
+        vals = []
+        if self._session_key:
+            vals.append(self._session_key)
+        try:
+            p = dop._project_of(plan.canonical_root(self._root))
+            for v in dop.redaction_secrets(p):
+                if v and v not in vals:
+                    vals.append(v)
+        except Exception:  # noqa: BLE001 — invalid config still redacts the session value
+            pass
+        return tuple(vals)
+
+    def _scrub_display(self, text):
+        """Redact every credential value this window knows from one
+        display/diagnostic string (ADR-0011)."""
+        return redact_text(text, self._credential_secrets())
+
+    def _seam(self):
+        """Provider factory for this window's provider calls (ADR-0007 and
+        ADR-0011): captures the current session credential and redaction
+        context before dispatch. The production wrapper constructs `Api`
+        with the session override; an injected test factory stays usable and
+        is annotated with the same redaction context. No session means the
+        unchanged factory-or-Api behavior."""
+        base = self._provider_factory
+        if not self._session_key:
+            return base
+        session = self._session_key
+        secrets = self._credential_secrets()
+
+        def factory(p):
+            from .api import Api
+            if base is not None:
+                provider = base(p)
+            else:
+                provider = Api(p, session_key=session)
+            if isinstance(provider, Api) and provider.session_key != session:
+                provider = Api(p, session_key=session)
+            try:
+                provider.secrets = secrets
+            except AttributeError:
+                pass
+            if hasattr(provider, "session_key"):
+                try:
+                    provider.session_key = session
+                except AttributeError:
+                    pass
+            return provider
+        return factory
 
     def _build_ui(self):
         central = QWidget()
@@ -200,10 +369,13 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         top.setSpacing(6)
         self.create_btn = QPushButton("Create…")
-        self.create_btn.setToolTip("Initialize a project directory with the "
-                                   "CLI init contents (create-missing-only; "
-                                   "existing files are never replaced)")
-        self.create_btn.clicked.connect(self.create_project)
+        self.create_btn.setToolTip("Open the ordered setup guide at the "
+                                   "location step: a title and a picked "
+                                   "directory initialize the CLI init "
+                                   "contents (create-missing-only; existing "
+                                   "files are never replaced). Nothing is "
+                                   "created until Create project is pressed.")
+        self.create_btn.clicked.connect(self.create_guide)
         top.addWidget(self.create_btn)
         self.open_btn = QPushButton("Open…")
         self.open_btn.setToolTip("Open an existing project directory; "
@@ -224,6 +396,13 @@ class MainWindow(QMainWindow):
         self.prose_size.valueChanged.connect(self._apply_prose_size)
         top.addWidget(self.prose_size)
         top.addStretch(1)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setToolTip("Cooperatively stop the running operation "
+                                 "at the next request/chunk/save boundary; "
+                                 "completed writes stay saved")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop)
+        top.addWidget(self.stop_btn)
         root.addLayout(top)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -236,33 +415,558 @@ class MainWindow(QMainWindow):
         right = QWidget()
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(0, 0, 0, 0)
-        self.tabs = QTabWidget()
+        self.stages = QTabWidget()
+        self._stage_pages = {}    # stage key -> page widget
+        self._stage_tools = {}    # stage key -> tool QTabWidget (None for a
+                                  # single-page stage)
+        self.stage_purpose = {}   # stage key -> purpose/next-action label
         self.reading = QPlainTextEdit()
         self.reading.setReadOnly(True)
         self.metadata = QPlainTextEdit()
         self.metadata.setReadOnly(True)
-        self.tabs.addTab(self.reading, "Manuscript")
+
+        # ---- Plan: overview + settings/credentials/preset, bible, outline,
+        # scene plan.
+        plan_page = QWidget()
+        plan_l = QVBoxLayout(plan_page)
+        plan_l.setContentsMargins(0, 0, 0, 0)
+        self._stage_pages["plan"] = plan_page
+        self.stage_purpose["plan"] = QLabel(STAGE_PURPOSE["plan"])
+        self.stage_purpose["plan"].setWordWrap(True)
+        plan_l.addWidget(self.stage_purpose["plan"])
+        plan_tools = QTabWidget()
+        self._stage_tools["plan"] = plan_tools
+        plan_tools.addTab(self._build_plan_overview(),
+                          TOOL_TITLES["overview"])
+        plan_tools.addTab(self._build_setup_tab(), TOOL_TITLES["setup"])
+        plan_tools.addTab(self._build_bible_tab(), TOOL_TITLES["bible"])
+        plan_tools.addTab(self._build_outline_tab(), TOOL_TITLES["outline"])
+        plan_tools.addTab(self._build_scenes_tab(), TOOL_TITLES["scenes"])
+        # The plan tools double as the guide's step content: the guide
+        # chrome sits above this stack and a guide step just selects the
+        # matching tool — there is no second copy of any editor (the
+        # location and Write handoff steps have their own guide-only
+        # pages because they are navigation, not planning panes).
+        self._guide_stack = QStackedWidget()
+        self._guide_stack.addWidget(plan_tools)              # 0: tool pane
+        self._guide_stack.addWidget(self._build_guide_location())  # 1
+        self._guide_stack.addWidget(self._build_guide_write())     # 2
+        plan_l.addWidget(self._guide_stack, 1)
+        self._guide_chrome = self._build_guide_chrome()
+        plan_l.addWidget(self._guide_chrome)
+        self._guide_chrome.setVisible(False)
+        self.stages.addTab(plan_page, STAGE_TITLES["plan"])
+
+        # ---- Write: manuscript/branches/draft tools + scene-labelled
+        # steering, candidate count and Generate.
+        write_page = QWidget()
+        write_l = QVBoxLayout(write_page)
+        write_l.setContentsMargins(0, 0, 0, 0)
+        self._stage_pages["write"] = write_page
+        self.stage_purpose["write"] = QLabel(STAGE_PURPOSE["write"])
+        self.stage_purpose["write"].setWordWrap(True)
+        write_l.addWidget(self.stage_purpose["write"])
+        write_tools = QTabWidget()
+        self._stage_tools["write"] = write_tools
+        write_tools.addTab(self.reading, TOOL_TITLES["manuscript"])
         branch_widget = QWidget()
         branch_l = QVBoxLayout(branch_widget)
         branch_l.setContentsMargins(0, 0, 0, 0)
         branch_l.addLayout(self._build_branches_controls())
         branch_l.addWidget(self.metadata, 1)
-        self.tabs.addTab(branch_widget, "Branches")
-        self.tabs.addTab(self._build_draft_tab(), "Draft")
-        self.tabs.addTab(self._build_scene_tab(), "Scene")
-        self.tabs.addTab(self._build_context_tab(), "Context")
-        self.tabs.addTab(self._build_lore_tab(), "Lore")
-        self.tabs.addTab(self._build_notes_tab(), "Notes")
-        self.tabs.addTab(self._build_setup_tab(), "Setup")
-        self.tabs.addTab(self._build_bible_tab(), "Bible")
-        self.tabs.addTab(self._build_outline_tab(), "Outline")
-        self.tabs.addTab(self._build_scenes_tab(), "Scenes")
-        self.tabs.addTab(self._build_continuity_tab(), "Continuity")
-        self.tabs.addTab(self._build_review_tab(), "Review")
-        self.tabs.addTab(self._build_revision_tab(), "Revision")
-        self.tabs.addTab(self._build_status_tab(), "Status")
-        right_l.addWidget(self.tabs, 1)
+        write_tools.addTab(branch_widget, TOOL_TITLES["branches"])
+        write_tools.addTab(self._build_draft_tab(), TOOL_TITLES["draft"])
+        write_tools.addTab(self._build_scene_tab(), TOOL_TITLES["scene"])
+        write_tools.addTab(self._build_context_tab(), TOOL_TITLES["context"])
+        write_tools.addTab(self._build_lore_tab(), TOOL_TITLES["lore"])
+        write_tools.addTab(self._build_notes_tab(), TOOL_TITLES["notes"])
+        write_l.addWidget(write_tools, 1)
+        write_l.addWidget(self._build_steering_box())
+        self.stages.addTab(write_page, STAGE_TITLES["write"])
 
+        # ---- Review: continuity, reports, revision.
+        review_page = QWidget()
+        review_l = QVBoxLayout(review_page)
+        review_l.setContentsMargins(0, 0, 0, 0)
+        self._stage_pages["review"] = review_page
+        self.stage_purpose["review"] = QLabel(STAGE_PURPOSE["review"])
+        self.stage_purpose["review"].setWordWrap(True)
+        review_l.addWidget(self.stage_purpose["review"])
+        review_tools = QTabWidget()
+        self._stage_tools["review"] = review_tools
+        review_tools.addTab(self._build_continuity_tab(),
+                            TOOL_TITLES["continuity"])
+        review_tools.addTab(self._build_review_tab(), TOOL_TITLES["reports"])
+        review_tools.addTab(self._build_revision_tab(),
+                            TOOL_TITLES["revision"])
+        review_l.addWidget(review_tools, 1)
+        self.stages.addTab(review_page, STAGE_TITLES["review"])
+
+        # ---- Export: destination-picked export and read-only full status.
+        export_page = QWidget()
+        export_l = QVBoxLayout(export_page)
+        export_l.setContentsMargins(0, 0, 0, 0)
+        self._stage_pages["export"] = export_page
+        self.stage_purpose["export"] = QLabel(STAGE_PURPOSE["export"])
+        self.stage_purpose["export"].setWordWrap(True)
+        export_l.addWidget(self.stage_purpose["export"])
+        self._stage_tools["export"] = None   # one labelled page, no tool wall
+        export_l.addWidget(self._build_status_tab(), 1)
+        self.stages.addTab(export_page, STAGE_TITLES["export"])
+
+        right_l.addWidget(self.stages, 1)
+        # Accessible names and mnemonics: stage titles carry unique Alt
+        # mnemonics (&Plan/&Write/&Review/&Export); each tool selector is
+        # named after its stage so screen readers announce the route.
+        self.stages.tabBar().setAccessibleName("Writing stages")
+        for stage, tw in self._stage_tools.items():
+            if tw is not None:
+                tw.tabBar().setAccessibleName(
+                    f"{STAGE_TITLES[stage].replace('&', '')} tools")
+        self.stages.currentChanged.connect(self._on_stage_changed)
+        split.addWidget(right)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 3)
+        root.addWidget(split, 1)
+
+        self.status = QLabel("")
+        self.statusBar().addWidget(self.status, 1)
+        self.select_stage("plan")
+
+    def _build_plan_overview(self):
+        """Read-only project overview (saved-artifact readiness); the Plan
+        stage's focused default. Filled by refresh; never writes or calls."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.plan_summary = QLabel("")
+        self.plan_summary.setWordWrap(True)
+        l.addWidget(self.plan_summary)
+        self.plan_next_btn = QPushButton("Go")
+        self.plan_next_btn.setToolTip("Open the recommended next Plan/Write "
+                                      "tool; never starts an operation")
+        self.plan_next_btn.clicked.connect(self._plan_next)
+        self.resume_setup_btn = QPushButton("Resume setup")
+        self.resume_setup_btn.setToolTip("Open the ordered setup guide at "
+                                         "the earliest incomplete saved "
+                                         "step; navigation never "
+                                         "initializes, generates, chooses "
+                                         "or accepts. A complete setup "
+                                         "reopens the guide for review "
+                                         "without regenerating anything.")
+        self.resume_setup_btn.clicked.connect(
+            lambda: self._enter_setup_guide())
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Recommended next step:"))
+        row.addWidget(self.plan_next_btn)
+        row.addWidget(self.resume_setup_btn)
+        row.addStretch(1)
+        l.addLayout(row)
+        self.plan_overview = QPlainTextEdit()
+        self.plan_overview.setReadOnly(True)
+        self.plan_overview.setPlaceholderText(
+            "Project identity, saved planning progress, credential source "
+            "and invalid-source warnings appear here; viewing writes "
+            "nothing and makes no provider call.")
+        l.addWidget(self.plan_overview, 1)
+        return box
+
+    # ------------------------------------------------------- setup guide
+
+    def _build_guide_chrome(self):
+        """Setup guide chrome: step list, heading/instructions and the
+        navigation buttons. Back/Next/Save and resume later/Advanced
+        planning never generate, choose, accept, discard or initialize."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.setup_step_label = QLabel("")
+        self.setup_step_label.setWordWrap(True)
+        self.setup_step_label.setAccessibleName("Setup guide step")
+        l.addWidget(self.setup_step_label)
+        self.setup_step_list = QListWidget()
+        self.setup_step_list.setAccessibleName("Setup guide steps")
+        self.setup_step_list.setMaximumHeight(104)
+        self.setup_step_list.setToolTip(
+            "The ordered setup steps; selecting one only moves the guide — "
+            "no action runs and no saved work changes")
+        for key in SETUP_STEPS:
+            self.setup_step_list.addItem(
+                QListWidgetItem(SETUP_STEP_TITLES[key]))
+        self.setup_step_list.currentRowChanged.connect(self._on_guide_step_row)
+        l.addWidget(self.setup_step_list)
+        btns = QHBoxLayout()
+        self.setup_back_btn = QPushButton("&Back")
+        self.setup_back_btn.setToolTip("Move to the previous step; a pure "
+                                       "navigation action that never "
+                                       "generates, chooses, accepts or "
+                                       "discards anything")
+        self.setup_back_btn.clicked.connect(self.setup_back)
+        self.setup_next_btn = QPushButton("&Next")
+        self.setup_next_btn.setToolTip("Move to the next step and explain "
+                                       "what it is still missing; never an "
+                                       "implicit Generate, Choose, Accept "
+                                       "or Discard")
+        self.setup_next_btn.clicked.connect(self.setup_next)
+        self.setup_resume_later_btn = QPushButton("Save and resume later")
+        self.resume_later_mnemonic = "S and resume la&ter"
+        self.setup_resume_later_btn.setText(self.resume_later_mnemonic)
+        self.setup_resume_later_btn.setToolTip(
+            "Offer to save dirty forms, wait for a successful save, then "
+            "return to Plan. Saved answers and edits are never an implicit "
+            "Accept, and no provider action runs.")
+        self.setup_resume_later_btn.clicked.connect(self.setup_resume_later)
+        self.setup_advanced_btn = QPushButton("A&dvanced planning")
+        self.setup_advanced_btn.setToolTip("Leave the guide for the "
+                                           "ordinary Plan tools; every "
+                                           "manual/advanced path stays "
+                                           "reachable and nothing changes")
+        self.setup_advanced_btn.clicked.connect(self._leave_guide)
+        for b in (self.setup_back_btn, self.setup_next_btn,
+                  self.setup_resume_later_btn, self.setup_advanced_btn):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        return box
+
+    def _build_guide_location(self):
+        """Guide location step: title, bundled-defaults summary and the
+        explicit Create project action (the directory picker opens from
+        that action); an existing valid project shows identity guidance."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.setup_identity_label = QLabel("")
+        self.setup_identity_label.setWordWrap(True)
+        l.addWidget(self.setup_identity_label)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Title"))
+        self.setup_title_edit = QLineEdit()
+        self.setup_title_edit.setPlaceholderText(
+            "Project title (optional; Untitled by default; used only when "
+            "project.json is newly created)")
+        self.setup_title_edit.setAccessibleName("New project title")
+        row.addWidget(self.setup_title_edit, 1)
+        l.addLayout(row)
+        self.setup_defaults_label = QLabel(
+            "Create project initializes, with no provider call and no "
+            "preset download: project.json (supported nonsecret defaults, "
+            "forced empty api_key, FEATHERLESS_API_KEY environment name), "
+            "bible.md, state.md, scenes.json, summaries.json and the "
+            "bundled nonsecret writer_preset.json. Existing files are "
+            "never replaced. A directory picker opens when you press "
+            "Create project.")
+        self.setup_defaults_label.setWordWrap(True)
+        l.addWidget(self.setup_defaults_label)
+        btns = QHBoxLayout()
+        self.setup_create_btn = QPushButton("&Create project")
+        self.setup_create_btn.setToolTip(
+            "Initialize the picked directory with the complete bundled "
+            "defaults (create-missing-only; a name collision or a stopped "
+            "run reports partial paths and a retry fills only the missing "
+            "ones). No provider call runs.")
+        self.setup_create_btn.clicked.connect(self.create_project)
+        btns.addWidget(self.setup_create_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        l.addStretch(1)
+        return box
+
+    def _build_guide_write(self):
+        """Guide Write handoff: read-only saved-facts summary and the
+        explicit Enter Write navigation action."""
+        box = QWidget()
+        l = QVBoxLayout(box)
+        l.setContentsMargins(0, 0, 0, 0)
+        self.setup_write_label = QLabel("")
+        self.setup_write_label.setWordWrap(True)
+        l.addWidget(self.setup_write_label)
+        self.setup_enter_write_btn = QPushButton("Enter &Write")
+        self.setup_enter_write_btn.setToolTip(
+            "Select the first saved scene that is not marked done and open "
+            "the Write stage with its saved head and steering. Navigation "
+            "only: no generation, acceptance, mark-done or continuity "
+            "update runs.")
+        self.setup_enter_write_btn.clicked.connect(self.setup_enter_write)
+        btns = QHBoxLayout()
+        btns.addWidget(self.setup_enter_write_btn)
+        btns.addStretch(1)
+        l.addLayout(btns)
+        self.setup_write_hint = QLabel(
+            "All scenes done, or no valid saved cards? The status line "
+            "explains the deliberate manual selection; nothing is ever "
+            "reset or generated on this step.")
+        self.setup_write_hint.setWordWrap(True)
+        l.addWidget(self.setup_write_hint)
+        l.addStretch(1)
+        return box
+
+    def _setup_resume_step(self):
+        """Earliest incomplete guide step from the saved-artifact readiness
+        facts (the shared source of truth; no wizard-state document)."""
+        r = self._ready or {}
+        nxt = r.get("next", "setup")
+        return "location" if nxt == "setup" else nxt
+
+    def _enter_setup_guide(self, step=None):
+        """Open the ordered setup guide (Create, or Plan's Resume/Reopen
+        setup). Entering is view-only: no initialization, provider request
+        or automatic content acceptance ever runs here."""
+        if step is None:
+            step = self._setup_resume_step()
+        if step not in SETUP_STEPS:
+            step = "location"
+        self._guide_active = True
+        self._guide_step = step
+        self.select_stage("plan")
+        self._guide_chrome.setVisible(True)
+        self._apply_guide_step()
+
+    def _after_save_settle(self):
+        """A Save dispatched by Save-and-resume-later returns to Plan after
+        the write settles; saved answers are never an implicit Accept and no
+        provider action runs."""
+        if not self._pending_guide_leave:
+            return
+        self._pending_guide_leave = False
+        self._leave_guide()
+        self._status("Setup guide closed; saved progress resumes from the "
+                     "saved artifacts (Plan → Resume setup).")
+
+    def _leave_guide(self):
+        """Advanced planning / resume later: hide the guide chrome and
+        return to the ordinary Plan tools. Everything stays as it is."""
+        self._guide_active = False
+        self._guide_chrome.setVisible(False)
+        self._guide_stack.setCurrentIndex(0)
+        self.select_stage("plan")
+        self._wire_tab_order()
+
+    def _guide_step_row(self, step):
+        return SETUP_STEPS.index(step) if step in SETUP_STEPS else 0
+
+    def _on_guide_step_row(self, row):
+        if not self._guide_active or self._guide_row_guard:
+            return
+        if 0 <= row < len(SETUP_STEPS):
+            self._guide_step = SETUP_STEPS[row]
+            self._apply_guide_step()
+
+    def _apply_guide_step(self):
+        """Show one step: its instructions plus the existing pane (or the
+        guide-only location/Write pages). Step changes are navigation."""
+        step = self._guide_step
+        idx = SETUP_STEPS.index(step)
+        self._guide_row_guard = True
+        try:
+            self.setup_step_list.setCurrentRow(idx)
+        finally:
+            self._guide_row_guard = False
+        self.setup_step_label.setText(self._guide_step_text(step))
+        if step == "location":
+            self._guide_stack.setCurrentIndex(1)
+            self._update_guide_location()
+        elif step == "write":
+            self._guide_stack.setCurrentIndex(2)
+            self._update_guide_write()
+        else:
+            self._guide_stack.setCurrentIndex(0)
+            self.select_tool({"credentials": "setup"}.get(step, step))
+        self.setup_back_btn.setEnabled(idx > 0)
+        self.setup_next_btn.setEnabled(idx < len(SETUP_STEPS) - 1)
+        self._wire_tab_order()
+
+    def _downstream_note(self):
+        """Plain saved-facts note about downstream work when saved planning
+        is replaced: existing scene cards and draft trees stay unchanged
+        (they are not regenerated, deleted or re-synchronized)."""
+        base = plan.canonical_root(self._root)
+        scenes = None
+        try:
+            sp = base / "scenes.json"
+            if sp.is_file():
+                scenes = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — a malformed list still counts
+            scenes = None
+        cards = len(scenes) if isinstance(scenes, list) else 0
+        trees = 0
+        try:
+            td = base / "trees"
+            if td.is_dir():
+                trees = sum(1 for _ in td.glob("*.json"))
+        except OSError:
+            trees = 0
+        if not cards and not trees:
+            return None
+        bits = []
+        if cards:
+            bits.append(f"{cards} saved scene card(s)")
+        if trees:
+            bits.append(f"{trees} saved tree file(s)")
+        return ("existing " + " and ".join(bits) + " stay unchanged: "
+                "they are not regenerated or deleted")
+
+    def _guide_step_text(self, step):
+        """Step instructions plus the current saved-facts state."""
+        base = SETUP_STEP_INSTRUCTIONS[step]
+        extra = []
+        r = self._ready or {}
+        if step == "location":
+            if r.get("exists") and r.get("config_ok"):
+                extra.append(
+                    f"This directory already has a project (title "
+                    f"{r.get('title') or '(untitled)'}); Create fills only "
+                    "missing files and never replaces existing "
+                    "title/settings.")
+        elif step == "credentials":
+            if not r.get("creds_ok"):
+                extra.append("No effective credential yet; local tools "
+                             "work without one.")
+        elif step == "bible":
+            b = r.get("bible") or {}
+            if b.get("filled"):
+                extra.append(f"{b['filled']} of {b['sections']} saved "
+                             "section(s) accepted.")
+            if b.get("placeholders"):
+                extra.append("still template: "
+                             + ", ".join(b["placeholders"][:4])
+                             + ("…" if len(b["placeholders"]) > 4 else ""))
+        elif step == "outline":
+            o = r.get("outline") or {}
+            extra.append("saved working outline: "
+                         + ("yes" if o.get("ok") else
+                            "no (candidates in outlines/ do not count "
+                            "until one is chosen)"))
+            note = self._downstream_note()
+            if note:
+                extra.append("replacing it does not update downstream "
+                             "work: " + note)
+        elif step == "scenes":
+            c = r.get("cards") or {}
+            extra.append(f"{c.get('count', 0)} card(s) saved, "
+                         f"{c.get('done', 0)} done")
+        elif step == "write":
+            w = r.get("write") or {}
+            if w.get("scenes"):
+                extra.append(f"first unfinished scene: "
+                             f"{w.get('next_scene') or '(none)'} "
+                             f"({w['scenes'] - w.get('done', 0)} of "
+                             f"{w['scenes']} unfinished)")
+        return base + (" " + " ".join(extra) if extra else "")
+
+    def _update_guide_location(self):
+        r = self._ready or {}
+        if r.get("exists") and r.get("config_ok"):
+            self.setup_identity_label.setText(
+                f"Existing project: title {r.get('title') or '(untitled)'}"
+                + ("; its title and settings are preserved by Create "
+                   "(the typed title does not overwrite them)" if
+                   r.get("setup_ok") else
+                   "; setup is incomplete — Create fills only the missing "
+                   "paths and never resets existing content"))
+        else:
+            self.setup_identity_label.setText(
+                "No valid project.json here yet; Create initializes this "
+                "directory with the complete bundled defaults.")
+
+    def _update_guide_write(self):
+        r = self._ready or {}
+        cards = r.get("cards") or {}
+        w = r.get("write") or {}
+        if not cards.get("ok"):
+            self.setup_write_label.setText(
+                "No valid saved scene cards yet; complete the Scene cards "
+                "step (Accept preview) first.")
+        elif cards.get("done", 0) >= cards.get("count", 0):
+            self.setup_write_label.setText(
+                f"All {cards['count']} saved scene(s) are marked done; "
+                "select a scene in the sidebar to reopen it explicitly. "
+                "Enter Write does not reset any status.")
+        else:
+            self.setup_write_label.setText(
+                f"First unfinished scene: {w.get('next_scene') or '(none)'} "
+                f"({cards['count'] - cards['done']} of {cards['count']} "
+                "unfinished). Enter Write selects it and opens the saved "
+                "head and steering — no generation.")
+
+    def setup_back(self):
+        """Back: pure navigation; editors and saved state are untouched."""
+        i = SETUP_STEPS.index(self._guide_step)
+        if i > 0:
+            self._guide_step = SETUP_STEPS[i - 1]
+            self._apply_guide_step()
+
+    def setup_next(self):
+        """Next: navigation plus an explanation of what is missing; never
+        an implicit Generate, Choose, Accept or Discard."""
+        i = SETUP_STEPS.index(self._guide_step)
+        if i < len(SETUP_STEPS) - 1:
+            self._guide_step = SETUP_STEPS[i + 1]
+            self._apply_guide_step()
+
+    def setup_resume_later(self):
+        """Save and resume later: offer to save dirty forms, wait for the
+        successful async save, then return to Plan. Cancel/failed saves
+        keep the guide on the current step; no acceptance runs."""
+        if self._busy:
+            self._status("An operation is running; wait for it to settle.",
+                         error=True)
+            return
+        if self._planning_dirty():
+            pick = self._choice(
+                "Unsaved planning input",
+                "Save your answers and edits before leaving the guide? "
+                "(Save waits for the write to settle; Discard reloads the "
+                "saved state; Cancel keeps the guide open.)",
+                ["Save", "Discard", "Cancel"])
+            if pick == "Save":
+                if not self._save_planning_dirty():
+                    return   # refused/stale: the step stays selected
+                self._pending_guide_leave = True
+                return
+            if pick == "Discard":
+                self._discard_planning_dirty()
+            else:
+                return
+        self._leave_guide()
+        self._status("Setup guide closed; saved progress resumes from the "
+                     "saved artifacts (Plan → Resume setup).")
+
+    def setup_enter_write(self):
+        """Guide handoff: select the first saved non-done scene from the
+        saved cards and open Write. No generation, acceptance, mark-done,
+        head move or continuity update ever runs here."""
+        if self._busy:
+            self._status("An operation is running; wait for it to settle.",
+                         error=True)
+            return
+        r = self._ready or {}
+        cards = r.get("cards") or {}
+        w = r.get("write") or {}
+        if not cards.get("ok"):
+            self._status("No valid saved scene cards yet; plan scenes in "
+                         "the guide (or the Scene plan tool) first.",
+                         error=True)
+            return
+        if cards.get("done", 0) >= cards.get("count", 0):
+            self._status("Every saved scene is marked done; select a scene "
+                         "in the sidebar to reopen it explicitly. Nothing "
+                         "was reset.")
+            return
+        scene = w.get("next_scene")
+        if not scene:
+            self._status("No unfinished scene found in the saved cards.",
+                         error=True)
+            return
+        self._leave_guide()
+        self.select_stage("write")
+        self.select_item("manuscript", scene, None)
+        self._status(f"Write opened at {scene} from its saved card, saved "
+                     "head and steering; nothing was generated.")
+
+    def _build_steering_box(self):
+        """Scene-labelled multiline steering with Save/Clear, candidate
+        count and Generate — visible only inside the Write stage."""
         steer_box = QGroupBox("Steering")
         steer_l = QVBoxLayout(steer_box)
         self.steer_label = QLabel("Steering")
@@ -275,7 +979,8 @@ class MainWindow(QMainWindow):
         steer_l.addWidget(self.steer_editor, 1)
         btns = QHBoxLayout()
         self.save_btn = QPushButton("Save steering")
-        self.save_btn.setDefault(True)
+        # never a default button: Enter in the multiline steering editor
+        # inserts a newline and must not trigger a save
         self.save_btn.clicked.connect(self.save_steering)
         self.clear_btn = QPushButton("Clear saved")
         self.clear_btn.clicked.connect(self.clear_steering)
@@ -291,22 +996,155 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.count_spin)
         self.generate_btn = QPushButton("Generate")
         self.generate_btn.clicked.connect(self.generate)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop)
         btns.addWidget(self.generate_btn)
-        btns.addWidget(self.stop_btn)
         steer_l.addLayout(btns)
         self.generate_note = QLabel("")
         steer_l.addWidget(self.generate_note)
-        right_l.addWidget(steer_box)
-        split.addWidget(right)
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 3)
-        root.addWidget(split, 1)
+        return steer_box
 
-        self.status = QLabel("")
-        self.statusBar().addWidget(self.status, 1)
+    # ------------------------------------------------- stage/tool routes
+
+    def current_stage(self):
+        """Semantic key of the selected primary stage."""
+        i = self.stages.currentIndex()
+        return STAGE_ORDER[i] if 0 <= i < len(STAGE_ORDER) else None
+
+    def current_tool(self):
+        """Semantic key of the selected stage-local tool panel."""
+        stage = self.current_stage()
+        if stage is None:
+            return None
+        tools = STAGE_TOOLS[stage]
+        tw = self._stage_tools.get(stage)
+        if tw is None:
+            return tools[0]
+        i = tw.currentIndex()
+        return tools[i] if 0 <= i < len(tools) else None
+
+    def route(self):
+        """(stage, tool) semantic route of the current selection."""
+        return (self.current_stage(), self.current_tool())
+
+    def select_stage(self, stage):
+        """Select one primary stage by its semantic key."""
+        if stage not in STAGE_ORDER:
+            raise ValueError(f"unknown stage: {stage!r}")
+        self.stages.setCurrentIndex(STAGE_ORDER.index(stage))
+
+    def select_tool(self, tool):
+        """Select a stage-local tool panel by its semantic key; selects the
+        owning stage first."""
+        for stage, tools in STAGE_TOOLS.items():
+            if tool in tools:
+                self.select_stage(stage)
+                tw = self._stage_tools.get(stage)
+                if tw is not None:
+                    tw.setCurrentIndex(tools.index(tool))
+                return
+        raise KeyError(f"unknown tool route: {tool!r}")
+
+    def _on_stage_changed(self, _index=None):
+        """A stage change is view-only: it never dispatches, saves or
+        accepts. Rewire the stage-local focus chain."""
+        self._wire_tab_order()
+
+    def _plan_next(self):
+        """Plan's primary next action: open the recommended tool route.
+        Never starts an operation, save or acceptance."""
+        target = getattr(self, "_plan_next_route", ("setup",))
+        if target[0] == "write":
+            self.select_stage("write")
+        else:
+            self.select_tool(target[0])
+
+    _PLAN_NEXT_LABELS = {
+        "setup": "Create / repair setup",
+        "credentials": "Add credentials",
+        "bible": "Answer the bible",
+        "outline": "Save the outline",
+        "scenes": "Plan scenes",
+        "write": "Enter Write",
+    }
+
+    def _update_plan_overview(self):
+        """Fill the Plan overview from the read-only readiness facts."""
+        r = getattr(self, "_ready", None)
+        if r is None:
+            return
+        self.plan_summary.setText(self._plan_summary_text(r))
+        self.plan_overview.setPlainText(self._plan_overview_text(r))
+        self.plan_next_btn.setText(self._PLAN_NEXT_LABELS.get(
+            r["next"], "Go"))
+        self._plan_next_route = (r["next"],)
+        self.resume_setup_btn.setText(
+            "Reopen setup" if self._setup_complete(r) else "Resume setup")
+        # guide chrome stays current with saved facts whenever it is visible
+        if getattr(self, "_guide_active", False) and \
+                hasattr(self, "setup_step_label"):
+            self.setup_step_label.setText(
+                self._guide_step_text(self._guide_step))
+            if self._guide_step == "location":
+                self._update_guide_location()
+            elif self._guide_step == "write":
+                self._update_guide_write()
+
+    def _setup_complete(self, r):
+        """Saved-facts completeness for the Resume/Reopen label; no key is
+        required (local tools work without credentials)."""
+        return bool(r.get("setup_ok") and r["bible"]["ok"]
+                    and r["outline"]["ok"] and r["cards"]["ok"])
+
+    def _plan_summary_text(self, r):
+        if not r["exists"]:
+            return "No project here yet — Create initializes this directory."
+        title = r.get("title") or "(untitled)"
+        return (f"{title} — {r['cards']['count']} scene card(s) saved, "
+                f"{r['write']['done']} done")
+
+    def _plan_overview_text(self, r):
+        lines = [f"root: {r['root']}"]
+        if not r["exists"]:
+            lines.append("setup: the directory does not exist yet; Create "
+                         "performs complete initialization")
+        elif r["setup_ok"]:
+            lines.append("setup: complete (project.json valid, writer "
+                         "preset found)")
+        else:
+            detail = []
+            if not r["config_ok"]:
+                detail.append("project.json missing or invalid")
+            if r["missing_files"]:
+                detail.append("missing init files: "
+                              + ", ".join(r["missing_files"]))
+            if not r["preset_found"]:
+                detail.append("writer preset missing")
+            lines.append("setup: incomplete — " + "; ".join(detail))
+        lines.append(
+            f"credentials: source {r['cred_source']}"
+            + (f" ({r['api_key_env']})" if r["api_key_env"] else "")
+            + " — generated planning needs a key; local tools do not")
+        b = r["bible"]
+        if b["sections"]:
+            lines.append(f"bible: {b['filled']}/{b['sections']} sections "
+                         "answered"
+                         + ("; still template: " + ", ".join(b["placeholders"])
+                            if b["placeholders"] else ""))
+        else:
+            lines.append("bible: no sections found")
+        o = r["outline"]
+        lines.append("outline: "
+                     + ("saved" if o["ok"] else
+                        ("saved but still template/placeholder"
+                         if o["saved"] else "not saved yet"))
+                     + f" ({o['chars']} characters)")
+        c = r["cards"]
+        lines.append(f"scene cards: {c['count']} saved, {c['done']} done"
+                     if c["valid"] else
+                     f"scene cards: none saved")
+        lines.append(f"next: {r['next_reason']}")
+        for w in r["warnings"]:
+            lines.append(f"! {w}")
+        return "\n".join(lines)
 
     def show_help(self):
         """Draft action help in the reading pane (CLI ?); no terminal."""
@@ -446,6 +1284,12 @@ class MainWindow(QMainWindow):
         l.setContentsMargins(0, 0, 0, 0)
         self.preview_label = QLabel("Preview — provisional streaming text (not saved)")
         l.addWidget(self.preview_label)
+        self.draft_stream_list = QListWidget()
+        self.draft_stream_list.setMaximumHeight(72)
+        self.draft_stream_list.setToolTip(
+            "Live answer previews per candidate while they stream (provisional)")
+        self.draft_stream_list.currentRowChanged.connect(self._show_draft_stream)
+        l.addWidget(self.draft_stream_list)
         self.preview = QPlainTextEdit()
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText(
@@ -980,6 +1824,12 @@ class MainWindow(QMainWindow):
             "The generated cards appear here; editing fields below updates "
             "the preview. scenes.json is replaced only on explicit Accept.")
         l.addWidget(self.scenes_preview, 3)
+        self.scenes_stream = QPlainTextEdit()
+        self.scenes_stream.setReadOnly(True)
+        self.scenes_stream.setPlaceholderText(
+            "The live answer appears here while scene cards stream "
+            "(provisional; nothing is saved here)")
+        l.addWidget(self.scenes_stream, 1)
         l.addWidget(QLabel("Selected card fields"))
         grid = QGridLayout()
         grid.setVerticalSpacing(2)
@@ -1200,8 +2050,9 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             prep = ro.critique_prepare(self._root, scene, token=token)
             res = ro.critique_generate(
-                self._root, prep, provider_factory=self._provider_factory,
-                token=token, events=sink)
+                self._root, prep, provider_factory=self._seam(),
+                token=token, events=sink,
+                preview_events=lambda ev: None)
             ext = ro.critique_extract(res["raw"])
             return {"prep": prep, "text": ext["text"], "ok": ext["ok"]}
 
@@ -1440,8 +2291,9 @@ class MainWindow(QMainWindow):
             prep = ro.update_state_prepare(self._root, scene_id, summary_only,
                                            token=token)
             res = ro.update_state_generate(
-                self._root, prep, provider_factory=self._provider_factory,
-                token=token, events=sink)
+                self._root, prep, provider_factory=self._seam(),
+                token=token, events=sink,
+                preview_events=lambda ev: None)
             return {"prep": prep, "raw": res["raw"], "finish": res["finish"],
                     "kind": "summary-only" if prep.summary_only else "update"}
 
@@ -1583,8 +2435,8 @@ class MainWindow(QMainWindow):
             def fn(sink, token):
                 res = ro.compress_generate(
                     self._root, prep,
-                    provider_factory=self._provider_factory, token=token,
-                    events=sink)
+                    provider_factory=self._seam(), token=token,
+                    events=sink, preview_events=lambda ev: None)
                 return {"prep": prep, "text": res["text"], "ok": res["ok"]}
 
             self._dispatch(fn, kind="compress_generate")
@@ -1592,8 +2444,9 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             res = ro.update_state_generate(
-                self._root, prep, provider_factory=self._provider_factory,
-                token=token, events=sink)
+                self._root, prep, provider_factory=self._seam(),
+                token=token, events=sink,
+                preview_events=lambda ev: None)
             return {"prep": prep, "raw": res["raw"], "finish": res["finish"],
                     "kind": self._cont["kind"]}
 
@@ -1664,8 +2517,9 @@ class MainWindow(QMainWindow):
             prep = ro.compress_prepare(self._root, lo, hi, replace=replace,
                                        token=token)
             res = ro.compress_generate(self._root, prep,
-                                       provider_factory=self._provider_factory,
-                                       token=token, events=sink)
+                                       provider_factory=self._seam(),
+                                       token=token, events=sink,
+                                       preview_events=lambda ev: None)
             return {"prep": prep, "text": res["text"], "ok": res["ok"]}
 
         self._dispatch(fn, kind="compress_generate")
@@ -2117,8 +2971,9 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             session = ro.revise_prepare(self._root, scene, token=token)
             res = ro.revise_generate(self._root, session, 0,
-                                     provider_factory=self._provider_factory,
-                                     token=token, events=sink)
+                                     provider_factory=self._seam(),
+                                     token=token, events=sink,
+                                     preview_events=lambda ev: None)
             return {"session": session, "psg": res}
 
         self._dispatch(fn, kind="revise_generate")
@@ -2136,7 +2991,7 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             res = ro.revise_generate(self._root, session, session.k,
-                                     provider_factory=self._provider_factory,
+                                     provider_factory=self._seam(),
                                      token=token, events=sink)
             return {"session": session, "psg": res}
 
@@ -2259,8 +3114,9 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             res = ro.revise_generate(self._root, session, k,
-                                     provider_factory=self._provider_factory,
-                                     token=token, events=sink)
+                                     provider_factory=self._seam(),
+                                     token=token, events=sink,
+                                     preview_events=lambda ev: None)
             return {"session": session, "psg": res}
 
         self._dispatch(fn, kind="revise_generate")
@@ -2489,10 +3345,11 @@ class MainWindow(QMainWindow):
         def fn(sink, token):
             return plan.generate_scene_cards(
                 root, force=force,
-                provider_factory=self._provider_factory, token=token,
-                events=sink)
+                provider_factory=self._seam(), token=token,
+                events=sink, preview_events=lambda ev: None)
 
-        self._dispatch(fn, kind="scenes_generate")
+        if self._dispatch(fn, kind="scenes_generate"):
+            self._clear_op_previews(("scenes",))
 
     def _on_scenes_selected(self, row):
         cards = self._scene_cards or []
@@ -2730,6 +3587,21 @@ class MainWindow(QMainWindow):
         self.outline_body_edit = QPlainTextEdit()
         self.outline_body_edit.setReadOnly(True)
         l.addWidget(self.outline_body_edit, 4)
+        self.outline_stream_label = QLabel(
+            "Live answer previews (provisional; nothing is saved or "
+            "accepted here)")
+        l.addWidget(self.outline_stream_label)
+        self.outline_stream_list = QListWidget()
+        self.outline_stream_list.setMaximumHeight(72)
+        self.outline_stream_list.currentRowChanged.connect(
+            self._show_outline_stream)
+        l.addWidget(self.outline_stream_list)
+        self.outline_stream = QPlainTextEdit()
+        self.outline_stream.setReadOnly(True)
+        self.outline_stream.setPlaceholderText(
+            "Each candidate's live answer appears here while it streams; "
+            "select a candidate above")
+        l.addWidget(self.outline_stream, 2)
         return box
 
     # ---------------------------------------------------------------- outline
@@ -2792,11 +3664,16 @@ class MainWindow(QMainWindow):
         root = plan.canonical_root(self._root)
 
         def fn(sink, token):
+            # no-op subscriber: planning_operations forwards each provider
+            # preview event on the events channel tagged with candidate_id.
             return plan.generate_outlines(root, notes_form, n,
-                                          provider_factory=self._provider_factory,
-                                          token=token, events=sink)
+                                          provider_factory=self._seam(),
+                                          token=token, events=sink,
+                                          preview_events=lambda i:
+                                          (lambda ev: None))
 
-        self._dispatch(fn, kind="outline_generate")
+        if self._dispatch(fn, kind="outline_generate"):
+            self._clear_op_previews(("outline",))
 
     def _outline_selected(self):
         row = self.outline_list.currentRow()
@@ -3239,6 +4116,64 @@ class MainWindow(QMainWindow):
         self.setup_note.setWordWrap(True)
         l.addWidget(self.setup_note)
 
+        l.addWidget(QLabel("Credentials (masked entry; availability only is "
+                           "shown, never a value)"))
+        self.credential_entry = QLineEdit()
+        self.credential_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.credential_entry.setPlaceholderText(
+            "Paste a key to act on; it is never displayed or prefilled")
+        self.credential_entry.setToolTip(
+            "Password-mode entry, empty on load. Nothing happens until you "
+            "press an action button; the value is trimmed of outer "
+            "whitespace and never echoed back.")
+        self.credential_entry.returnPressed.connect(self.credential_use)
+        l.addWidget(self.credential_entry)
+        self.credential_status = QLabel("")
+        self.credential_status.setWordWrap(True)
+        l.addWidget(self.credential_status)
+        cbtns = QHBoxLayout()
+        self.credential_use_btn = QPushButton("Use for this session")
+        self.credential_use_btn.setToolTip(
+            "Activate the pasted key for this window only (ADR-0011): it "
+            "overrides project.json and the environment for every provider "
+            "action here, is cleared on close or when another project "
+            "opens, and project.json is never written.")
+        self.credential_use_btn.clicked.connect(self.credential_use)
+        cbtns.addWidget(self.credential_use_btn)
+        self.credential_clear_session_btn = QPushButton("Clear session key")
+        self.credential_clear_session_btn.setToolTip(
+            "Remove this window's session credential; the effective "
+            "credential falls back to project.json, then the environment, "
+            "then missing. project.json is never written.")
+        self.credential_clear_session_btn.clicked.connect(
+            self.credential_clear_session)
+        cbtns.addWidget(self.credential_clear_session_btn)
+        self.credential_save_btn = QPushButton("Save to this project")
+        self.credential_save_btn.setToolTip(
+            "Store the pasted key in project.json api_key after explicit "
+            "confirmation: the file is plaintext and sharing/backups "
+            "include the key. The saved key applies only when no session "
+            "key is active; an active session is never replaced.")
+        self.credential_save_btn.clicked.connect(self.credential_save)
+        cbtns.addWidget(self.credential_save_btn)
+        self.credential_clear_saved_btn = QPushButton("Clear saved key")
+        self.credential_clear_saved_btn.setToolTip(
+            "Clear only the saved project.json api_key (explicit "
+            "confirmation): the session key, if any, stays in force and "
+            "otherwise the environment fallback is exposed.")
+        self.credential_clear_saved_btn.clicked.connect(
+            self.credential_clear_saved)
+        cbtns.addWidget(self.credential_clear_saved_btn)
+        self.credential_test_btn = QPushButton("Test connection")
+        self.credential_test_btn.setToolTip(
+            "One /plan lookup through the effective credential (session, "
+            "then project, then environment); never generates anything, "
+            "keeps no response content and writes nothing.")
+        self.credential_test_btn.clicked.connect(self.credential_test)
+        cbtns.addWidget(self.credential_test_btn)
+        cbtns.addStretch(1)
+        l.addLayout(cbtns)
+
         l.addWidget(QLabel("Settings (supported nonsecret project.json "
                            "fields; unknown fields and any existing key are "
                            "preserved)"))
@@ -3346,7 +4281,8 @@ class MainWindow(QMainWindow):
     def _load_settings_form(self):
         """Fill the form from the shared read-only state (no calls)."""
         try:
-            state = plan.settings_state(self._root)
+            state = plan.settings_state(self._root,
+                                        session=self._availability())
         except dop.OpError as e:
             self.settings_note.setText(f"(settings unavailable: {e})")
             return
@@ -3432,7 +4368,8 @@ class MainWindow(QMainWindow):
 
         def fn(sink, token):
             return plan.fetch_limits(
-                root, provider_factory=self._provider_factory,
+                root, provider_factory=self._seam(),
+                session=self._availability(),
                 token=token, events=sink)
 
         self._dispatch(fn, kind="limits")
@@ -3462,7 +4399,9 @@ class MainWindow(QMainWindow):
 
     def _resolve_dirty(self):
         """Resolve unsaved input before a destructive transition (project
-        Create/Open); False cancels or defers the transition."""
+        Create/Open). Returns "ok", "cancel" or "deferred": "deferred" means a
+        planning save was dispatched on the worker and the caller's already
+        set `_pending_action` resumes after settlement."""
         if self._scene_sel is not None and self.dirty():
             pick = self._choice(
                 "Unsaved steering",
@@ -3470,9 +4409,9 @@ class MainWindow(QMainWindow):
                 ["Save", "Discard", "Cancel"])
             if pick == "Save":
                 if not self._persist(self.steer_editor.toPlainText()):
-                    return False
+                    return "cancel"
             elif pick != "Discard":
-                return False
+                return "cancel"
         if self._planning_dirty():
             pick = self._choice(
                 "Unsaved planning input",
@@ -3481,13 +4420,13 @@ class MainWindow(QMainWindow):
                 ["Save", "Discard", "Cancel"])
             if pick == "Save":
                 if not self._save_planning_dirty():
-                    return False   # the transition resumes after settlement
-                return False
+                    return "cancel"   # the save refused; nothing dispatched
+                return "deferred"
             if pick == "Discard":
                 self._discard_planning_dirty()
-                return True
-            return False
-        return True
+                return "ok"
+            return "cancel"
+        return "ok"
 
     def _planning_dirty(self):
         return (self.settings_dirty() or self._bible_dirty()
@@ -3519,21 +4458,31 @@ class MainWindow(QMainWindow):
         kind, target = action
         self._pending_root = target
         if kind == "create":
+            title = self._pending_title
+            self._pending_title = None
+
             def fn(sink, token):
-                return plan.init_project(target, token=token, events=sink)
+                return plan.init_project(target, token=token, events=sink,
+                                         title=title)
             self._dispatch(fn, kind="init")
         else:
             def fn(sink, token):
                 return plan.project_overview(target)
             self._dispatch(fn, kind="open")
 
+    def create_guide(self):
+        """Create… opens the ordered setup guide at the location step.
+        Nothing is picked, initialized or created until Create project is
+        pressed on that step."""
+        self._enter_setup_guide("location")
+
     def create_project(self):
-        """Desktop Create: pick a location, initialize create-missing-only."""
+        """Guide Create project: pick a location, initialize
+        create-missing-only; the typed title is carried for a newly created
+        project.json only (an existing one keeps its identity)."""
         if self._busy:
             self._status("An operation is running; Create is disabled until "
                          "it settles.", error=True)
-            return
-        if not self._resolve_dirty():
             return
         picked = self._dir_picker("Create: choose a project directory",
                                   self._plan.get("root") or self._root)
@@ -3541,15 +4490,27 @@ class MainWindow(QMainWindow):
             self._status("No location picked; nothing was created.")
             return
         target = plan.canonical_root(picked)
+        self._guide_dir = picked
+        title = (self.setup_title_edit.text().strip()
+                 if hasattr(self, "setup_title_edit") else "")
+        self._pending_title = title or None
         self._pending_action = ("create", target)
-        if not self._resolve_dirty():
+        state = self._resolve_dirty()
+        if state == "cancel":
             self._pending_action = None
+            self._pending_title = None
+            self._status("Create cancelled; nothing was created.")
             return
+        if state == "deferred":
+            return   # the save settles first; settlement continues the Create
         self._pending_action = None
         self._pending_root = target
+        title = self._pending_title
+        self._pending_title = None
 
         def fn(sink, token):
-            return plan.init_project(target, token=token, events=sink)
+            return plan.init_project(target, token=token, events=sink,
+                                     title=title)
 
         self._dispatch(fn, kind="init")
 
@@ -3560,8 +4521,6 @@ class MainWindow(QMainWindow):
             self._status("An operation is running; Open is disabled until it "
                          "settles.", error=True)
             return
-        if not self._resolve_dirty():
-            return
         picked = self._dir_picker("Open: choose a project directory",
                                   self._plan.get("root") or self._root)
         if not picked:
@@ -3569,16 +4528,21 @@ class MainWindow(QMainWindow):
                          "unchanged.")
             return
         target = plan.canonical_root(picked)
+        self._pending_action = ("open", target)
+        state = self._resolve_dirty()
+        if state == "cancel":
+            self._pending_action = None
+            self._status("Open cancelled; the current project is unchanged.")
+            return
+        if state == "deferred":
+            return   # the save settles first; settlement continues the Open
+        self._pending_action = None
         if target == plan.canonical_root(self._root):
-            self._plan = plan.project_overview(target)
+            self._plan = plan.project_overview(target,
+                                               session=self._availability())
             self.refresh(force=True)
             self._status("Reopened the current project.")
             return
-        self._pending_action = ("open", target)
-        if not self._resolve_dirty():
-            self._pending_action = None
-            return
-        self._pending_action = None
         self._pending_root = target
 
         def fn(sink, token):
@@ -3589,7 +4553,11 @@ class MainWindow(QMainWindow):
     def _rebind_root(self, root):
         """Bind a new project root; clear caches, baselines and planning
         state, then reload the views."""
+        if Path(root) != self._root:
+            self._session_key = None      # a session never crosses projects
         self._root = Path(root)
+        if hasattr(self, "credential_entry"):
+            self.credential_entry.clear()
         self._cache = SourceCache()
         self.snap = None
         self._sel_data = None
@@ -3600,7 +4568,10 @@ class MainWindow(QMainWindow):
         self._view_override = None
         self._draft_left = False
         self._stale_config = False
-        self._plan = plan.project_overview(self._root)
+        self._plan = plan.project_overview(self._root,
+                                           session=self._availability())
+        self._ready = plan.readiness(self._root,
+                                     session=self._availability())
         self._bible_overview = None
         self._bible_session = False
         self._bible_heading = None
@@ -3628,6 +4599,7 @@ class MainWindow(QMainWindow):
         self._settling = False
         self._cont = None
         self._cont_editing = None
+        self._pending_title = None    # a new root never inherits a carried title
         self._bind_steering(None)
         self.refresh(force=True)
         self._autoselect()
@@ -3677,6 +4649,171 @@ class MainWindow(QMainWindow):
         for w in p["warnings"]:
             lines.append("warning: " + w)
         self.setup_status.setText("\n".join(lines))
+        self.credential_status.setText(self._credential_status_text())
+        self.credential_save_btn.setText(
+            "Replace saved key" if p.get("inline_key")
+            else "Save to this project")
+
+    def _credential_status_text(self):
+        """Availability, winning source and environment name only (ADR-0011)."""
+        p = self._plan
+        src = p.get("cred_source", "missing")
+        env = p.get("api_key_env") or "FEATHERLESS_API_KEY"
+        if src == "session":
+            return ("Available — session key for this window; it overrides "
+                    f"project.json and environment {env} for every provider "
+                    "action here and is cleared on close.")
+        if src == "project":
+            return ("Available — saved project.json api_key"
+                    + (f" (environment {env} also set)" if p.get("env_set")
+                       else ""))
+        if src == "environment":
+            return f"Available — environment {env}"
+        return ("Missing — no session key, no saved api_key and environment "
+                f"{env} not set; paste a key and press Use for this session, "
+                'or set "api_key" in project.json (plaintext).')
+
+    def credential_use(self):
+        """Activate the pasted key for this window only; nothing is written."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        val = self.credential_entry.text().strip()
+        if not val:
+            self._status("Enter a credential first; an empty entry changes "
+                         "nothing.", error=True)
+            return
+        self._session_key = val
+        self.credential_entry.clear()
+        self.refresh(force=True)
+        self._status("Credential set for this session; project.json is "
+                     "unchanged. Activation is not a validity check — use "
+                     "Test connection.")
+
+    def credential_clear_session(self):
+        """Remove the window override; project.json and the environment keep
+        their values and the effective credential falls back to them."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        if not self._session_key:
+            self._status("No session credential is active.")
+            return
+        self._session_key = None
+        self.credential_entry.clear()
+        self.refresh(force=True)
+        self._status("Session credential cleared; the saved project key, "
+                     "then the environment, applies again. project.json is "
+                     "unchanged.")
+
+    def _resolve_credential_settings_dirty(self, action):
+        """Unsaved settings edits survive unless explicitly discarded
+        before a credential write replaces their loaded baseline."""
+        if not self.settings_dirty():
+            return True
+        pick = self._choice(
+            "Unsaved settings",
+            "Settings have unsaved changes. A credential write replaces "
+            "the loaded settings baseline. Discard the settings changes "
+            "and continue, or cancel?",
+            ["Discard settings changes", "Cancel"])
+        if pick == "Discard settings changes":
+            self._settings_touched = {}
+            return True
+        self._status(f"Cancelled; the {action} wrote nothing and the "
+                     "settings edits are kept.", error=True)
+        return False
+
+    def credential_save(self):
+        """Confirm, then store the pasted key in project.json api_key."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        val = self.credential_entry.text().strip()
+        if not val:
+            self._status("Enter a credential first; an empty entry changes "
+                         "nothing.", error=True)
+            return
+        replace = bool(self._plan.get("inline_key"))
+        head = ("Replace the saved project.json api_key with this key?\n\n"
+                if replace else
+                "Save this key into project.json?\n\n")
+        pick = self._choice(
+            "Replace saved credential" if replace else "Save credential",
+            head + "project.json is plaintext: anyone with access to the "
+            "project, and any shared copy or backup, can read the key.\n\n"
+            "The saved key applies only when no session key is active; an "
+            "active session key is never replaced. Only the api_key field "
+            "changes.",
+            ["Save", "Cancel"])
+        if pick != "Save":
+            self._status("Cancelled; nothing was written and no credential "
+                         "was saved.")
+            return
+        if not self._resolve_credential_settings_dirty("save"):
+            return
+        root = plan.canonical_root(self._root)
+        base = self._settings_state.get("baseline")
+
+        def fn(sink, token):
+            return plan.save_credential(
+                root, "replace" if replace else "save", val,
+                baseline=dict(base) if base else None, token=token,
+                events=sink)
+
+        self._dispatch(fn, kind="credential_save")
+
+    def credential_clear_saved(self):
+        """Confirm, then write an empty project.json api_key."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        if not self._plan.get("inline_key"):
+            self._status("No saved project credential to clear.")
+            return
+        fallback = ("an active session key stays in force"
+                    if self._availability() else
+                    f"the environment fallback ({self._plan.get('api_key_env') or 'the configured variable'}) "
+                    "is exposed")
+        pick = self._choice(
+            "Clear saved credential",
+            "Clear the saved project.json api_key?\n\nAfterwards "
+            + fallback + ". Only the api_key field changes; the file is "
+            "never rewritten with a value.",
+            ["Clear", "Cancel"])
+        if pick != "Clear":
+            self._status("Cancelled; nothing was written.")
+            return
+        if not self._resolve_credential_settings_dirty("clear"):
+            return
+        root = plan.canonical_root(self._root)
+        base = self._settings_state.get("baseline")
+
+        def fn(sink, token):
+            return plan.save_credential(
+                root, "clear", baseline=dict(base) if base else None,
+                token=token, events=sink)
+
+        self._dispatch(fn, kind="credential_save")
+
+    def credential_test(self):
+        """Explicit non-generative connection test on the worker."""
+        if self._busy:
+            self._status("An operation is running; credential actions are "
+                         "paused until it settles.", error=True)
+            return
+        root = plan.canonical_root(self._root)
+
+        def fn(sink, token):
+            return plan.test_connection(root, provider_factory=self._seam(),
+                                        session=self._availability(),
+                                        token=token, events=sink)
+
+        self._dispatch(fn, kind="credential_test")
 
     # ------------------------------------------------------------ preset import
 
@@ -3717,11 +4854,40 @@ class MainWindow(QMainWindow):
         return (path or "", flt)
 
     def _wire_tab_order(self):
-        """Visible, predictable keyboard order: sidebar → reading → editor →
-        actions → refresh/size."""
+        """Visible, predictable keyboard order: sidebar → stage selector →
+        stage-local tool chain → reading → editor → actions → refresh/size."""
         w = QWidget.setTabOrder
-        w(self.sidebar, self.tabs)
-        w(self.tabs, self.reading)
+        w(self.sidebar, self.stages)
+        stage = self.current_stage()
+        if stage is None:
+            stage = "plan"
+        tw = self._stage_tools.get(stage)
+        entry = tw if tw is not None else self._stage_pages[stage]
+        if self._guide_active and self._guide_chrome.isVisible():
+            # the guide chrome sits between the stage selector and the tool
+            # chain; the step's own content follows the chrome buttons
+            w(self.stages, self.setup_step_list)
+            w(self.setup_step_list, self.setup_back_btn)
+            w(self.setup_back_btn, self.setup_next_btn)
+            w(self.setup_next_btn, self.setup_resume_later_btn)
+            w(self.setup_resume_later_btn, self.setup_advanced_btn)
+            if self._guide_step == "location":
+                w(self.setup_advanced_btn, self.setup_title_edit)
+                w(self.setup_title_edit, self.setup_create_btn)
+                w(self.setup_create_btn, entry)
+            elif self._guide_step == "write":
+                w(self.setup_advanced_btn, self.setup_enter_write_btn)
+                w(self.setup_enter_write_btn, entry)
+            else:
+                w(self.setup_advanced_btn, entry)
+        else:
+            w(self.stages, entry)
+        # every tool chain ends at the shared reading/steering action row
+        for other in STAGE_ORDER:
+            otw = self._stage_tools.get(other)
+            if otw is not None and other != stage:
+                w(otw, entry)
+        w(entry, self.reading)
         w(self.reading, self.metadata)
         w(self.metadata, self.notes_list)
         w(self.notes_list, self.notes_view)
@@ -3729,7 +4895,8 @@ class MainWindow(QMainWindow):
         w(self.steer_editor, self.save_btn)
         w(self.save_btn, self.clear_btn)
         w(self.clear_btn, self.generate_btn)
-        w(self.generate_btn, self.refresh_btn)
+        w(self.generate_btn, self.stop_btn)
+        w(self.stop_btn, self.refresh_btn)
         w(self.refresh_btn, self.prose_size)
 
     def _start_timer(self):
@@ -3800,15 +4967,20 @@ class MainWindow(QMainWindow):
     def refresh(self, force=False):
         """Reload the snapshot; preserve selection, tab, scroll, focus, dirty."""
         if force:
-            self._plan = plan.project_overview(self._root)
+            self._plan = plan.project_overview(self._root,
+                                               session=self._availability())
+            self._ready = plan.readiness(self._root,
+                                         session=self._availability())
             self._refresh_bible_overview()
             self._refresh_outline_overview()
             self._refresh_scenes_overview()
             try:
-                self._session = dop.session_info(self._root)
+                self._session = dop.session_info(
+                    self._root, session=self._availability())
             except dop.OpError:
                 pass   # keep the last known session facts
         self._update_setup_tab()
+        self._update_plan_overview()
         try:
             res = self._load(self._root, cache=self._cache, force=force)
         except OSError as e:
@@ -3908,6 +5080,12 @@ class MainWindow(QMainWindow):
                     return
             self._bind_steering(scene_id)
         self._sel_data = data
+        # Keep the visible selection on the newly bound scene: a Save during
+        # the switch refreshes the snapshot mid-handler, and the rebuild
+        # restores the sidebar by the still-old selection identity.
+        item = self._find_item(data)
+        if item is not None and self.sidebar.currentItem() is not item:
+            self.sidebar.setCurrentItem(item)
         self._missing_node = None
         self._view_override = None   # selection navigation clears view-only text
         self._update_panes()
@@ -4034,6 +5212,9 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(self._busy)
         for b in (self.create_btn, self.open_btn, self.preset_import_btn,
                   self.settings_save_btn, self.settings_cancel_btn,
+                  self.credential_use_btn, self.credential_clear_session_btn,
+                  self.credential_save_btn, self.credential_clear_saved_btn,
+                  self.credential_test_btn,
                   self.fetch_limits_btn, self.bible_begin_btn,
                   self.bible_save_btn, self.bible_accept_btn,
                   self.bible_edit_btn, self.bible_skip_btn,
@@ -4078,12 +5259,15 @@ class MainWindow(QMainWindow):
         self._op_id += 1
         self._op_kind = kind
         self._op_rows = rows
+        target = self._preview_target()
+        if target:
+            self._clear_op_previews((target,))
         self._view_override = None
         op_id = self._op_id
         self._token = CancellationToken()
         token = self._token
         thread = OpThread(op_id, lambda sink, tok=token: fn(sink, tok),
-                          parent=self)
+                          parent=self, redact=self._scrub_display)
         thread.event_sig.connect(self._on_worker_event)
         thread.done_sig.connect(self._on_worker_done)
         thread.finished.connect(lambda t=thread: self._on_thread_finished(t))
@@ -4113,7 +5297,12 @@ class MainWindow(QMainWindow):
             self.preview.setPlainText("")
             self._status("Streaming… (provisional preview; nothing is saved yet)")
         elif kind in ("candidate_done", "candidate_failed"):
+            # candidate_failed's k is a completion-order index (Api.many),
+            # never a preview slot; previews are marked nonaccepting at
+            # settlement instead (see _on_worker_done).
             self._status(payload.get("msg", ""))
+        elif kind in dop.PREVIEW_TYPES:
+            self._on_preview_event(payload)
         elif kind == "progress":
             self._status(payload.get("msg", ""))
         elif kind == "note":
@@ -4123,6 +5312,195 @@ class MainWindow(QMainWindow):
                          f"{payload.get('wanted')} responses came back")
         elif kind == "skipped_empty":
             self._status("warning: a response cleaned to empty and was discarded")
+
+    def _on_preview_event(self, payload):
+        """Live answer preview (ADR-0012) keyed by candidate/attempt; the
+        queued channel already paired the payload with the operation id, and
+        the op_id filter above ignores superseded operations. Only the latest
+        attempt of a candidate is kept."""
+        try:
+            cand = int(payload.get("candidate_id", 1))
+            attempt = int(payload.get("attempt_id", 1))
+        except (TypeError, ValueError):
+            return
+        kind = payload.get("type")
+        if self._op_preview_latest.get(cand, 0) > attempt:
+            return   # a retired attempt cannot revive its preview
+        if kind == "preview_start":
+            self._status("Waiting for answer… (provisional preview; "
+                         "nothing is saved yet)")
+        st = self._op_previews.setdefault(
+            (cand, attempt), {"text": "", "status": "waiting"})
+        if kind == "preview_start":
+            self._op_preview_latest[cand] = attempt
+            st["text"] = ""
+            st["status"] = "waiting"
+        elif kind == "preview_delta":
+            st["text"] += payload.get("text", "")
+            if st["text"]:
+                st["status"] = "streaming"
+        elif kind == "preview_reset":
+            st["text"] = ""
+            st["status"] = "waiting"
+        elif kind == "preview_complete":
+            st["status"] = "complete"
+        else:
+            return
+        if kind == "preview_delta":
+            # Coalesce adjacent deltas: the pane repaints once per GUI
+            # event-loop turn while the request stays blocked on the wire.
+            self._schedule_preview_flush()
+        else:
+            self._refresh_preview_pane()
+
+    def _schedule_preview_flush(self):
+        """Flush coalesced preview deltas on this event-loop turn."""
+        if self._preview_dirty:
+            return
+        self._preview_dirty = True
+        QTimer.singleShot(0, self._flush_preview_pane)
+
+    def _flush_preview_pane(self):
+        self._preview_dirty = False
+        self._refresh_preview_pane()
+
+    def _preview_target(self):
+        """Which pane shows live previews for the running operation."""
+        if self._op_kind in ("outline_generate",):
+            return "outline"
+        if self._op_kind in ("scenes_generate",):
+            return "scenes"
+        if self._op_kind in ("generate", "reroll", "add"):
+            return "draft"
+        if self._op_kind in ("continuity_generate", "compress_generate",
+                             "revise_generate", "critique_generate"):
+            return "review"
+        return None
+
+    def _candidate_states(self):
+        """Latest attempt per candidate: {cand: {text,status}}."""
+        out = {}
+        for (cand, _attempt), st in self._op_previews.items():
+            if self._op_preview_latest.get(cand) == _attempt:
+                out[cand] = st
+        return out
+
+    def _refresh_preview_pane(self):
+        target = self._preview_target()
+        if target == "outline":
+            states = self._candidate_states()
+            cands = sorted(states)
+            lst = self.outline_stream_list
+            lst.blockSignals(True)
+            lst.clear()
+            for c in cands:
+                lst.addItem(QListWidgetItem(
+                    f"candidate {c} — {states[c]['status']}"))
+            if cands:
+                row = self._op_preview_row if self._op_preview_row in cands \
+                    else cands[0]
+                self._op_preview_row = row
+                lst.setCurrentRow(cands.index(row))
+            lst.blockSignals(False)
+            if self._op_preview_row in cands:
+                st = states[self._op_preview_row]
+                text = st["text"]
+                if not text:
+                    text = ("(Waiting for answer…)"
+                            if st["status"] in ("waiting", "streaming")
+                            else f"({st['status']}; no answer text)")
+                self.outline_stream.setPlainText(text)
+                bar = self.outline_stream.verticalScrollBar()
+                bar.setValue(bar.maximum())
+        elif target == "scenes":
+            st = self._candidate_states().get(1)
+            if st is not None:
+                self.scenes_stream.setPlainText(st["text"])
+                bar = self.scenes_stream.verticalScrollBar()
+                bar.setValue(bar.maximum())
+        elif target == "review":
+            st = self._candidate_states().get(1)
+            if st is None:
+                return
+            if self._op_kind in ("continuity_generate", "compress_generate"):
+                widget = self.continuity_preview
+            elif self._op_kind == "revise_generate":
+                widget = self.revise_view
+            else:
+                widget = self.report_view
+            if not st["text"]:
+                if st["status"] in ("waiting", "streaming"):
+                    widget.setPlainText("(Waiting for answer…)")
+                return
+            widget.setPlainText(st["text"])
+            bar = widget.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        elif target == "draft":
+            states = self._candidate_states()
+            cands = sorted(states)
+            lst = self.draft_stream_list
+            lst.blockSignals(True)
+            lst.clear()
+            for c in cands:
+                lst.addItem(QListWidgetItem(
+                    f"candidate {c} — {states[c]['status']}"))
+            if cands:
+                row = self._op_preview_row if self._op_preview_row in cands \
+                    else cands[0]
+                self._op_preview_row = row
+                lst.setCurrentRow(cands.index(row))
+            lst.blockSignals(False)
+            if self._op_preview_row in cands:
+                st = states[self._op_preview_row]
+                text = st["text"]
+                if not text:
+                    text = ("(Waiting for answer…)"
+                            if st["status"] in ("waiting", "streaming")
+                            else f"({st['status']}; no answer text)")
+                self.preview.setPlainText(text)
+                bar = self.preview.verticalScrollBar()
+                bar.setValue(bar.maximum())
+
+    def _show_outline_stream(self, row):
+        cands = sorted(self._candidate_states())
+        if 0 <= row < len(cands):
+            self._op_preview_row = cands[row]
+            self._refresh_preview_pane()
+
+    def _show_draft_stream(self, row):
+        self._show_outline_stream(row)
+
+    def _clear_op_previews(self, targets):
+        """Reset live preview state and pane widgets for a fresh operation."""
+        self._op_previews = {}
+        self._op_preview_latest = {}
+        self._op_preview_row = None
+        self._preview_dirty = False
+        if "outline" in targets:
+            self.outline_stream_list.blockSignals(True)
+            self.outline_stream_list.clear()
+            self.outline_stream_list.blockSignals(False)
+            self.outline_stream.setPlainText("")
+        if "scenes" in targets:
+            self.scenes_stream.setPlainText("")
+        if "review" in targets:
+            pass   # review panes keep the last completed preview
+        if "draft" in targets:
+            self.draft_stream_list.blockSignals(True)
+            self.draft_stream_list.clear()
+            self.draft_stream_list.blockSignals(False)
+            self._preview_text = ""
+            self.preview.setPlainText("")
+
+    def _fail_running_previews(self):
+        """A settled (cancelled/failed) operation cannot keep streaming."""
+        changed = False
+        for st in self._op_previews.values():
+            if st["status"] in ("waiting", "streaming"):
+                st["status"] = "failed"
+                changed = True
+        if changed:
+            self._refresh_preview_pane()
 
     def _on_worker_done(self, op_id, outcome, value):
         """One terminal outcome per operation. Settlement runs here, but the
@@ -4149,6 +5527,17 @@ class MainWindow(QMainWindow):
             self._settling = False
         if self._op_id != settled:
             return  # a chained operation already owns the gate
+        # A settled operation's previews are final: any answer that never
+        # completed is failed/aborted and cannot be accepted (candidate_failed
+        # carries only a completion-order k, so per-slot labelling happens
+        # here, not per event).
+        changed = False
+        for st in self._op_previews.values():
+            if st["status"] not in ("complete", "failed"):
+                st["status"] = "failed"
+                changed = True
+        if changed:
+            self._refresh_preview_pane()
         self._update_steering_ui()
 
     def _on_thread_finished(self, thread):
@@ -4165,6 +5554,10 @@ class MainWindow(QMainWindow):
         """Cooperative Stop settlement: completed writes stay saved, the
         provisional output is discarded and the messages name exactly what
         happened (never a rollback promise)."""
+        self._pending_action = None   # a stopped save never continues a
+        self._pending_root = None     # deferred transition
+        self._pending_guide_leave = False
+        self._fail_running_previews()
         self._update_steering_ui()
         kind = self._op_kind
         if kind == "status_overview":
@@ -4210,6 +5603,12 @@ class MainWindow(QMainWindow):
             self._status(f"revised {changed} passages — stopped; remaining "
                          "passages were not revised.")
             return
+        if kind == "init":
+            self._pending_root = None
+            self._status("Stopped; the initialization is incomplete — "
+                         "completed writes stay saved and retrying Create "
+                         "fills only the missing paths.", error=True)
+            return
         self._preview_text = ""
         self.preview.setPlainText("")
         self._status("Stopped; nothing was saved. Head and saved "
@@ -4219,6 +5618,9 @@ class MainWindow(QMainWindow):
         self._update_steering_ui()
         self._pending_action = None   # a failed save never continues a
         self._pending_root = None     # deferred transition
+        self._pending_title = None    # a failed init never carries a title
+        self._pending_guide_leave = False
+        self._fail_running_previews()
         if getattr(value, "collision", False) and \
                 self._op_kind in ("import", "scenes_generate",
                                   "compress_generate"):
@@ -4375,8 +5777,17 @@ class MainWindow(QMainWindow):
                     (", ".join(created) if created else
                      "(nothing; all files already exist)")
                 if value.get("preset"):
-                    msg += "; writer_preset.json imported"
+                    if value["preset"].get("default"):
+                        msg += "; bundled writer_preset.json created"
+                    else:
+                        msg += "; writer_preset.json imported"
                 self._status(msg)
+                if self._guide_active:
+                    self.refresh(force=True)
+                    self._guide_step = "credentials"
+                    self._apply_guide_step()
+                    self._status(msg + "; guide continues at Credentials")
+                return
             else:
                 self.refresh(force=True)
                 self._status("initialized " + root.name)
@@ -4414,6 +5825,27 @@ class MainWindow(QMainWindow):
             self._status(msg)
             if self._pending_action is not None:
                 self._run_pending_action()
+            else:
+                self._after_save_settle()
+        elif kind == "credential_save" and isinstance(value, dict):
+            self._load_settings_form()
+            self._settings_state["loaded"] = True
+            self.refresh(force=True)
+            self.credential_entry.clear()
+            verb = ("replaced" if value["action"] == "replace"
+                    else "saved" if value["action"] == "save" else "cleared")
+            self._status(
+                f"{verb.capitalize()} the saved project credential; "
+                "availability refreshed. project.json is plaintext — "
+                "sharing and backups include the key."
+                if value["action"] != "clear" else
+                "Cleared the saved project credential; availability "
+                "refreshed.")
+        elif kind == "credential_test" and isinstance(value, dict):
+            self._status(
+                "Connection succeeded using "
+                f"{value['cred_source']} credentials; the response content "
+                "was discarded and nothing was written.")
         elif kind == "limits" and isinstance(value, dict):
             self.limits_view.setPlainText(self._limits_text(value["view"]))
             msg = ("limits fetched and saved to limits.json"
@@ -4445,6 +5877,9 @@ class MainWindow(QMainWindow):
                 "bible.md is unchanged until you press Accept section")
             self._status(f"saved answers to {value['form_path']} and input "
                          "history; bible.md unchanged until Accept")
+            if self._pending_action is not None:
+                self._run_pending_action()
+            self._after_save_settle()
         elif kind == "bible_accept" and isinstance(value, dict):
             self._bible_preview_section = None
             self._bible_preview_is_current = True
@@ -4497,6 +5932,9 @@ class MainWindow(QMainWindow):
             self._status("saved the edited outline to outline.md (previous "
                          "outline backed up); the candidate file is "
                          "unchanged")
+            if self._pending_action is not None:
+                self._run_pending_action()
+            self._after_save_settle()
         elif kind == "scenes_generate" and isinstance(value, dict):
             self._scenes_preview_baseline = dict(value.get("baseline") or {})
             if value.get("raw") is not None:
@@ -4583,8 +6021,9 @@ class MainWindow(QMainWindow):
                         r = ro.revise_generate(
                             self._root, value["session"],
                             value["session"].k,
-                            provider_factory=self._provider_factory,
-                            token=token, events=sink)
+                            provider_factory=self._seam(),
+                            token=token, events=sink,
+                            preview_events=lambda ev: None)
                         return {"session": value["session"], "psg": r}
 
                     self._dispatch(nxt, kind="revise_generate")
@@ -4735,10 +6174,11 @@ class MainWindow(QMainWindow):
             return dop.generate_candidates(
                 self._root, self._batch["scene"], count=count,
                 parent=self._batch["parent"],
-                provider_factory=self._provider_factory, token=token,
-                events=sink)
+                provider_factory=self._seam(), token=token,
+                events=sink, preview_events=lambda i: (lambda ev: None))
 
-        self._dispatch(fn, kind=kind, rows=rows)
+        if self._dispatch(fn, kind=kind, rows=rows):
+            self._clear_op_previews(("draft",))
 
     def reroll_selected(self):
         rows = [self._tray_selected()] if self._tray_selected() is not None else []
@@ -4948,13 +6388,17 @@ class MainWindow(QMainWindow):
         self._op_scene = scene
 
         def fn(sink, token):
+            # ADR-0012: the no-op subscriber enables the preview stream;
+            # generate_candidates forwards provider events tagged with the
+            # submission-slot candidate_id on the events channel.
             return dop.generate_candidates(
                 self._root, scene, count=self.count_spin.value(),
                 passage_words=self.length_spin.value(),
-                provider_factory=self._provider_factory, token=token,
-                events=sink)
+                provider_factory=self._seam(), token=token,
+                events=sink, preview_events=lambda i: (lambda ev: None))
 
-        self._dispatch(fn)
+        if self._dispatch(fn):
+            self._clear_op_previews(("draft",))
 
     def accept_candidate(self):
         """Accept the tray-selected candidate; never implicit."""
@@ -5231,6 +6675,12 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------------- close
 
+    def showEvent(self, ev):
+        """Showing the window rebuilds Qt's focus chain; re-apply the
+        stage-aware order (idempotent, never moves focus)."""
+        super().showEvent(ev)
+        self._wire_tab_order()
+
     def closeEvent(self, ev):
         if self._busy:
             pick = self._choice(
@@ -5284,3 +6734,4 @@ class MainWindow(QMainWindow):
             ev.ignore()
             return
         ev.accept()
+        self._session_key = None   # lifecycle: the session never survives close

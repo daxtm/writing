@@ -68,33 +68,38 @@ class FakeProvider:
         FakeProvider.instances.append(self)
 
     def complete(self, role, prompt, params, extra=None, stream_cb=None, meta=None,
-                 token=None, **kw):
+                 token=None, preview_events=None, **kw):
         i = len(self.calls)
         self.calls.append({"prompt": prompt, "params": dict(params),
                            "extra": dict(extra or {}), "meta": dict(meta or {})})
         item = FakeProvider.script[i] if i < len(FakeProvider.script) else "FALLBACK TEXT."
         if isinstance(item, Exception):
             raise item
+        if preview_events is not None:
+            preview_events({"type": "preview_start", "attempt_id": 1})
+            preview_events({"type": "preview_delta", "attempt_id": 1,
+                            "text": item})
+            preview_events({"type": "preview_complete", "attempt_id": 1})
         if stream_cb:
             stream_cb(item)
         self.p.record_calib("meta-llama/Llama-3.3-70B-Instruct", len(prompt), 40)
         return item, "stop", {"prompt_tokens": 40, "completion_tokens": 12}
 
-    def many(self, fn, n, token=None, on_event=None):
+    def many(self, fn, n, token=None, on_event=None, indexed=None):
         out = []
-        for k in range(1, n + 1):
+        for k0 in range(n):
             try:
-                out.append(fn())
+                out.append(indexed(k0)() if indexed is not None else fn())
                 if on_event:
-                    on_event({"type": "candidate_done", "k": k, "n": n, "msg": f"  candidate {k}/{n} done"})
+                    on_event({"type": "candidate_done", "k": k0 + 1, "n": n, "msg": f"  candidate {k0 + 1}/{n} done"})
                 else:
-                    print(f"  candidate {k}/{n} done", flush=True)
+                    print(f"  candidate {k0 + 1}/{n} done", flush=True)
             except Exception as e:  # noqa: BLE001 (mirrors Api.many)
                 if on_event:
-                    on_event({"type": "candidate_failed", "k": k, "n": n,
-                              "msg": f"  candidate {k}/{n} failed: {type(e).__name__}: {e}"})
+                    on_event({"type": "candidate_failed", "k": k0 + 1, "n": n,
+                              "msg": f"  candidate {k0 + 1}/{n} failed: {type(e).__name__}: {e}"})
                 else:
-                    print(f"  candidate {k}/{n} failed: {type(e).__name__}: {e}", flush=True)
+                    print(f"  candidate {k0 + 1}/{n} failed: {type(e).__name__}: {e}", flush=True)
         return out
 
 
@@ -437,3 +442,215 @@ def test_accept_matches_shared_operation(tmp_path, monkeypatch, capsys):
     assert _norm_tree(root2) == _norm_tree(root)
     scenes2 = json.loads((root2 / "scenes.json").read_text(encoding="utf-8"))
     assert scenes2 == scenes
+
+
+class PausedProvider(FakeProvider):
+    """Paused-stream fake: complete() emits the first fragment, blocks on the
+    shared gate, then finishes. many() runs slots in parallel when indexed
+    previews are threaded through (mirrors Api.many's bounded concurrency)."""
+
+    gate = None
+
+    def complete(self, role, prompt, params, extra=None, stream_cb=None, meta=None,
+                 token=None, preview_events=None, **kw):
+        i = len(self.calls)
+        self.calls.append({"prompt": prompt, "params": dict(params),
+                           "extra": dict(extra or {}), "meta": dict(meta or {})})
+        item = PausedProvider.script[i] if i < len(PausedProvider.script) \
+            else "FALLBACK TEXT."
+        if isinstance(item, Exception):
+            raise item
+        if preview_events is not None:
+            preview_events({"type": "preview_start", "attempt_id": 1})
+            half = len(item) // 2
+            for part in (item[:half],):
+                preview_events({"type": "preview_delta", "attempt_id": 1,
+                                "text": part})
+            if PausedProvider.gate is not None and \
+                    not PausedProvider.gate.wait(30):
+                raise AssertionError("fake provider gate never opened")
+            preview_events({"type": "preview_delta", "attempt_id": 1,
+                            "text": item[half:]})
+            preview_events({"type": "preview_complete", "attempt_id": 1})
+        self.p.record_calib("meta-llama/Llama-3.3-70B-Instruct", len(prompt), 40)
+        return item, "stop", {"prompt_tokens": 40, "completion_tokens": 12}
+
+    def many(self, fn, n, token=None, on_event=None, indexed=None):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import longform_core.cancel as cancel_mod
+        out = []
+        was_cancelled = False
+        with ThreadPoolExecutor(max_workers=max(1, n)) as ex:
+            futs = [ex.submit(indexed(i) if indexed is not None else fn)
+                    for i in range(n)]
+            for k, fut in enumerate(as_completed(futs), 1):
+                try:
+                    out.append(fut.result())
+                    if on_event:
+                        on_event({"type": "candidate_done", "k": k, "n": n,
+                                  "msg": f"  candidate {k}/{n} done"})
+                except cancel_mod.Cancelled:
+                    was_cancelled = True
+                except Exception as e:  # noqa: BLE001 (mirrors Api.many)
+                    if on_event:
+                        on_event({"type": "candidate_failed", "k": k, "n": n,
+                                  "msg": f"  candidate {k}/{n} failed: "
+                                         f"{type(e).__name__}: {e}"})
+            for f in futs:
+                f.cancel()
+        if was_cancelled:
+            raise cancel_mod.Cancelled("stopped")
+        return out
+
+
+def test_batch_previews_interleave_before_completion(tmp_path):
+    """Both candidates' first fragments are visible as preview events while
+    the gates are closed; final saved nodes/head/prompt bytes are identical
+    to an otherwise identical no-preview run (task 1.5)."""
+    import threading
+    a, b = build(tmp_path / "a"), build(tmp_path / "b")
+    PausedProvider.script = [BATCH_A, BATCH_B]
+    FakeProvider.instances = []
+    evs = []
+    gate = threading.Event()
+    PausedProvider.gate = gate
+    box = {}
+    try:
+        t = threading.Thread(
+            target=lambda: box.update(
+                res=dop.generate_candidates(
+                    a, "s001", count=2, steer="",
+                    provider_factory=lambda p: PausedProvider(p),
+                    events=evs.append,
+                    preview_events=lambda i: (lambda ev: None))))
+        t.start()
+        import time
+        for _ in range(600):
+            if PausedProvider.instances and \
+                    len(PausedProvider.instances[0].calls) >= 2:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("both candidates never started")
+        for _ in range(600):
+            if _norm_tree(a)["nodes"].keys() == {"n1"} and \
+                    sum(1 for e in evs
+                        if e.get("type") == "preview_delta") >= 2:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("previews never appeared before completion")
+        assert evs[-1]["type"] != "preview_complete" or gate.is_set(), \
+            "no candidate completed while the gate was closed"
+    finally:
+        gate.set()
+        t.join(30)
+    PausedProvider.gate = None
+    res = box["res"]
+    assert len(res.saved) == 2 and res.shortfall == 0
+    per_text = {}
+    for e in evs:
+        if e.get("type") == "preview_delta":
+            per_text[e["candidate_id"]] = per_text.get(
+                e["candidate_id"], "") + e["text"]
+    assert len(per_text) == 2, "both candidates streamed their answer"
+    assert any("BATCH A" in x for x in per_text.values()) and \
+        any("BATCH B" in x for x in per_text.values()), \
+        "interleaved fragments stay bound to their own candidate"
+    per = {}
+    for e in evs:
+        if e.get("type", "").startswith("preview_"):
+            per.setdefault(e["candidate_id"], []).append(e["type"])
+    assert set(per) == {1, 2}, "stable per-candidate identities"
+
+    # no-preview reference: identical prompts, nodes, head
+    res2 = dop.generate_candidates(
+        b, "s001", count=2, steer="",
+        provider_factory=lambda p: PausedProvider(p))
+    assert len(res2.saved) == 2
+    ta, tb = _norm_tree(a), _norm_tree(b)
+    assert ta["head"] == tb["head"] == "n1", "head never moves"
+    assert set(ta["nodes"]) == set(tb["nodes"]) == {"n1", "n2", "n3"}
+    texts_a = sorted(ta["nodes"][n]["text"] for n in ("n2", "n3"))
+    texts_b = sorted(tb["nodes"][n]["text"] for n in ("n2", "n3"))
+    assert texts_a == texts_b
+    calls_a = PausedProvider.instances[0].calls
+    assert len(calls_a) == 2 and len(PausedProvider.instances[1].calls) == 2
+    assert [c["prompt"] for c in calls_a] == \
+        [c["prompt"] for c in PausedProvider.instances[1].calls], \
+        "prompt bytes are identical with and without previews"
+
+
+def test_single_candidate_preview_retry_reset_parity(tmp_path):
+    """count=1: a preview subscriber sees start/deltas and a transport-retry
+    reset before completion; the final node, head and saved files are
+    identical with and without previews and the CLI emits no preview events."""
+    root_plain, root_sub = build(tmp_path / "a"), build(tmp_path / "b")
+
+    class RetryFake(FakeProvider):
+        def complete(self, role, prompt, params, extra=None, stream_cb=None,
+                     meta=None, token=None, preview_events=None, **kw):
+            i = len(self.calls)
+            self.calls.append({"prompt": prompt, "params": dict(params),
+                               "extra": dict(extra or {}),
+                               "meta": dict(meta or {})})
+            if preview_events is not None:
+                preview_events({"type": "preview_start", "attempt_id": 1})
+                preview_events({"type": "preview_delta", "attempt_id": 1,
+                                "text": "PART A "})
+                preview_events({"type": "preview_reset", "attempt_id": 1})
+                preview_events({"type": "preview_start", "attempt_id": 2})
+                preview_events({"type": "preview_delta", "attempt_id": 2,
+                                "text": BATCH_A})
+                preview_events({"type": "preview_complete", "attempt_id": 2})
+            return BATCH_A, "stop", {"prompt_tokens": 40,
+                                     "completion_tokens": 12}
+
+    evs = []
+    res = dop.generate_candidates(
+        root_sub, "s001", count=1, steer="",
+        provider_factory=lambda p: RetryFake(p),
+        events=evs.append, preview_events=lambda i: (lambda ev: None))
+    assert res.saved == ["n2"]
+    types = [e["type"] for e in evs if e.get("type", "").startswith("preview_")]
+    assert types == ["preview_start", "preview_delta", "preview_reset",
+                     "preview_start", "preview_delta", "preview_complete"]
+    assert types.count("preview_start") == 2 and \
+        types[2] == "preview_reset", "retry resets its own attempt only"
+    evs2 = []
+    res2 = dop.generate_candidates(
+        root_plain, "s001", count=1, steer="",
+        provider_factory=lambda p: RetryFake(p),
+        events=evs2.append)
+    assert res2.saved == ["n2"]
+    assert not [e for e in evs2
+                if e.get("type", "").startswith("preview_")], \
+        "no preview events without a subscriber"
+    assert _norm_tree(root_plain) == _norm_tree(root_sub)
+    assert _norm_tree(root_sub)["head"] == "n1"
+
+
+def test_batch_shortfall_with_previews_matches_no_preview_run(tmp_path):
+    """One failed candidate in a batch: shortfall, saved ids, candidate_failed
+    event and the final tree are identical with and without previews."""
+    a, b = build(tmp_path / "a"), build(tmp_path / "b")
+    FakeProvider.script = [BATCH_A, HttpErr(500, "boom")]
+    FakeProvider.instances = []
+    evs = []
+    res = dop.generate_candidates(
+        a, "s001", count=2, steer="",
+        provider_factory=lambda p: FakeProvider(p),
+        events=evs.append, preview_events=lambda i: (lambda ev: None))
+    res2 = dop.generate_candidates(
+        b, "s001", count=2, steer="",
+        provider_factory=lambda p: FakeProvider(p))
+    assert res.saved == res2.saved == ["n2"] and \
+        res.shortfall == res2.shortfall == 1
+    assert {"type": "candidate_failed", "k": 2, "n": 2,
+            "msg": "  candidate 2/2 failed: HttpErr: HTTP 500: boom"} in evs
+    failed = [e for e in evs if e.get("type", "").startswith("preview_")]
+    assert not failed or all(e.get("candidate_id") == 1 for e in failed), \
+        "only the completed candidate streams an answer"
+    assert _norm_tree(a) == _norm_tree(b), \
+        "final tree/head identical with and without previews"
+    assert _norm_tree(b)["head"] == "n1"

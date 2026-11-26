@@ -9,23 +9,41 @@ Let writers create, configure and plan an existing-format fiction project throug
 ### Requirement: Create and Open work without a prepared project
 The GUI SHALL offer desktop Create/Open directory selection even when launched
 with a missing directory, missing configuration or no scenes. Explicit Create
-SHALL use existing initialization contents and create-missing-only semantics.
-Open SHALL read without initializing or requesting the provider.
+SHALL perform complete shared initialization with sanitized bundled defaults,
+including the writer preset, using create-missing-only semantics on both
+immediate and deferred paths. Open SHALL read without initializing or requesting
+the provider.
 
 #### Scenario: Create from an empty location
 - **WHEN** the writer launches `gui DIR` for a missing directory and confirms a location through Create
-- **THEN** the five default project files and seven initialization directories are created with the same contents as CLI init
-- **AND** setup controls remain usable with an empty scene list, without a terminal question or provider call
+- **THEN** the five default project files, seven initialization directories and `writer_preset.json` are created with the same contents as CLI init using the bundled sanitized defaults
+- **AND** setup controls remain usable with an empty scene list, without a terminal question, preset picker or provider call
+- **AND** completion reports the preset as created and no longer identifies it as a missing drafting prerequisite
 
 #### Scenario: Repeated initialization and cancelled selection
 - **WHEN** Create targets an existing partially initialized project or the directory dialog is cancelled
-- **THEN** existing files remain unchanged and only missing initialization paths are created on confirmed Create
+- **THEN** existing files remain unchanged and only missing initialization paths, including the default preset, are created on confirmed Create
 - **AND** cancelling creates nothing and leaves the current project selected
 
 #### Scenario: Open or fail safely
 - **WHEN** the writer opens an existing valid project, or selects a directory with missing, malformed or unsafe configuration
 - **THEN** a valid project displays its existing content without changes or calls
 - **AND** an invalid selection reports an actionable error without resetting files or replacing the currently usable project
+- **AND** Open does not repair a missing preset or other initialization path
+
+#### Scenario: Deferred Create after saving dirty settings
+- **WHEN** Create for another directory is deferred until an explicit Save of the current project's dirty settings completes
+- **THEN** the current settings save finishes first and the selected new directory receives the same six files, seven directories and sanitized defaults as immediate Create
+- **AND** the saved old-project title or other settings do not leak into the new project, and no preset picker or provider request runs
+
+#### Scenario: Dirty Save fails or Create is cancelled
+- **WHEN** a prerequisite dirty-form Save fails, is stale or is cancelled, or the writer cancels Create
+- **THEN** no deferred initialization runs, the current project remains selected and local unsaved edits remain available
+
+#### Scenario: Partial initialization is not successful creation
+- **WHEN** Create encounters a path collision, permission failure or cooperative Stop after some paths were saved
+- **THEN** the GUI reports the failed/stopped path and completed writes rather than successful full initialization
+- **AND** controls recover after settlement, the previously usable project remains selected and retry creates only missing paths
 
 ### Requirement: Preset import preserves master-export validation and no-overwrite behavior
 The GUI SHALL import an explicitly picked SillyTavern master-export JSON using
@@ -44,8 +62,9 @@ overwrite `writer_preset.json`.
 ### Requirement: Settings edit supported nonsecret fields only
 The GUI SHALL provide validated Save/Cancel forms for supported nonsecret
 project, role/model, sampler, writer, budget and review-configuration settings.
-It SHALL preserve unknown/unedited fields, refresh prerequisites without a
-provider call, and offer no raw configuration or key editor.
+It SHALL preserve unknown/unedited fields and refresh prerequisites without a
+provider call. Credentials SHALL use a separate masked control with explicit
+session/storage actions, not a raw configuration editor.
 
 #### Scenario: Supported configuration controls
 - **WHEN** the writer opens Settings
@@ -56,6 +75,7 @@ provider call, and offer no raw configuration or key editor.
 - **WHEN** the writer changes supported models, budgets, concurrency and writer preset overrides and presses Save
 - **THEN** `project.json` contains those values in the existing schema, unknown fields remain intact and reopening shows the saved settings
 - **AND** no limits fetch, generation or implicit next command runs
+- **AND** the credential field is preserved unless a separate credential storage action was explicitly confirmed
 
 #### Scenario: Refuse invalid configuration
 - **WHEN** a form contains a blank model, invalid environment name, nonfinite number, boolean integer, nonpositive concurrency, invalid probability, malformed list or unsupported enum
@@ -67,21 +87,26 @@ provider call, and offer no raw configuration or key editor.
 - **THEN** configuration remains unchanged and subsequent operations use saved values
 
 ### Requirement: Credential presentation never reveals a key
-The GUI SHALL show the configured environment variable name and missing/available
-status, and only boolean effective credential availability using existing Api
-precedence. It SHALL NOT render, accept, copy or persist a new credential value,
-expose headers/raw configuration, or leak a credential in results/errors.
-Existing inline keys SHALL be preserved opaquely by nonsecret saves.
+The GUI SHALL show effective credential source and missing/available status,
+plus the configured environment name, never a stored key value. New input
+SHALL be masked and never prefilled from saved/environment credentials.
+Use for this session SHALL be the default nonpersistent action; nonsecret
+settings saves SHALL preserve existing inline keys opaquely.
 
 #### Scenario: Environment and legacy inline credentials
 - **WHEN** a project uses an environment key or an existing inline key and the writer views or saves Settings
-- **THEN** the GUI shows the environment name/status and effective availability without the key value
+- **THEN** the GUI shows the environment name/status, effective availability and winning source without the key value
 - **AND** no new key is stored and an existing inline field is neither displayed, changed nor migrated
 
 #### Scenario: Missing credentials and an echoed secret
 - **WHEN** credentials are absent or a fake provider failure body includes a sentinel credential
 - **THEN** provider controls explain missing credentials or show a sanitized failure, without exposing the sentinel anywhere in GUI text/events
 - **AND** local bible/settings/card editing remains available when its own file prerequisites are valid
+
+#### Scenario: Entry alone has no effect
+- **WHEN** the writer types a new value in the masked credential field without choosing a credential action
+- **THEN** effective credentials and project bytes remain unchanged and no provider request occurs
+- **AND** an ordinary Save settings cannot persist the typed value
 
 ### Requirement: Limits are fetched only by explicit action
 Fetch limits SHALL use the shared Api and existing plan/model lookup, limit
@@ -260,3 +285,70 @@ weakened guards. Real native Wayland acceptance SHALL be recorded separately.
 - **WHEN** offscreen coverage passes without a real Wayland desktop run
 - **THEN** the planning acceptance record remains explicitly PENDING for Wayland pickers, forms, keyboard/focus/clipboard, available scaling/themes and planner Stop/close
 - **AND** neither whole-workspace completion nor shipping is claimed
+
+### Requirement: Session credentials are isolated and used consistently
+An explicitly activated session credential SHALL override project then
+environment credentials for every provider action in its project/window.
+It SHALL NOT mutate process environment or saved configuration. Switching
+projects or closing SHALL clear it; local actions SHALL remain usable without it.
+
+#### Scenario: One session enables all provider families
+- **WHEN** project and environment keys exist and a distinct session sentinel is activated with Use for this session
+- **THEN** Test connection, Fetch limits, outline, scenes, draft, continuity, compression, critique and revision use only that session credential for authentication
+- **AND** project bytes and process environment are unchanged and status identifies session as the source
+
+#### Scenario: Clear session or switch projects
+- **WHEN** the writer chooses Clear session key, switches to another project or closes/reopens the window
+- **THEN** the prior session credential is unavailable, with remaining source resolved as project then environment then missing
+- **AND** a second window has never inherited that session credential
+
+#### Scenario: CLI compatibility
+- **WHEN** the CLI constructs its provider without a GUI session override
+- **THEN** nonempty project credentials still precede the configured environment key and existing command output/arguments remain unchanged
+
+### Requirement: Project credential persistence requires explicit informed action
+Save to this project, Replace saved key and Clear saved key SHALL modify only
+the existing `api_key` field after explicit confirmation. Before storage the
+GUI SHALL warn that `project.json` is plaintext and sharing/backups include
+the key. Writes SHALL refuse stale/unsafe targets and preserve unrelated fields.
+
+#### Scenario: Save then replace then clear
+- **WHEN** the writer confirms Save to this project for a new key, later confirms Replace and then Clear saved key
+- **THEN** only `api_key` changes on each successful operation, no old key is copied into input history/backups, and source/status refreshes without exposing a value
+- **AND** clearing saved credentials leaves an active session override in force or exposes the environment fallback when no session is active
+
+#### Scenario: Cancel or refuse unsafe persistence
+- **WHEN** confirmation is declined, configuration changes externally before save, the destination/temp path is unsafe, or writing fails
+- **THEN** no credential overwrite occurs, unrelated configuration survives, and an actionable sanitized error or cancellation is shown
+- **AND** failed Save does not report persistence or implicitly activate the new key
+
+### Requirement: Connection testing is explicit and non-generative
+Test connection SHALL authenticate through the same effective credential
+selection as generation, report success or sanitized failure, and make no
+generation request or project write. Create/Open, key entry, activation,
+Save/Replace/Clear and navigation SHALL make no implicit provider call.
+
+#### Scenario: Test current credentials
+- **WHEN** the writer explicitly chooses Test connection with an effective credential
+- **THEN** one existing plan lookup runs on the cancellable worker, and the GUI reports connected, refused or stopped without revealing response secrets
+- **AND** no model generation, `limits.json` save or accepted-content change occurs
+
+#### Scenario: Missing key and busy test
+- **WHEN** Test connection has no effective credential or is already running
+- **THEN** missing-key guidance prevents a request or the existing one-operation gate prevents a second request
+- **AND** Stop/close follows cooperative settlement and restores usable controls
+
+### Requirement: Credentials cannot escape through generated or diagnostic output
+Credential values from session, project and configured environment sources
+SHALL be redacted from GUI results/events, errors, logs and provider echoes
+before persistence or export. Credential storage SHALL be limited to explicit
+project Save/Replace; defaults and distributed resources SHALL stay empty of keys.
+
+#### Scenario: Synthetic secret echo coverage
+- **WHEN** fake provider text, metadata, malformed chunks or exceptions echo distinct session/project/environment sentinels, including split streamed fragments
+- **THEN** no sentinel appears in delivered events, visible output, stdout/stderr, call logs, limits metadata, generated artifacts or exported manuscript
+- **AND** redaction does not expose headers, effective configuration or credential-bearing object representations
+
+#### Scenario: Defaults remain independent of session or storage choices
+- **WHEN** a writer uses or explicitly saves a synthetic key and then creates a different project
+- **THEN** its bundled defaults and new `project.json` have empty `api_key` and no prior credential is copied

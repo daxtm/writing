@@ -14,26 +14,40 @@ import os
 import re
 from pathlib import Path
 
+from . import defaults as dfl
 from .api import Api, HttpErr
 from .cancel import Cancelled
 from .config import BIBLE_TEMPLATE, DEFAULT_CONFIG, STATE_TEMPLATE
 from .draft_operations import (_advance, _capture, _emit, _project_of,
                                _provider, _read_bytes, _scenes_or_error,
-                               _stale_check, OpError)
+                               _stale_check, OpError, credential_state,
+                               preview_factory, redaction_secrets,
+                               scrub_credentials)
 from .reader_model import _no_symlink_below
 from .project import Project
 from .utils import (FatalError, deep_merge, now, read_text, save_input, stamp,
-                    write_text)
+                    write_text, redact_text)
 
 # ------------------------------------------------------- initialization
 
 
+def _project_json_bytes(title=None):
+    """Reviewed new-project defaults (ADR-0010) as the exact project.json
+    payload; a fresh validated copy per call, with an optional explicit title.
+    """
+    cfg = dfl.project_defaults()
+    if title is not None:
+        cfg["title"] = str(title)
+    return (json.dumps(cfg, indent=2) + "\n").encode("utf-8")
+
+
 INIT_FILES = {
-    "project.json": json.dumps(DEFAULT_CONFIG, indent=2) + "\n",
+    "project.json": None,      # payload from the reviewed defaults
     "bible.md": BIBLE_TEMPLATE,
     "state.md": STATE_TEMPLATE,
     "scenes.json": "[]\n",
     "summaries.json": json.dumps({"scenes": {}, "arcs": []}, indent=2) + "\n",
+    "writer_preset.json": None,  # explicit source wins; else the bundled preset
 }
 INIT_DIRS = ("trees", "outlines", "critiques", "checks", "state_history",
              "lorebooks", "bible_history")
@@ -56,67 +70,161 @@ def _write_bytes_safe(path, data):
     os.replace(tmp, path)
 
 
-def init_project(root, *, preset_src=None, token=None, events=None):
-    """Create-missing-only initialization with cmd_init's exact payloads.
-
-    Existing files are never replaced, even malformed; a name collision with a
-    directory or symlink is an error (with what was already created reported),
-    not permission to reset. A preset source imports through the existing
-    master-export validation without overwriting an existing destination.
-    """
-    root = canonical_root(root)
+def _init_file(root, name, data, made, token):
+    """Create one missing initial file (bytes) with the safe-path checks;
+    existing files are never replaced, unsafe collisions are refused."""
+    path = root / name
     if token:
         token.check()
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise OpError(f"{name} is a symlink; not overwritten")
+        if path.exists() and not path.is_file():
+            raise OpError(f"{name} exists and is not a regular file; "
+                          "not overwritten")
     except OSError as e:
-        raise OpError(f"the project directory could not be created "
-                      f"({type(e).__name__})") from None
+        raise OpError(f"{name} could not be inspected "
+                      f"({type(e).__name__})" + _partial_note_made(made)
+                      ) from None
+    if path.exists():
+        return
+    try:
+        _write_bytes_safe(path, data)
+    except OSError as e:
+        raise OpError(f"{name} could not be written ({type(e).__name__})"
+                      + _partial_note_made(made)) from None
+    made.append(name)
+
+
+def init_project(root, *, preset_src=None, title=None, token=None, events=None):
+    """Create-missing-only initialization with complete new-project defaults.
+
+    Existing files are never replaced, even malformed; a name collision with a
+    directory or symlink is an error (with what was already created reported),
+    not permission to reset. New files come from the reviewed bundled defaults
+    (ADR-0010): supported settings with the forced empty key, credential
+    environment name and project-relative preset path, plus a usable bundled
+    `writer_preset.json`. An explicit `preset_src` wins over the bundle for a
+    missing destination and is validated before any write — invalid explicit
+    input never falls back to the bundle; an existing regular destination is
+    preserved with a not-overwritten warning. `title` (optional) overrides the
+    `Untitled` default for a newly created configuration only.
+    """
+    root = canonical_root(root)
     made, dirs_made, problems = [], [], []
-    for name, content in INIT_FILES.items():
-        path = root / name
+    try:
+        if token:
+            token.check()
         try:
-            if path.is_symlink():
-                raise OpError(f"{name} is a symlink; not overwritten")
-            if path.exists() and not path.is_file():
-                raise OpError(f"{name} exists and is not a regular file; "
-                              "not overwritten")
+            root.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            raise OpError(f"{name} could not be inspected "
+            raise OpError(f"the project directory could not be created "
                           f"({type(e).__name__})") from None
-        if not path.exists():
-            write_text(path, content)
-            made.append(name)
-    for d in INIT_DIRS:
-        dp = root / d
-        if dp.is_symlink():
-            raise OpError(f"{d}/ is a symlink; not replaced"
-                          + _partial_note(made, dirs_made))
-        if dp.exists():
-            if not dp.is_dir():
-                raise OpError(f"{d} exists and is not a directory; not replaced"
-                              + _partial_note(made, dirs_made))
-            continue
-        try:
-            dp.mkdir()
-        except OSError as e:
-            raise OpError(f"{d}/ could not be created ({type(e).__name__})"
-                          + _partial_note(made, dirs_made)) from None
-        dirs_made.append(d)
-    preset = None
-    if preset_src:
-        preset = import_preset(root, preset_src, token=token)
+        for name, content in INIT_FILES.items():
+            if name == "writer_preset.json":
+                continue   # after the directories, once its source is selected
+            if name == "project.json":
+                _init_file(root, name, _project_json_bytes(title), made, token)
+            else:
+                _init_file(root, name, content.encode("utf-8"), made, token)
+        for d in INIT_DIRS:
+            if token:
+                token.check()
+            dp = root / d
+            if dp.is_symlink():
+                raise OpError(f"{d}/ is a symlink; not replaced"
+                              + _partial_note_made(made, dirs_made))
+            if dp.exists():
+                if not dp.is_dir():
+                    raise OpError(
+                        f"{d} exists and is not a directory; not replaced"
+                        + _partial_note_made(made, dirs_made))
+                continue
+            try:
+                dp.mkdir()
+            except OSError as e:
+                raise OpError(f"{d}/ could not be created "
+                              f"({type(e).__name__})"
+                              + _partial_note_made(made, dirs_made)) from None
+            dirs_made.append(d)
+        preset = _init_preset(root, preset_src, made, dirs_made, problems,
+                              token=token)
+    except Cancelled:
+        # Stop at a controlled boundary: report what already exists, keep it.
+        _emit(events, "init_partial", created=list(made), dirs=list(dirs_made))
+        raise
     _emit(events, "initialized", created=len(made))
     return {"root": str(root), "created": made, "dirs": dirs_made,
             "preset": preset, "warnings": problems}
 
 
-def _partial_note(made, dirs_made):
+def _init_preset(root, preset_src, made, dirs_made, problems, *, token):
+    """Select the preset source before creating a missing destination:
+    explicit `preset_src` (validated, never replaced by the bundle), else the
+    reviewed bundled preset. An existing regular destination is preserved."""
+    dst = root / "writer_preset.json"
+    if token:
+        token.check()
+    try:
+        if dst.is_symlink():
+            raise OpError("writer_preset.json is a symlink; not overwritten"
+                          + _partial_note_made(made, dirs_made),
+                          collision=True)
+        if dst.exists() and not dst.is_file():
+            raise OpError("writer_preset.json exists and is not a regular "
+                          "file; not overwritten"
+                          + _partial_note_made(made, dirs_made), collision=True)
+    except OSError as e:
+        raise OpError("writer_preset.json could not be inspected "
+                      f"({type(e).__name__})"
+                      + _partial_note_made(made, dirs_made)) from None
+    if dst.exists():
+        if preset_src:
+            problems.append("writer_preset.json already exists; not "
+                            "overwritten (configure an existing preset path "
+                            "in Settings if appropriate)")
+        return None   # existing preset/config preserved untouched
+    if preset_src:
+        try:
+            preset = import_preset(root, preset_src, token=token)
+        except OpError as e:
+            note = _partial_note_made(made, dirs_made)
+            if note and note not in str(e):
+                raise OpError(str(e) + note,
+                              collision=getattr(e, "collision", False)
+                              ) from None
+            raise
+        if "writer_preset.json" not in made:
+            made.append("writer_preset.json")
+        return preset
+    try:
+        data = dfl.writer_preset_bytes()
+    except dfl.DefaultsError as e:
+        raise OpError(str(e) + _partial_note_made(made, dirs_made)) from None
+    if token:
+        token.check()
+    try:
+        _write_bytes_safe(dst, data)
+    except OSError as e:
+        raise OpError(f"writer_preset.json could not be written "
+                      f"({type(e).__name__})"
+                      + _partial_note_made(made, dirs_made)) from None
+    made.append("writer_preset.json")
+    _emit(None, "preset_imported", name="writer_preset.json")
+    return {"imported": "writer_preset.json", "bytes": len(data),
+            "replaced": False, "default": True}
+
+
+def _partial_note_made(made, dirs_made=()):
     if made or dirs_made:
         return (f" (created before the error: "
-                f"{', '.join(made + dirs_made)}; initialization is not a "
-                "transaction)")
+                f"{', '.join(list(made) + list(dirs_made))}; initialization "
+                "is not a transaction)")
     return ""
+
+
+def _partial_note(made, dirs_made):
+    return _partial_note_made(made, dirs_made)
 
 
 REQUIRED_PRESET_KEYS = ("instruct", "context", "sysprompt", "preset")
@@ -141,7 +249,7 @@ def import_preset(root, src, *, token=None, events=None):
     try:
         data = src.read_bytes()
     except OSError as e:
-        raise OpError("the selected preset could not be read "
+        raise OpError(f"preset file not found or unreadable: {src} "
                       f"({type(e).__name__})") from None
     try:
         d = json.loads(data.decode("utf-8"))
@@ -517,10 +625,14 @@ def outline_baseline(root, candidates=()):
 
 
 def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
-                      events=None):
+                      events=None, preview_events=None):
     """N competing planner candidates via the shared chat_many: exact CLI
     messages, tag extraction, candidate naming and the optional leading notes
-    comment. Rerolls append; nothing replaces outline.md."""
+    comment. Rerolls append; nothing replaces outline.md.
+
+    `preview_events`, when given, is called with the slot index i and must
+    return that candidate's preview_events subscriber (or None); each event is
+    forwarded on the same events channel tagged with candidate=i+1 (ADR-0012)."""
     p = _project_of(root)
     bible = read_text(p.f("bible.md")).strip()
     if not bible:
@@ -545,8 +657,11 @@ def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
     _emit(events, "progress", msg=f"generating {n} outline candidate(s) "
           f"(max_parallel {p.cfg['max_parallel']})")
     from .utils import extract_tagged
+    pe = None if preview_events is None else \
+        preview_factory(events, preview_events)
     try:
         res = provider.chat_many("planner", msgs, n, token=token,
+                                 preview_events=pe,
                                  on_event=None if events is None else (
                                      lambda ev: _emit(events, ev.get("type"),
                                                       **{k: v for k, v in
@@ -555,7 +670,8 @@ def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
     except Cancelled:
         raise
     except Exception as e:  # noqa: BLE001 — sanitized outcome
-        raise OpError(f"outline generation failed: {e}", soft=True) from None
+        raise OpError(f"outline generation failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
     ts = stamp()
     existing = 0
     d = p.f("outlines")
@@ -573,7 +689,8 @@ def generate_outlines(root, notes_form, n, *, provider_factory=None, token=None,
         if not _no_symlink_below(p.root, "outlines", name):
             raise OpError(f"outlines/{name} is a symlink; refusing to write")
         write_text(p.f("outlines", name),
-                   (f"<!-- notes: {notes} -->\n" if notes else "") + body + "\n")
+                   (f"<!-- notes: {notes} -->\n" if notes else "")
+                   + scrub_credentials(p, body, provider) + "\n")
         saved.append(name)
     if not saved:
         warnings.append("no candidates came back")
@@ -914,14 +1031,15 @@ def scene_messages(bible, outline, tw):
 
 
 def generate_scene_cards(root, *, force=False, provider_factory=None,
-                         token=None, events=None):
+                         token=None, events=None, preview_events=None):
     """Scene-card generation from a saved outline (CLI `scenes`).
 
     Force protection mirrors `scenes --force`: any non-planned card or any
     tree file requires an explicit confirmation before the provider call
     (declining runs no request and changes nothing). Invalid arrays are saved
     at the existing raw path for inspection; scenes.json is never replaced by
-    a preview."""
+    a preview. `preview_events` (single candidate) is forwarded tagged with
+    candidate=1 on the events channel."""
     p = _project_of(root)
     outline = read_text(p.f("outline.md")).strip() \
         if p.f("outline.md").is_file() else ""
@@ -950,11 +1068,15 @@ def generate_scene_cards(root, *, force=False, provider_factory=None,
             "planner", msgs, token=token,
             on_retry_event=None if events is None else (
                 lambda why, delay: _emit(events, "retry", why=why,
-                                         delay=delay)))
+                                         delay=delay)),
+            preview_events=None if preview_events is None else
+            preview_factory(events, lambda i: preview_events)(0))
     except Cancelled:
         raise
     except Exception as e:  # noqa: BLE001 — sanitized outcome
-        raise OpError(f"scene generation failed: {e}", soft=True) from None
+        raise OpError(f"scene generation failed: {scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
+    text = scrub_credentials(p, text, provider)
     arr = extract_json_array(text)
     if arr is None or not all(isinstance(x, dict) for x in arr):
         name = f"scenes_raw_{stamp()}.txt"
@@ -1042,20 +1164,23 @@ def _safe_read_json(path, warnings, label):
     return raw
 
 
-def project_overview(root):
+def project_overview(root, *, session=False):
     """Read-only sanitized setup view for the Setup pane (no writes, no calls).
 
     Works for missing directories, empty directories and invalid configs; the
-    only credential facts are the environment name and boolean availability —
-    an existing inline api_key is never echoed or migrated.
+    only credential facts are the environment name, boolean availability and
+    the winning source (session/project/environment/missing) — an existing
+    inline api_key is never echoed or migrated. `session` is the GUI's
+    window-credential availability input (ADR-0011).
     """
     root = canonical_root(root)
     out = {"root": str(root), "exists": root.is_dir(), "config_ok": False,
            "title": "", "target_words": 0, "scenes": 0, "scene_status": [],
            "preset_found": False, "preset_path": "", "api_key_env": "",
            "env_set": False, "inline_key": False, "creds_ok": False,
-           "outline_present": False, "trees": [], "created_files": [],
-           "missing_files": [], "dirs": [], "warnings": []}
+           "cred_source": "missing", "outline_present": False, "trees": [],
+           "created_files": [], "missing_files": [], "dirs": [],
+           "warnings": []}
     if not out["exists"]:
         out["warnings"].append("the directory does not exist yet; "
                                "use Create to initialize it")
@@ -1087,11 +1212,12 @@ def project_overview(root):
             out["trees"] = sorted(p.name for p in trees.glob("*.json"))
         except OSError:
             warnings.append("trees/ could not be listed")
-    env = str(cfg.get("api_key_env") or "")
-    out["api_key_env"] = env
-    out["env_set"] = bool(env) and bool(os.environ.get(env, "").strip())
-    out["inline_key"] = bool(str(cfg.get("api_key") or "").strip())
-    out["creds_ok"] = out["inline_key"] or out["env_set"]
+    creds = credential_state(cfg, session=session)
+    out["api_key_env"] = creds["api_key_env"]
+    out["env_set"] = creds["env_set"]
+    out["inline_key"] = creds["inline_key"]
+    out["cred_source"] = creds["source"]
+    out["creds_ok"] = creds["available"]
     preset = str(cfg.get("roles", {}).get("writer", {}).get("preset", "")
                  or "writer_preset.json")
     ppath = Path(preset).expanduser()
@@ -1106,6 +1232,130 @@ def project_overview(root):
         out["preset_path"] = str(ppath)
         out["preset_found"] = ppath.is_file()
     out["warnings"] = warnings
+    return out
+
+
+def readiness(root, *, session=False):
+    """Advisory saved-artifact readiness for the Plan stage (read-only).
+
+    Sanitized plain facts derived from saved sources only — file existence
+    alone never counts as accepted content: template/placeholder bible
+    sections, comment-only outline files and unchosen outline candidates do
+    not qualify, and only valid nonempty saved scene cards do. Credential
+    availability is separate from saved-content readiness; a missing key
+    never gates local tools. Never writes project files and never uses the
+    provider. `next`/`next_reason` recommend the first applicable recovery
+    (setup → credentials → bible → outline → scenes → write) and the wizard
+    reuses these facts instead of introducing another authoritative state.
+    """
+    over = project_overview(root, session=session)
+    out = {"root": over["root"], "exists": over["exists"],
+           "config_ok": over["config_ok"], "title": over["title"],
+           "missing_files": over["missing_files"],
+           "preset_found": over["preset_found"],
+           "preset_path": over["preset_path"],
+           "creds_ok": over["creds_ok"], "cred_source": over["cred_source"],
+           "api_key_env": over["api_key_env"], "env_set": over["env_set"],
+           "inline_key": over["inline_key"],
+           "warnings": list(over["warnings"])}
+    out["setup_ok"] = (over["exists"] and over["config_ok"]
+                       and not over["missing_files"]
+                       and over["preset_found"])
+    base = Path(out["root"])
+
+    # bible: nonplaceholder accepted section content
+    bible = {"ok": False, "sections": 0, "filled": 0, "placeholders": []}
+    if out["exists"] and over["config_ok"]:
+        try:
+            bo = bible_overview(root)
+            if bo.get("error"):
+                out["warnings"].append(f"bible.md: {bo['error']}")
+            else:
+                bible["sections"] = len(bo["sections"])
+                bible["filled"] = sum(1 for s in bo["sections"]
+                                      if not s["placeholder"])
+                bible["placeholders"] = [s["heading"] for s in bo["sections"]
+                                         if s["placeholder"]]
+                bible["ok"] = bible["filled"] > 0
+        except OpError as e:
+            out["warnings"].append(f"bible.md could not be read: {e}")
+    out["bible"] = bible
+
+    # outline: nonempty saved working outline.md; comments/template-only
+    # content and unchosen outline candidates do not qualify
+    outline = {"saved": False, "ok": False, "chars": 0}
+    op = base / "outline.md"
+    if _plain_file(op):
+        try:
+            text = read_text(op)
+        except OSError as e:
+            out["warnings"].append(f"outline.md could not be read: {e}")
+            text = ""
+        from .commands import is_placeholder
+        outline["saved"] = True
+        # candidate-notes comments/template-only content do not qualify
+        body = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+        outline["chars"] = len(text.strip())
+        outline["ok"] = bool(body.strip()) and not is_placeholder(body)
+    out["outline"] = outline
+
+    # cards: valid saved nonempty scene cards (not just a scenes.json path)
+    cards = {"valid": False, "count": 0, "done": 0, "ok": False}
+    rows = []
+    if over["exists"]:
+        raw = _safe_read_json(base / "scenes.json", out["warnings"],
+                              "scenes.json")
+        if isinstance(raw, list) and all(
+                isinstance(s, dict) and s.get("id") for s in raw):
+            cards["valid"] = True
+            cards["count"] = len(raw)
+            cards["done"] = sum(1 for s in raw
+                                if s.get("status") == "done")
+            cards["ok"] = cards["count"] > 0
+            rows = [{"id": s["id"], "status": s.get("status", "")}
+                    for s in raw]
+        elif raw is not None:
+            out["warnings"].append(
+                "scenes.json is not a valid scene-card list; re-plan the "
+                "scenes or fix the file")
+    out["cards"] = cards
+    out["write"] = {"scenes": cards["count"], "done": cards["done"],
+                    "next_scene": next((r["id"] for r in rows
+                                        if r["status"] != "done"), "")}
+
+    if not out["setup_ok"]:
+        out["next"] = "setup"
+        out["next_reason"] = (
+            "create the project with complete initialization"
+            if not over["exists"]
+            else "repair the setup: " + ("; ".join(
+                w for w in out["warnings"])
+                or "missing " + ", ".join(over["missing_files"]))
+            if over["missing_files"] or out["warnings"]
+            else "repair the project setup")
+    elif not over["creds_ok"]:
+        out["next"] = "credentials"
+        out["next_reason"] = ("add provider credentials for generated "
+                              "planning (manual and local tools need none)")
+    elif not bible["ok"]:
+        out["next"] = "bible"
+        out["next_reason"] = ("answer the story bible — every section is "
+                              "still template placeholder"
+                              if bible["sections"] and not bible["filled"]
+                              else "answer the story bible locally or "
+                                   "generate draft sections")
+    elif not outline["ok"]:
+        out["next"] = "outline"
+        out["next_reason"] = ("save a working outline.md — outline "
+                              "candidates in outlines/ do not count until "
+                              "chosen")
+    elif not cards["ok"]:
+        out["next"] = "scenes"
+        out["next_reason"] = "plan scene cards from the saved outline"
+    else:
+        out["next"] = "write"
+        out["next_reason"] = ("everything needed to draft is saved; enter "
+                              "Write at the first unfinished scene")
     return out
 
 
@@ -1234,10 +1484,11 @@ def _get_setting(cfg, dotted):
     return "" if v is None else v
 
 
-def settings_state(root):
+def settings_state(root, *, session=False):
     """Read-only settings view: supported values (merged with defaults),
-    credential name/availability booleans, ignored-sampler warnings and the
-    unknown fields the patch must preserve. Never includes a key value."""
+    credential name/availability/source booleans, ignored-sampler warnings
+    and the unknown fields the patch must preserve. Never includes a key
+    value or the environment value (ADR-0011)."""
     root = canonical_root(root)
     p = _project_of(root)
     raw = _read_bytes(p.f("project.json"), "project.json")
@@ -1267,13 +1518,12 @@ def settings_state(root):
                         " are preserved but have no control here (not sent "
                         "to the provider)")
     unknown = _unknown_paths(parsed)
-    env = str(cfg.get("api_key_env") or "")
+    creds = credential_state(cfg, session=session)
     state = {"root": str(root), "values": values, "warnings": warnings,
-             "unknown_fields": unknown, "api_key_env": env,
-             "env_set": bool(env) and bool(os.environ.get(env, "").strip()),
-             "inline_key": bool(str(cfg.get("api_key") or "").strip()),
-             "env_value": os.environ.get(env, "") if env else ""}
-    state["creds_ok"] = state["inline_key"] or state["env_set"]
+             "unknown_fields": unknown, "api_key_env": creds["api_key_env"],
+             "env_set": creds["env_set"], "inline_key": creds["inline_key"],
+             "cred_source": creds["source"]}
+    state["creds_ok"] = creds["available"]
     return state
 
 
@@ -1413,6 +1663,58 @@ def settings_baseline(root):
     return _capture(p, ["project.json"])
 
 
+def save_credential(root, action, value=None, *, baseline=None, token=None,
+                    events=None):
+    """Credential-only project.json patch beside save_settings (ADR-0011).
+
+    `action` is "save"/"replace" (store the trimmed value in api_key) or
+    "clear" (write an empty api_key). Only the existing api_key field
+    changes; unrelated fields survive byte-for-byte semantics of the parsed
+    document and no old key is copied into input history or backups. The
+    same baseline capture, parsing, stale and temporary-path safety checks
+    as save_settings apply; refusing leaves disk unchanged. Returns
+    availability/source facts only, never the stored value."""
+    if action not in ("save", "replace", "clear"):
+        raise OpError(f"unsupported credential action: {action}")
+    if action == "clear":
+        value = ""
+    key = str(value or "").strip()
+    if not key and action != "clear":
+        raise OpError("no credential value was provided", soft=True)
+    root = canonical_root(root)
+    p = _project_of(root)
+    if baseline is None:
+        baseline = _capture(p, ["project.json"])
+    if token:
+        token.check()
+    if not _no_symlink_below(p.root, "project.json"):
+        raise OpError("project.json is a symlink; refusing to write")
+    raw = baseline["project.json"]
+    try:
+        parsed = json.loads(raw.decode("utf-8")) if raw is not None else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise OpError("project.json is not valid JSON; not saved") from None
+    if not isinstance(parsed, dict):
+        raise OpError("project.json is not a JSON object; not saved")
+    _stale_check(p, baseline)
+    parsed["api_key"] = key if action in ("save", "replace") else ""
+    data = (json.dumps(parsed, indent=2, ensure_ascii=False) + "\n").encode()
+    try:
+        _write_bytes_safe(p.f("project.json"), data)
+    except OSError as e:
+        raise OpError(f"project.json could not be written "
+                      f"({type(e).__name__})") from None
+    _advance(p, baseline, "project.json")
+    creds = credential_state(parsed)
+    _emit(events, "credential_saved", action=action)
+    return {"action": action,
+            "creds_ok": creds["available"],
+            "cred_source": creds["source"],
+            "api_key_env": creds["api_key_env"],
+            "inline_key": creds["inline_key"],
+            "env_set": creds["env_set"]}
+
+
 def save_settings(root, values, *, baseline=None, token=None, events=None):
     """Validate and commit a settings patch over the original JSON object.
 
@@ -1480,28 +1782,24 @@ _SECRET_KEY_RE = re.compile(r"api[-_]?key|secret|authorization|bearer",
                             re.I)
 
 
-def _scrub_text(p, text):
-    """Remove resolved credential values from provider text (GUI only)."""
-    key = str(p.cfg.get("api_key") or "").strip()
-    env = str(p.cfg.get("api_key_env") or "")
-    envval = os.environ.get(env, "").strip() if env else ""
-    out = text or ""
-    for secret in (key, envval):
-        if secret:
-            out = out.replace(secret, "[redacted]")
-    return out
+def _scrub_text(p, text, provider=None):
+    """Remove resolved credential values from provider text (GUI only).
+
+    Knows every nonempty source (session override, saved-project key,
+    configured environment value), not only the winning one (ADR-0011)."""
+    return scrub_credentials(p, text, provider)
 
 
-def _sanitize_raw(obj, p=None):
+def _sanitize_raw(obj, p=None, provider=None):
     """Drop credential-ish keys and scrub resolved secrets from model
     metadata before GUI display (limits.json keeps the CLI shape)."""
     if isinstance(obj, dict):
-        return {k: _sanitize_raw(v, p) for k, v in obj.items()
+        return {k: _sanitize_raw(v, p, provider) for k, v in obj.items()
                 if not _SECRET_KEY_RE.search(str(k))}
     if isinstance(obj, list):
-        return [_sanitize_raw(x, p) for x in obj]
+        return [_sanitize_raw(x, p, provider) for x in obj]
     if isinstance(obj, str) and p is not None:
-        return _scrub_text(p, obj)
+        return _scrub_text(p, obj, provider)
     return obj
 
 
@@ -1513,16 +1811,52 @@ def _first_int(d, keys):
     return None
 
 
-def fetch_limits(root, *, provider_factory=None, token=None, events=None):
+def test_connection(root, *, provider_factory=None, token=None, events=None,
+                    session=False):
+    """Explicit non-generative connection test (ADR-0011): one /plan lookup
+    through the effective credential chain, reusing the shared Api retry and
+    timeout behavior. The response content is discarded and nothing is
+    written (limits.json stays untouched); a failure is a sanitized OpError.
+    `session` is the GUI's window-credential availability input."""
+    p = _project_of(root)
+    creds = credential_state(p.cfg, session=session)
+    if not creds["available"]:
+        env = creds["api_key_env"]
+        raise OpError(
+            f'no API key: set "api_key" in project.json, or export {env}=...'
+            " (paste a key and press Use for this session, or set api_key "
+            "in project.json)", soft=True)
+    provider = _provider(p, provider_factory)
+    if token:
+        token.check()
+    try:
+        provider.get("/plan", token=token,
+                     on_retry_event=None if events is None else (
+                         lambda why, delay: _emit(events, "retry",
+                                                  why=why, delay=delay)))
+    except Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001 — sanitized outcome, file untouched
+        raise OpError("connection test failed: "
+                      f"{scrub_credentials(p, str(e), provider)}",
+                      soft=True) from None
+    return {"ok": True, "cred_source": creds["source"],
+            "api_key_env": creds["api_key_env"]}
+
+
+def fetch_limits(root, *, provider_factory=None, token=None, events=None,
+                 session=False):
     """Explicit limits fetch through the shared Api (CLI `limits`).
 
     One /plan request and one /models/<id> lookup per distinct configured
     model; 404 is a found:false result, transport/plan/unexpected failures or
-    Stop keep the previous limits.json. The saved shape matches cmd_limits."""
+    Stop keep the previous limits.json. The saved shape matches cmd_limits.
+    `session` is the GUI's window-credential availability input (ADR-0011):
+    it satisfies the missing-key guard without touching config/environment."""
     p = _project_of(root)
-    key = str(p.cfg.get("api_key") or "").strip()
-    env = str(p.cfg.get("api_key_env") or "")
-    if not key and not (env and os.environ.get(env, "").strip()):
+    creds = credential_state(p.cfg, session=session)
+    if not creds["available"]:
+        env = creds["api_key_env"]
         raise OpError(
             f'no API key: set "api_key" in project.json, or export {env}=...',
             soft=True)
@@ -1540,7 +1874,7 @@ def fetch_limits(root, *, provider_factory=None, token=None, events=None):
     except Cancelled:
         raise
     except Exception as e:  # noqa: BLE001 — sanitized outcome, file untouched
-        raise OpError(f"limits fetch failed: {_scrub_text(p, str(e))}",
+        raise OpError(f"limits fetch failed: {_scrub_text(p, str(e), provider)}",
                       soft=True) from None
     out = {"fetched": now(), "plan": plan, "models": {}}
     _emit(events, "plan_fetched", plan_max=(
@@ -1562,11 +1896,11 @@ def fetch_limits(root, *, provider_factory=None, token=None, events=None):
                 entry = None   # a model 404 is a found:false result
             else:
                 raise OpError(f"limits fetch failed: "
-                              f"{_scrub_text(p, str(e))}", soft=True) from None
+                              f"{_scrub_text(p, str(e), provider)}", soft=True) from None
         except Cancelled:
             raise
         except Exception as e:  # noqa: BLE001
-            raise OpError(f"limits fetch failed: {_scrub_text(p, str(e))}",
+            raise OpError(f"limits fetch failed: {_scrub_text(p, str(e), provider)}",
                           soft=True) from None
         if isinstance(entry, dict) and "id" not in entry and entry.get("data"):
             d = entry["data"]
@@ -1605,7 +1939,7 @@ def fetch_limits(root, *, provider_factory=None, token=None, events=None):
             "role": role, "model": rc["model"], "found": m["found"],
             "context": m.get("context"), "max_completion": m.get("max_completion"),
             "available": m.get("available_on_current_plan"),
-            "raw": _sanitize_raw(m.get("raw"), p) if m["found"] else None,
+            "raw": _sanitize_raw(m.get("raw"), p, provider) if m["found"] else None,
         })
     _emit(events, "limits_saved")
     return {"saved": str(p.f("limits.json")), "view": view,

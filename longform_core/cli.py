@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.13,<3.14"
 # dependencies = ["httpx>=0.27", "pyside6>=6.12.0,<6.13"]
 # ///
 """longform.py - plan-then-collaborate longform fiction pipeline for Featherless.
@@ -37,11 +37,43 @@ the character's name, plus any embedded character_book entries. Toggle them and 
 """
 import argparse
 import os
+import re
+import sys
+from pathlib import Path
 
 from .commands import (cmd_bible, cmd_check, cmd_compress, cmd_critique, cmd_draft, cmd_export,
                        cmd_init, cmd_limits, cmd_outline, cmd_revise, cmd_scenes, cmd_status,
                        cmd_update_state)
 from .project import Project
+
+
+def enforce_python_pin():
+    """Refuse to run on a different CPython minor than the authoritative pin.
+
+    `uv run --python 3.12` only warns when an explicit interpreter request
+    contradicts the launcher's PEP 723 mirror, so the source launcher enforces
+    the reviewed minor itself (ADR-0013). The root `.python-version` is the
+    single authority: the running interpreter must be CPython with the same
+    major.minor. Patch updates inside the minor are automatic; a minor bump
+    is a reviewed pin/mirror change. Absent, unreadable or malformed pins skip
+    the guard (the frozen executable ships no pin file and needs none), and
+    non-CPython requests are a checkout bug caught by the regression suite.
+    """
+    pin_file = Path(__file__).resolve().parents[1] / ".python-version"
+    try:
+        pin = pin_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    match = re.fullmatch(r"cpython@(\d+)\.(\d+)", pin)
+    if not match:
+        return
+    running = f"cpython@{sys.version_info[0]}.{sys.version_info[1]}"
+    if running != pin:
+        print(f"error: longform.py is running on {running} but this checkout pins "
+              f"{pin} in .python-version (patch updates are automatic; a minor "
+              "bump is a reviewed pin/mirror change, see ADR-0013)", file=sys.stderr)
+        sys.exit(2)
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

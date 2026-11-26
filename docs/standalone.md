@@ -2,7 +2,7 @@
 
 `scripts/build-standalone.sh` freezes `longform.py` — the full CLI **and** the
 native Qt Widgets GUI — into one copyable executable, `dist/longform`, using
-PyInstaller one-file console mode. It bundles the Python 3.11 interpreter, the
+PyInstaller one-file console mode. It bundles the Python 3.13 interpreter, the
 current CLI and `longform_core`, the httpx dependency closure, certifi's TLS
 certificate data, and the PySide6/Qt GUI runtime with its Wayland platform
 plugins. The source/uv launcher remains fully supported; both entry points run
@@ -13,8 +13,16 @@ files, and the same native-Wayland-only policy.
 
 - Linux x86_64 with glibc **2.34 or newer** (the pinned PySide6 wheels are
   `manylinux_2_34`; musl and other OSes/architectures are not built).
-- `uv`, with a provisionable Python 3.11 (`uv python install 3.11` is run for
-  you if needed).
+- `uv`. The build validates the authoritative `.python-version` pin and
+  provisions the latest available managed CPython 3.13 patch itself
+  (`uv python install --upgrade cpython@3.13`), then explicitly selects it for
+  the cleared build venv (ADR-0013). The build requires CPython **3.13.x**:
+  PySide6 6.12.0 loses one reference to `None` on every Qt call on 3.11, so
+  long GUI sessions abort with `none_dealloc`; CPython 3.12+ makes `None`
+  immortal (PYSIDE-3424, fixed only in the unreleased shiboken 6.12.1). The
+  reviewed policy holds the minor at 3.13 — patch updates are automatic, and
+  only a minor bump is a reviewed pin/mirror change. Another minor or
+  implementation fails the build before any dependency is installed.
 - Network access **for provisioning build dependencies only**; the built
   application never installs or downloads anything.
 - Build dependency versions are fully pinned in
@@ -35,13 +43,17 @@ files, and the same native-Wayland-only policy.
 ./scripts/build-standalone.sh
 ```
 
-The script diagnoses missing uv, unsupported OS/architecture/libc, and an
-unusable build Python, and exits nonzero on any error. It prints the artifact
+The script diagnoses missing uv, unsupported OS/architecture/libc, a missing,
+malformed or patch-specific interpreter pin, an unprovisionable requested
+minor, and a provisioned interpreter of the wrong implementation or minor,
+and exits nonzero on any error — wrong interpreters are rejected before pip or
+PyInstaller run, with no fallback. It prints the artifact
 path on success. Generated spec/work files live under `build/standalone/` and
 the executable under `dist/`; both are git-ignored. The build runs from the
 repository root resolved from the script location. Build output is not
-guaranteed to be bit-identical between runs; the interpreter patch version is
-recorded in `dist/longform-build.json`. The current Qt 6.12.0 build produces an
+guaranteed to be bit-identical between runs; the requested minor and the
+actual interpreter implementation and full patch version are recorded in
+`dist/longform-build.json`. The current Qt 6.12.0 build produces an
 executable of roughly 85 MB (212 MiB unpacked).
 
 ## Copy, run, distribute
@@ -56,6 +68,15 @@ cd /any/other/dir && /wherever/you/want/longform --help
 Only the executable file is needed; the informational sidecars described below
 are not required to run it. Relative paths (project directories, `--out`,
 presets) resolve against the caller's working directory exactly as in source.
+
+The executable bundles the reviewed application-owned new-project defaults
+(`longform_core/resources/project_defaults.json` and `writer_preset.json`,
+per ADR-0010) inside the archive, so `init` and GUI Create produce the same
+complete six-file setup as source with no adjacent defaults directory, manual
+preset copy or network access. Missing or invalid bundled assets fail init
+with an actionable diagnostic instead of a complete-setup report; an explicit
+`--preset` still takes precedence for a missing destination and existing
+preset files are never overwritten on repeat init.
 
 The GUI is the default entry point: running the executable with **no
 arguments** — for example by double-clicking it in a file manager — opens the
@@ -74,7 +95,9 @@ as for any Qt Wayland application.
 Two files are generated beside the executable for distribution purposes:
 
 - `dist/longform-build.json`: the source revision and dirty state, OS,
-  architecture, glibc, interpreter and resolved dependency versions, PySide6,
+  architecture, glibc, the requested interpreter pin (`cpython@3.13`), the
+  actual build interpreter implementation and full version, the resolved
+  dependency versions, PySide6,
   Shiboken and Qt versions, the actual bundled plugin inventory, per-file `ldd`
   inspection of the Qt/Wayland libraries and plugins (bundled versus remaining
   host dependencies), native shared-library requirements of the executable
@@ -83,11 +106,14 @@ Two files are generated beside the executable for distribution purposes:
   the bundled distributions (including certifi's CA data), the PyInstaller
   bootloader exception, and the LGPLv3/GPLv2/GPLv3 texts governing PySide6,
   Shiboken and Qt (vendored canonical SPDX texts, because those wheels ship no
-  license files), plus the bundled plugin inventory.
+  license files), plus the bundled plugin inventory. It also records the
+  bundled reviewed defaults resources by name, size and SHA-256 (per ADR-0010,
+  hashes only — never their contents).
 
 ## What is bundled vs. what stays on the host
 
-- **Bundled**: the Python runtime, `longform.py` + `longform_core`, the httpx
+- **Bundled**: the Python runtime, `longform.py` + `longform_core`, the reviewed
+  defaults resources (`longform_core/resources/*.json`, ADR-0010), the httpx
   dependency closure, certifi's CA data, PySide6/Shiboken and the Qt libraries
   and plugins needed by the GUI (the Qt Wayland platform plugin, shell
   integrations, decoration and graphics-integration clients), and their
@@ -146,7 +172,11 @@ uv run --with pytest --with httpx --with 'pyside6>=6.12.0,<6.13' pytest -q tests
 
 It runs the same source suite and provisions/builds through the production
 script whenever `dist/longform` is missing or older than the build inputs (the
-frozen tests reuse a freshly built artifact rather than rebuilding). The
+frozen tests reuse a freshly built artifact rather than rebuilding). The pin
+is treated as a build input: cached artifacts or build environments whose
+recorded or actual implementation/minor disagree with `.python-version`, or
+whose metadata is missing or unreadable, are rebuilt through the production
+script — patch differences within 3.13 do not invalidate a valid cache. The
 public `gui` command still accepts only native Wayland; `offscreen` is used
 only inside the test subprocess for widget cases.
 

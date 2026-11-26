@@ -1,6 +1,8 @@
 # Fully pinned build dependency closure for scripts/build-standalone.sh.
 # Build-only: never added to the PEP 723 runtime dependencies of longform.py.
-# Resolved with `uv pip compile --python-version 3.11` on 2026-11-23.
+# Resolved with `uv pip compile` on 2026-11-23; installed into the Python 3.13
+# build venv. PySide6 6.12.0 crashes long-running GUIs on CPython 3.11
+# ("none_dealloc: deallocating None"), so the build floor is 3.12 (PYSIDE-3424).
 #
 # GUI: PySide6-Essentials provides the PySide6 package and the QtCore/QtGui/
 # QtWidgets modules the source workspace imports. The pyside6 meta package
